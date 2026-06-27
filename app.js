@@ -38,6 +38,18 @@ const NOTE_FREQ = {
     "B4":  493.88,
     "C5":  523.25,
     "C#5": 554.37,
+    "D5":  587.33,
+    "D#5": 622.25,
+    "E5":  659.25,
+    "F5":  698.46,
+    "F#5": 739.99,
+    "G5":  783.99,
+    "G#5": 830.61,
+    "A5":  880.00,
+    "A#5": 932.33,
+    "B5":  987.77,
+    "C6":  1046.50,
+    "C#6": 1108.73,
 };
 
 function playNote(pitch, startTime, duration) {
@@ -221,6 +233,13 @@ const WHITE_KEYS = [
     { pitch: "A4", semitone: 9  },
     { pitch: "B4", semitone: 11 },
     { pitch: "C5", semitone: 12 },
+    { pitch: "D5", semitone: 14 },
+    { pitch: "E5", semitone: 16 },
+    { pitch: "F5", semitone: 17 },
+    { pitch: "G5", semitone: 19 },
+    { pitch: "A5", semitone: 21 },
+    { pitch: "B5", semitone: 23 },
+    { pitch: "C6", semitone: 24 },
 ];
 
 const BLACK_KEYS = [
@@ -230,6 +249,11 @@ const BLACK_KEYS = [
     { pitch: "G#4", semitone: 8  },
     { pitch: "A#4", semitone: 10 },
     { pitch: "C#5", semitone: 13 },
+    { pitch: "D#5", semitone: 15 },
+    { pitch: "F#5", semitone: 18 },
+    { pitch: "G#5", semitone: 20 },
+    { pitch: "A#5", semitone: 22 },
+    { pitch: "C#6", semitone: 25 },
 ];
 
 const WHITE_TO_BLACK = {
@@ -239,6 +263,11 @@ const WHITE_TO_BLACK = {
     "G4":  "G#4",
     "A4":  "A#4",
     "C5":  "C#5",
+    "D5":  "D#5",
+    "F5":  "F#5",
+    "G5":  "G#5",
+    "A5":  "A#5",
+    "C6":  "C#6",
 };
 
 const BLACK_PITCHES = new Set(BLACK_KEYS.map(k => k.pitch));
@@ -258,6 +287,18 @@ const PITCH_TO_FILE = {
     "B4":  "b.jpg",
     "C5":  "c2.jpg",
     "C#5": "c2_.jpg",
+    "D5":  "d2.jpg",
+    "D#5": "d2_.jpg",
+    "E5":  "e2.jpg",
+    "F5":  "f2.jpg",
+    "F#5": "f2_.jpg",
+    "G5":  "g2.jpg",
+    "G#5": "g2_.jpg",
+    "A5":  "a2.jpg",
+    "A#5": "a2_.jpg",
+    "B5":  "b2.jpg",
+    "C6":  "c3.jpg",
+    "C#6": "c3_.jpg",
 };
 
 function semitoneToY(semitone) {
@@ -412,7 +453,9 @@ function updateImageArea() {
 
     const BLACK_TO_WHITE = {
         "C#4": "C4", "D#4": "D4", "F#4": "F4",
-        "G#4": "G4", "A#4": "A4", "C#5": "C5"
+        "G#4": "G4", "A#4": "A4", "C#5": "C5",
+        "D#5": "D5", "F#5": "F5", "G#5": "G5",
+        "A#5": "A5", "C#6": "C6"
     };
 
     const countMap = {};
@@ -431,7 +474,7 @@ function updateImageArea() {
     if (!panelCount) return;
     panelCount.innerHTML = "";
 
-    const ORDER = ["C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5"];
+    const ORDER = ["C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5", "D5", "E5", "F5", "G5", "A5", "B5", "C6"];
     ORDER.forEach(pitch => {
         const file = PITCH_TO_FILE[pitch];
         if (!file) return;
