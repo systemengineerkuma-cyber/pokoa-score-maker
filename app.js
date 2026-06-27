@@ -1162,6 +1162,14 @@ async function main() {
             setupDeleteButtons();
         });
 
+    document.getElementById("undoBtn")
+        .addEventListener("click", () => undo());
+
+    document.getElementById("redoBtn")
+        .addEventListener("click", () => redo());
+
+    document.getElementById("playBtn")
+
     document.getElementById("playBtn")
         .addEventListener("click", () => {
             if (isPlaying) {
