@@ -1,0 +1,69 @@
+{
+  "timeSignature": "4/4",
+  "measures": [
+    {
+      "notes": [
+        { "pitches": ["C4"], "duration": "q" },
+        { "pitches": ["E4"], "duration": "q" },
+        { "pitches": ["G4"], "duration": "q" },
+        { "pitches": ["C4", "E4", "G4"], "duration": "q" }
+      ]
+    },
+    {
+      "notes": [
+        { "pitches": ["D4"], "duration": "8" },
+        { "pitches": ["E4"], "duration": "8" },
+        { "pitches": ["F#4"], "duration": "q" },
+        { "pitches": ["A4"], "duration": "h" }
+      ]
+    },
+    {
+      "notes": [
+        { "pitches": ["G4"], "duration": "q" },
+        { "pitches": ["F#4"], "duration": "q" },
+        { "pitches": ["E4"], "duration": "q" },
+        { "pitches": ["D4"], "duration": "q" }
+      ]
+    },
+    {
+      "notes": [
+        { "pitches": ["C4", "E4"], "duration": "h" },
+        { "rest": true, "duration": "q" },
+        { "pitches": ["G4"], "duration": "q" }
+      ]
+    },
+    {
+      "notes": [
+        { "pitches": ["A4"], "duration": "q" },
+        { "pitches": ["G4"], "duration": "q" },
+        { "pitches": ["F#4"], "duration": "8" },
+        { "pitches": ["E4"], "duration": "8" },
+        { "pitches": ["D4"], "duration": "q" }
+      ]
+    },
+    {
+      "notes": [
+        { "pitches": ["E4", "G4"], "duration": "q" },
+        { "pitches": ["C#4"], "duration": "q" },
+        { "pitches": ["D4"], "duration": "h" }
+      ]
+    },
+    {
+      "notes": [
+        { "pitches": ["G4"], "duration": "8" },
+        { "pitches": ["F#4"], "duration": "8" },
+        { "pitches": ["E4"], "duration": "q" },
+        { "pitches": ["C4", "E4", "G4"], "duration": "h" }
+      ]
+    },
+    {
+      "notes": [
+        { "pitches": ["D4", "F#4"], "duration": "q" },
+        { "pitches": ["E4"], "duration": "q" },
+        { "rest": true, "duration": "8" },
+        { "pitches": ["C4"], "duration": "8" },
+        { "pitches": ["C4", "E4", "G4"], "duration": "q" }
+      ]
+    }
+  ]
+}

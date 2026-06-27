@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>ぽこあスコアメーカー</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎵</text></svg>">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Meiryo', 'メイリオ', sans-serif;
+            background: #f5f5f5;
+            color: #222;
+            min-height: 100vh;
+            user-select: none;
+        }
+
+        header {
+            background: #111;
+            color: #fff;
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        header h1 {
+            font-size: 18px;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+        }
+
+        header i {
+            font-size: 20px;
+            color: #aaa;
+        }
+
+        #main {
+            padding: 24px;
+        }
+
+        #toolbars {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .toolbar {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            background: #fff;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 10px 16px;
+        }
+
+        .toolbar button, .toolbar label {
+            background: none;
+            border: none;
+            cursor: pointer;
+            color: #444;
+            font-size: 16px;
+            width: 32px;
+            height: 32px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.15s;
+        }
+
+        .toolbar button:hover, .toolbar label:hover {
+            background: #f0f0f0;
+        }
+
+        #zoomSlider {
+            width: 240px;
+            accent-color: #222;
+        }
+
+        #scoreWrapper {
+            position: relative;
+            background: #fff;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            overflow: visible;
+            padding: 8px 0;
+        }
+
+        #score {
+            display: inline-block;
+        }
+
+        #addMeasureBtn {
+            position: absolute;
+            width: 28px;
+            height: 28px;
+            background: none;
+            color: #999;
+            border: none;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 10;
+            opacity: 0.3;
+            transition: color 0.15s, opacity 0.15s;
+        }
+
+        #addMeasureBtn:hover {
+            color: #222;
+            opacity: 1;
+        }
+
+        #imageArea {
+            margin-top: 24px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+
+        .measureGroup {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 6px;
+        }
+
+        .measureLabel {
+            font-size: calc(11px * var(--scale, 1));
+            color: #999;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+        }
+
+        .measureImages {
+            display: flex;
+            flex-direction: row;
+            gap: 4px;
+            background: #fff;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 8px;
+        }
+
+        .measureImages img {
+            object-fit: contain;
+            border-radius: 4px;
+        }
+
+        .deleteMeasureBtn {
+            position: absolute;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            background: none;
+            color: #999;
+            border: none;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 16px;
+            z-index: 10;
+            opacity: 0.3;
+            transition: color 0.15s, opacity 0.15s;
+        }
+
+        .deleteMeasureBtn:hover {
+            color: #222;
+            opacity: 1;
+        }
+
+        #info {
+            margin-top: 32px;
+            font-size: 12px;
+            color: #aaa;
+            line-height: 1.8;
+            border-top: 1px solid #ddd;
+            padding-top: 16px;
+        }
+
+        #info span {
+            display: inline-block;
+            background: #f0f0f0;
+            border-radius: 4px;
+            padding: 2px 8px;
+            margin: 2px;
+            color: #555;
+        }
+
+        #scoreTitle {
+            margin-bottom: 8px;
+        }
+
+        #scoreTitleInput {
+            border: none;
+            border-bottom: 1px solid #ddd;
+            font-size: 16px;
+            color: #222;
+            outline: none;
+            background: transparent;
+            padding: 4px 0;
+            width: 300px;
+            user-select: text;
+        }
+
+        #scoreTitleInput:focus {
+            border-bottom: 1px solid #222;
+        }
+
+    </style>
+</head>
+<body>
+
+<header>
+    <i class="fa-solid fa-music"></i>
+    <h1>ぽこあスコアメーカー</h1>
+</header>
+
+<div id="main">
+
+    <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:20px;">
+        <div id="toolbars" style="margin-bottom:0;">
+            <div class="toolbar">
+                <label id="loadBtn" tabindex="-1" title="開く"><i class="fa-solid fa-folder-open"></i><input type="file" id="loadFile" accept=".json" style="display:none"></label>
+                <button id="saveBtn" tabindex="-1" title="保存"><i class="fa-solid fa-floppy-disk"></i></button>
+                <button id="clearBtn" tabindex="-1" title="全クリア"><i class="fa-solid fa-trash"></i></button>
+            </div>
+            <div class="toolbar">
+                <button id="compassBtn" tabindex="-1" title="北の向きを変える">
+                    <i class="fa-solid fa-compass"></i>
+                    <span id="compassLabel" style="font-size:10px; margin-left:2px;">N↑</span>
+                </button>
+            </div>
+            <div class="toolbar">
+                <button id="playBtn" tabindex="-1" title="再生/停止"><i class="fa-solid fa-play"></i></button>
+                <input type="number" id="bpmInput" value="120" min="40" max="240" step="1" style="width:52px; border:none; border-bottom:1px solid #ddd; font-size:14px; text-align:center; background:transparent; outline:none;" title="BPM">
+                <span style="font-size:11px; color:#aaa;">BPM</span>
+            </div>
+            <div class="toolbar">
+                <button id="zoomOut" tabindex="-1" title="縮小"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
+                <input type="range" id="zoomSlider" min="0.25" max="1.75" step="0.01" value="1">
+                <button id="zoomIn" tabindex="-1" title="拡大"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
+            </div>
+        </div>
+        <div id="panelCount" style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;"></div>
+    </div>
+
+    <div id="scoreTitle">
+        <input type="text" id="scoreTitleInput" placeholder="楽譜の名前" value="NewScore">
+    </div>
+    <div id="scoreWrapper">
+        <div id="score"></div>
+        <button id="addMeasureBtn"><i class="fa-solid fa-circle-plus"></i></button>
+    </div>
+
+    <div id="imageArea"></div>
+
+    <div id="info">
+        <span><i class="fa-solid fa-arrow-pointer"></i> 左クリック</span> 音符追加 &nbsp;
+        <span><i class="fa-solid fa-arrow-pointer"></i> 左クリック（音符上）</span> 削除 &nbsp;
+        <span><i class="fa-solid fa-computer-mouse"></i> 右クリック（音符上）</span> 音価切替 &nbsp;
+        <span><i class="fa-solid fa-keyboard"></i> Shift + 左クリック</span> 白鍵↔黒鍵 &nbsp;
+        <span><i class="fa-solid fa-keyboard"></i> Ctrl + 左クリック</span> 休符追加
+    </div>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/vexflow@5.0.0/build/cjs/vexflow.js"></script>
+<script src="app.js"></script>
+
+</body>
+</html>
