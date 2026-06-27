@@ -451,11 +451,28 @@ function updateImageArea() {
         imageArea.appendChild(group);
     });
 
-    const BLACK_TO_WHITE = {
-        "C#4": "C4", "D#4": "D4", "F#4": "F4",
-        "G#4": "G4", "A#4": "A4", "C#5": "C5",
-        "D#5": "D5", "F#5": "F5", "G#5": "G5",
-        "A#5": "A5", "C#6": "C6"
+const PITCH_TO_GROUP = {
+        "C4": "C1", "C#4": "C1",
+        "D4": "D",  "D#4": "D",
+        "E4": "E",
+        "F4": "F",  "F#4": "F",
+        "G4": "G",  "G#4": "G",
+        "A4": "A",  "A#4": "A",
+        "B4": "B",
+        "C5": "C2", "C#5": "C2",
+        "D5": "D",  "D#5": "D",
+        "E5": "E",
+        "F5": "F",  "F#5": "F",
+        "G5": "G",  "G#5": "G",
+        "A5": "A",  "A#5": "A",
+        "B5": "B",
+        "C6": "C2", "C#6": "C2",
+    };
+
+    const GROUP_TO_FILE = {
+        "C1": "c.jpg", "D": "d.jpg", "E": "e.jpg",
+        "F": "f.jpg",  "G": "g.jpg", "A": "a.jpg",
+        "B": "b.jpg",  "C2": "c2.jpg"
     };
 
     const countMap = {};
@@ -463,8 +480,8 @@ function updateImageArea() {
         measure.notes.forEach(note => {
             if (!note.rest && note.pitches) {
                 note.pitches.forEach(pitch => {
-                    const base = BLACK_TO_WHITE[pitch] || pitch;
-                    countMap[base] = (countMap[base] || 0) + 1;
+                    const group = PITCH_TO_GROUP[pitch];
+                    if (group) countMap[group] = (countMap[group] || 0) + 1;
                 });
             }
         });
@@ -474,9 +491,9 @@ function updateImageArea() {
     if (!panelCount) return;
     panelCount.innerHTML = "";
 
-    const ORDER = ["C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5", "D5", "E5", "F5", "G5", "A5", "B5", "C6"];
-    ORDER.forEach(pitch => {
-        const file = PITCH_TO_FILE[pitch];
+    const ORDER = ["C1", "D", "E", "F", "G", "A", "B", "C2"];
+    ORDER.forEach(group => {
+        const file = GROUP_TO_FILE[group];
         if (!file) return;
 
         const item = document.createElement("div");
@@ -489,7 +506,7 @@ function updateImageArea() {
 
         const count = document.createElement("span");
         count.style.cssText = "font-size:12px; color:#999;";
-        count.textContent = `×${countMap[pitch] || 0}`;
+        count.textContent = `×${countMap[group] || 0}`;
 
         item.appendChild(img);
         item.appendChild(count);
@@ -1024,7 +1041,7 @@ function setupSVGEvents() {
                     if (existingNote) {
                         const note = measure.notes[existingNote.noteIndex];
                         if (note.rest) return;
-                        if (note.pitches.length >= 3) return;
+                        if (note.pitches.length >= 12) return;
 
                         const pitch = yToPitch(clickYLocal, false);
                         if (!pitch) return;
@@ -1210,8 +1227,6 @@ async function main() {
 
     document.getElementById("redoBtn")
         .addEventListener("click", () => redo());
-
-    document.getElementById("playBtn")
 
     document.getElementById("playBtn")
         .addEventListener("click", () => {
