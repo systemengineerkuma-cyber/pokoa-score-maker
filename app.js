@@ -614,6 +614,7 @@ function getMeasuresPerRow() {
 }
 
 function renderScore() {
+    const scrollY = window.scrollY;
     notePositions = [];
 
     const scoreElement = document.getElementById("score");
@@ -684,12 +685,23 @@ function renderScore() {
                 return;
             }
 
-            const notes = measure.notes.map((note) => {
+            const notes = measure.notes.map((note, noteIndex) => {
+                const isHovered = hoveredPos &&
+                    hoveredPos.measureIndex === measureIndex &&
+                    hoveredPos.hitNoteIndex === noteIndex &&
+                    hoveredPos.directHit === true;
+
+                const hoverColor = "rgba(220, 50, 50, 0.7)";
+
                 if (note.rest) {
-                    return new VF.StaveNote({
+                    const restNote = new VF.StaveNote({
                         keys: ["b/4"],
                         duration: note.duration + "r"
                     });
+                    if (isHovered) {
+                        restNote.setStyle({ fillStyle: hoverColor, strokeStyle: hoverColor });
+                    }
+                    return restNote;
                 }
 
                 const keys = note.pitches.map(p => pitchToKey(p).key);
@@ -698,6 +710,10 @@ function renderScore() {
                     duration: note.duration,
                     auto_stem: true
                 });
+
+                if (isHovered) {
+                    staveNote.setStyle({ fillStyle: hoverColor, strokeStyle: hoverColor });
+                }
 
                 note.pitches.forEach((pitch, i) => {
                     const converted = pitchToKey(pitch);
@@ -748,13 +764,19 @@ function renderScore() {
 
             notes.forEach((staveNote, noteIndex) => {
                 const noteData = measure.notes[noteIndex];
+                const bb = staveNote.getBoundingBox();
+                console.log("noteIndex:", noteIndex, "pitches:", noteData.pitches, "bb:", bb ? {x: Math.round(bb.getX()*scale), w: Math.round(bb.getW()*scale)} : null);
                 const nx = staveNote.getAbsoluteX() * scale;
+                const nxLeft = bb ? bb.getX() * scale : nx - 6 * scale;
+                const nxRight = bb ? (bb.getX() + bb.getW()) * scale : nx + 6 * scale;
                 const svgOffsetTop = rowDiv.offsetTop;
 
                 if (noteData.rest) {
                     const ny = staveNote.getYs()[0] * scale + svgOffsetTop;
                     notePositions.push({
                         x: nx,
+                        xLeft: nxLeft,
+                        xRight: nxRight,
                         y: ny,
                         pitch: null,
                         rest: true,
@@ -766,10 +788,17 @@ function renderScore() {
                     return;
                 }
 
+                const bbX = bb ? bb.getX() * scale : nx;
+                const bbW = bb ? bb.getW() * scale : 12 * scale;
+                const pitchCount = noteData.pitches.length;
+
                 noteData.pitches.forEach((pitch, pitchIndex) => {
                     const ny = staveNote.getYs()[pitchIndex] * scale + svgOffsetTop;
+                    const sliceW = bbW / pitchCount;
                     notePositions.push({
                         x: nx,
+                        xLeft: bbX + sliceW * pitchIndex,
+                        xRight: bbX + sliceW * (pitchIndex + 1),
                         y: ny,
                         pitch,
                         measureIndex,
@@ -780,6 +809,9 @@ function renderScore() {
                 });
             });
 
+            const pos = notePositions.filter(p => p.measureIndex === measureIndex);
+            if (pos.length > 0) console.log("measure", measureIndex, JSON.stringify(pos.map(p => ({pitch: p.pitch, x: Math.round(p.x), xLeft: Math.round(p.xLeft), xRight: Math.round(p.xRight)}))));
+
             drawHoverPreview(context, stave, measureIndex);
         });
     });
@@ -787,6 +819,7 @@ function renderScore() {
     updateImageArea();
     updateAddButton();
     setupSVGEvents();
+    window.scrollTo(0, scrollY);
 }
 
 function setupDeleteButtons() {
@@ -846,14 +879,15 @@ function updateDeleteButtons() {}
 function findNoteAtX(measureIndex, clickX) {
     return notePositions.find(pos =>
         pos.measureIndex === measureIndex &&
-        Math.abs(pos.x - clickX) <= 10 * scale
+        Math.abs(pos.x - clickX) <= 24 * scale
     ) || null;
 }
 
 function findNoteAt(measureIndex, clickX, clickY, looseness = 1) {
     const hit = notePositions.find(pos =>
         pos.measureIndex === measureIndex &&
-        Math.abs(pos.x - clickX) <= 10 * scale * looseness &&
+        clickX >= pos.xLeft &&
+        clickX < pos.xRight &&
         Math.abs(pos.y - clickY) <= 5 * scale * looseness
     );
     return hit || null;
@@ -920,9 +954,12 @@ function setupSVGEvents() {
             }
 
             const pitch = yToPitch(e.clientY - rect.top, false);
+            const hitNote = findNoteAt(measureIndex, mouseX, mouseY);
+            const hitNoteX = findNoteAtX(measureIndex, mouseX);
+            if (hitNote) console.log("hitNote:", {noteIndex: hitNote.noteIndex, pitchIndex: hitNote.pitchIndex, pitch: hitNote.pitch});
 
             const newHovered = pitch
-                ? { measureIndex, x: mouseX, y: mouseY, pitch }
+                ? { measureIndex, x: mouseX, y: mouseY, pitch, hitNoteIndex: hitNote ? hitNote.noteIndex : (hitNoteX ? hitNoteX.noteIndex : null), directHit: !!hitNote }
                 : null;
 
             const changed = JSON.stringify(newHovered) !== JSON.stringify(hoveredPos);
@@ -1023,7 +1060,25 @@ function setupSVGEvents() {
                     saveHistory();
                     renderScore();
 
-                } else if (hit) {
+                    } else if (hit) {
+                    // 同じX座標に既存音符があり、Y座標が外れている場合は和音追加
+                    const existingAtX = findNoteAtX(measureIndex, clickX);
+                    if (existingAtX && !existingAtX.rest) {
+                        const note = measure.notes[existingAtX.noteIndex];
+                        const pitch = yToPitch(clickYLocal, false);
+                        if (pitch && !note.pitches.includes(pitch) && note.pitches.length < 12) {
+                            note.pitches.push(pitch);
+                            note.pitches.sort((a, b) => {
+                                const aIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === a);
+                                const bIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === b);
+                                return aIdx - bIdx;
+                            });
+                            saveHistory();
+                            renderScore();
+                            return;
+                        }
+                    }
+
                     const note = measure.notes[hit.noteIndex];
                     if (note.rest) {
                         measure.notes.splice(hit.noteIndex, 1);
@@ -1155,11 +1210,14 @@ async function main() {
     });
 
     document.getElementById("addMeasureBtn")
-        .addEventListener("click", () => {
+        .addEventListener("click", (e) => {
+            e.preventDefault();
+            const scrollY = window.scrollY;
             score.measures.push({ notes: [] });
             saveHistory();
             renderScore();
             setupDeleteButtons();
+            window.scrollTo(0, scrollY);
         });
 
     document.addEventListener("keydown", e => {
