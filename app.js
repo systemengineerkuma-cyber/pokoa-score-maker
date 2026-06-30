@@ -11,12 +11,18 @@ let northDirection = 0; // 0=↑, 1=→, 2=↓, 3=←
 
 let audioCtx = null;
 let isPlaying = false;
+let isLooping = false;
 let playTimeouts = [];
 let playStartTime = null;
 let noteSchedule = [];
 let noteTimeMap = [];
 let currentHighlightMeasure = -1;
 let animFrameId = null;
+
+// 小節範囲選択用の状態
+let selectedMeasures = new Set();
+let dragState = null; // { startX, startY, currentX, currentY, isDragging }
+const DRAG_THRESHOLD = 6; // px
 
 function getAudioContext() {
     if (!audioCtx) audioCtx = new AudioContext();
@@ -129,6 +135,11 @@ function playScore() {
 
     const totalTime = (time - ctx.currentTime) * 1000;
     const t = setTimeout(() => {
+        if (isLooping) {
+            isPlaying = false;
+            playScore();
+            return;
+        }
         isPlaying = false;
         currentHighlightMeasure = -1;
         cancelAnimationFrame(animFrameId);
@@ -215,8 +226,8 @@ function drawPlayLine(x, rowIndex) {
     rowDiv.appendChild(line);
 }
 
-const DURATION_ORDER = ["q", "8", "h", "w"];
-const durationBeats = { "w": 4, "h": 2, "q": 1, "8": 0.5 };
+const DURATION_ORDER = ["16", "8", "q", "h", "w"];
+const durationBeats = { "w": 4, "h": 2, "q": 1, "8": 0.5, "16": 0.25 };
 
 const STAVE_TOP_BASE = 40;
 const STAVE_WIDTH_BASE = 350;
@@ -353,7 +364,7 @@ function pitchToKey(pitch) {
 function makeDummyNotes(remainingBeats) {
     const dummies = [];
     let remaining = remainingBeats;
-    const durations = ["w", "h", "q", "8"];
+    const durations = ["w", "h", "q", "8", "16"];
 
     for (const dur of durations) {
         while (remaining >= durationBeats[dur]) {
@@ -374,7 +385,8 @@ function makeDummyNotes(remainingBeats) {
 
 function updateImageArea() {
     document.documentElement.style.setProperty('--scale', scale);
-    const imageSize = Math.round(64 * scale * 0.5);
+    const imageSize = Math.round(42 * scale * 0.5);
+    const panelCountImageSize = 21;
     const imageArea = document.getElementById("imageArea");
     imageArea.innerHTML = "";
 
@@ -390,19 +402,19 @@ function updateImageArea() {
         const imagesRow = document.createElement("div");
         imagesRow.className = "measureImages";
 
-        const slots = Array(8).fill(null);
+        const slots = Array(16).fill(null);
         let slotIndex = 0;
         measure.notes.forEach(note => {
             const beats = durationBeats[note.duration] || 0;
-            const slotCount = beats / 0.5;
+            const slotCount = beats / 0.25;
 
             if (note.rest) {
                 for (let s = 0; s < slotCount; s++) {
-                    if (slotIndex < 8) slots[slotIndex++] = { type: "rest" };
+                    if (slotIndex < 16) slots[slotIndex++] = { type: "rest" };
                 }
             } else {
                 for (let s = 0; s < slotCount; s++) {
-                    if (slotIndex < 8) {
+                    if (slotIndex < 16) {
                         slots[slotIndex++] = s === 0
                             ? { type: "note", pitches: note.pitches }
                             : { type: "continuation" };
@@ -432,7 +444,7 @@ function updateImageArea() {
                     justify-content: flex-start;
                     gap: 2px;
                 `;
-                slot.pitches.forEach(pitch => {
+                [...slot.pitches].reverse().forEach(pitch => {
                     if (!PITCH_TO_FILE[pitch]) return;
                     const img = document.createElement("img");
                     img.src = `img/${PITCH_TO_FILE[pitch]}`;
@@ -501,7 +513,7 @@ const PITCH_TO_GROUP = {
 
         const img = document.createElement("img");
         img.src = `img/${file}`;
-        img.style.cssText = `width:${imageSize}px; height:${imageSize}px;`;
+        img.style.cssText = `width:${panelCountImageSize}px; height:${panelCountImageSize}px;`;
         img.style.transform = `rotate(${northDirection * 90}deg)`;
 
         const count = document.createElement("span");
@@ -592,16 +604,20 @@ function undo() {
     if (historyIndex <= 0) return;
     historyIndex--;
     score = JSON.parse(history[historyIndex]);
+    selectedMeasures.clear();
     renderScore();
     setupDeleteButtons();
+    setupInsertButtons();
 }
 
 function redo() {
     if (historyIndex >= history.length - 1) return;
     historyIndex++;
     score = JSON.parse(history[historyIndex]);
+    selectedMeasures.clear();
     renderScore();
     setupDeleteButtons();
+    setupInsertButtons();
 }
 
 function getMeasuresPerRow() {
@@ -611,6 +627,83 @@ function getMeasuresPerRow() {
     if (availableWidth < firstRowWidth * scale) return 1;
     const remaining = availableWidth - firstRowWidth * scale;
     return 1 + Math.floor(remaining / (STAVE_WIDTH_BASE * scale));
+}
+
+// 指定した小節のX範囲（row内の左端〜右端）を返す
+function getMeasureXRange(measureIndex) {
+    const measuresPerRow = getMeasuresPerRow();
+    const rowIndex = Math.floor(measureIndex / measuresPerRow);
+    const indexInRow = measureIndex % measuresPerRow;
+    const isFirstRow = rowIndex === 0;
+    const isFirstMeasure = isFirstRow && indexInRow === 0;
+
+    let sx;
+    if (isFirstRow) {
+        sx = indexInRow === 0 ? 20 : 20 + FIRST_MEASURE_EXTRA + indexInRow * STAVE_WIDTH_BASE;
+    } else {
+        sx = 20 + indexInRow * STAVE_WIDTH_BASE;
+    }
+    const measureWidth = isFirstMeasure ? STAVE_WIDTH_BASE + FIRST_MEASURE_EXTRA : STAVE_WIDTH_BASE;
+
+    return {
+        rowIndex,
+        left: sx * scale,
+        right: (sx + measureWidth) * scale
+    };
+}
+
+// 指定座標（scoreWrapper基準）に最も近い小節indexを返す（行優先・X座標は範囲内/最近傍）
+function getMeasureIndexFromWrapperXY(x, y) {
+    const scoreElement = document.getElementById("score");
+    const rowDivs = scoreElement.querySelectorAll("div[data-row-index]");
+    if (!rowDivs.length || !score.measures.length) return 0;
+
+    let bestIndex = 0;
+    let bestDist = Infinity;
+
+    score.measures.forEach((_, measureIndex) => {
+        const { rowIndex, left, right } = getMeasureXRange(measureIndex);
+        const rowDiv = rowDivs[rowIndex];
+        if (!rowDiv) return;
+
+        const top = rowDiv.offsetTop;
+        const bottom = top + rowDiv.offsetHeight;
+
+        let dy;
+        if (y < top) dy = top - y;
+        else if (y > bottom) dy = y - bottom;
+        else dy = 0;
+
+        let dx;
+        if (x < left) dx = left - x;
+        else if (x > right) dx = x - right;
+        else dx = 0;
+
+        // 行のズレを最優先（同じ行内ならdy=0なので、行内のX距離だけで比較される）
+        const dist = dy * 100000 + dx;
+
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestIndex = measureIndex;
+        }
+    });
+
+    return bestIndex;
+}
+
+// ドラッグ開始点〜終了点までの小節indexを、順序通りに全部含めて返す（飛び飛びにならない）
+function getMeasuresInDragRange(x1, y1, x2, y2) {
+    const startIndex = getMeasureIndexFromWrapperXY(x1, y1);
+    const endIndex = getMeasureIndexFromWrapperXY(x2, y2);
+
+    const from = Math.min(startIndex, endIndex);
+    const to = Math.max(startIndex, endIndex);
+
+    const result = [];
+    for (let i = from; i <= to; i++) {
+        result.push(i);
+    }
+    return result;
 }
 
 function renderScore() {
@@ -765,7 +858,6 @@ function renderScore() {
             notes.forEach((staveNote, noteIndex) => {
                 const noteData = measure.notes[noteIndex];
                 const bb = staveNote.getBoundingBox();
-                console.log("noteIndex:", noteIndex, "pitches:", noteData.pitches, "bb:", bb ? {x: Math.round(bb.getX()*scale), w: Math.round(bb.getW()*scale)} : null);
                 const nx = staveNote.getAbsoluteX() * scale;
                 const nxLeft = bb ? bb.getX() * scale : nx - 6 * scale;
                 const nxRight = bb ? (bb.getX() + bb.getW()) * scale : nx + 6 * scale;
@@ -809,9 +901,6 @@ function renderScore() {
                 });
             });
 
-            const pos = notePositions.filter(p => p.measureIndex === measureIndex);
-            if (pos.length > 0) console.log("measure", measureIndex, JSON.stringify(pos.map(p => ({pitch: p.pitch, x: Math.round(p.x), xLeft: Math.round(p.xLeft), xRight: Math.round(p.xRight)}))));
-
             drawHoverPreview(context, stave, measureIndex);
         });
     });
@@ -819,7 +908,55 @@ function renderScore() {
     updateImageArea();
     updateAddButton();
     setupSVGEvents();
+    drawSelectionRect();
     window.scrollTo(0, scrollY);
+}
+
+// 選択中（確定 + ドラッグ中の暫定）の小節にDIVオーバーレイでハイライトを重ねる
+// renderScore() を呼ばずに高速更新できるようにするための仕組み
+function drawSelectionRect() {
+    document.querySelectorAll(".selectionHighlight").forEach(el => el.remove());
+
+    const scoreElement = document.getElementById("score");
+    const rowDivs = scoreElement.querySelectorAll("div[data-row-index]");
+    if (!rowDivs.length || !score.measures.length) return;
+
+    let previewSet = null;
+    if (dragState && dragState.isDragging) {
+        previewSet = new Set(getMeasuresInDragRange(
+            dragState.startX, dragState.startY,
+            dragState.currentX, dragState.currentY
+        ));
+    }
+
+    const wrapper = document.getElementById("scoreWrapper");
+
+    score.measures.forEach((_, measureIndex) => {
+        const isSelected = selectedMeasures.has(measureIndex) ||
+            (previewSet && previewSet.has(measureIndex));
+        if (!isSelected) return;
+
+        const { rowIndex, left, right } = getMeasureXRange(measureIndex);
+        const rowDiv = rowDivs[rowIndex];
+        if (!rowDiv) return;
+
+        const top = rowDiv.offsetTop + (STAVE_TOP_BASE - 6) * scale;
+        const height = 130 * scale;
+
+        const el = document.createElement("div");
+        el.className = "selectionHighlight";
+        el.style.cssText = `
+            position: absolute;
+            left: ${left}px;
+            top: ${top}px;
+            width: ${right - left}px;
+            height: ${height}px;
+            background: rgba(74, 144, 226, 0.12);
+            pointer-events: none;
+            z-index: 5;
+        `;
+        wrapper.appendChild(el);
+    });
 }
 
 function setupDeleteButtons() {
@@ -865,9 +1002,62 @@ function setupDeleteButtons() {
 
         btn.addEventListener("click", () => {
             score.measures.splice(measureIndex, 1);
+            selectedMeasures.clear();
             saveHistory();
             renderScore();
             setupDeleteButtons();
+            setupInsertButtons();
+        });
+
+        wrapper.appendChild(btn);
+    });
+}
+
+function setupInsertButtons() {
+    document.querySelectorAll(".insertMeasureBtn").forEach(b => b.remove());
+
+    const wrapper = document.getElementById("scoreWrapper");
+    const scoreElement = document.getElementById("score");
+    const measuresPerRow = getMeasuresPerRow();
+
+    score.measures.forEach((_, measureIndex) => {
+        const btn = document.createElement("button");
+        btn.className = "insertMeasureBtn";
+        btn.innerHTML = '<i class="fa-solid fa-circle-plus"></i>';
+
+        const rowIndex = Math.floor(measureIndex / measuresPerRow);
+        const indexInRow = measureIndex % measuresPerRow;
+        const isFirstRow = rowIndex === 0;
+        const isFirstMeasure = isFirstRow && indexInRow === 0;
+
+        let sx;
+        if (isFirstRow) {
+            sx = indexInRow === 0 ? 20 : 20 + FIRST_MEASURE_EXTRA + indexInRow * STAVE_WIDTH_BASE;
+        } else {
+            sx = 20 + indexInRow * STAVE_WIDTH_BASE;
+        }
+
+        const rowDivs = scoreElement.querySelectorAll("div[data-row-index]");
+        const rowDiv = rowDivs[rowIndex];
+        const rowOffsetTop = rowDiv ? rowDiv.offsetTop : 0;
+
+        const leftPos = (sx - 14) * scale;
+        const topPos = rowOffsetTop + (STAVE_TOP_BASE + 110) * scale;
+
+        btn.style.left = `${leftPos}px`;
+        btn.style.top = `${topPos}px`;
+        btn.style.display = "flex";
+        btn.style.width = `${28 * scale}px`;
+        btn.style.height = `${28 * scale}px`;
+        btn.style.fontSize = `${16 * scale}px`;
+
+        btn.addEventListener("click", () => {
+            score.measures.splice(measureIndex, 0, { notes: [] });
+            selectedMeasures.clear();
+            saveHistory();
+            renderScore();
+            setupDeleteButtons();
+            setupInsertButtons();
         });
 
         wrapper.appendChild(btn);
@@ -926,9 +1116,187 @@ function getMeasureIndexFromXY(clickX, clickY) {
     return rowIndex * measuresPerRow + indexInRow;
 }
 
+// 実際の音符編集処理（ドラッグでない通常クリック時に呼ばれる）
+function handleNoteEdit(e, svg, rowDiv) {
+    const rect = svg.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const clickY = e.clientY - rect.top + rowDiv.offsetTop;
+    const clickYLocal = e.clientY - rect.top;
+
+    const measureIndex = getMeasureIndexFromXY(clickX, clickY);
+    if (measureIndex < 0 || measureIndex >= score.measures.length) return;
+
+    const measure = score.measures[measureIndex];
+    const hit = findNoteAt(measureIndex, clickX, clickY);
+
+    const measuresPerRow = getMeasuresPerRow();
+    const idxInRow = measureIndex % measuresPerRow;
+    const isFirstRow = Math.floor(measureIndex / measuresPerRow) === 0;
+    const isFirstMeasure = isFirstRow && idxInRow === 0;
+    let sx;
+    if (isFirstRow) {
+        sx = idxInRow === 0 ? 20 : 20 + FIRST_MEASURE_EXTRA + idxInRow * STAVE_WIDTH_BASE;
+    } else {
+        sx = 20 + idxInRow * STAVE_WIDTH_BASE;
+    }
+    const measureWidth = isFirstMeasure ? STAVE_WIDTH_BASE + FIRST_MEASURE_EXTRA : STAVE_WIDTH_BASE;
+    const isValidX = clickX < (sx + measureWidth) * scale;
+
+    if (e.button === 0) {
+        if (e.shiftKey) {
+            const shiftHit = notePositions
+                .filter(pos =>
+                    pos.measureIndex === measureIndex &&
+                    Math.abs(pos.x - clickX) <= 20 * scale
+                )
+                .sort((a, b) => Math.abs(a.y - clickY) - Math.abs(b.y - clickY))[0] || null;
+
+            if (shiftHit) {
+                const note = measure.notes[shiftHit.noteIndex];
+                const pitch = note.pitches[shiftHit.pitchIndex];
+                if (BLACK_PITCHES.has(pitch)) {
+                    const whiteKey = Object.keys(WHITE_TO_BLACK).find(
+                        k => WHITE_TO_BLACK[k] === pitch
+                    );
+                    if (whiteKey) {
+                        note.pitches[shiftHit.pitchIndex] = whiteKey;
+                        saveHistory();
+                        renderScore();
+                    }
+                } else if (WHITE_TO_BLACK[pitch]) {
+                    note.pitches[shiftHit.pitchIndex] = WHITE_TO_BLACK[pitch];
+                    saveHistory();
+                    renderScore();
+                }
+            }
+
+        } else if (e.ctrlKey) {
+            const existingNote = findNoteAt(measureIndex, clickX, clickY);
+            if (existingNote) return;
+            if (!isValidX) return;
+
+            const measureNotes = notePositions.filter(
+                p => p.measureIndex === measureIndex
+            );
+
+            const beats = getMeasureBeats(measure);
+            const remaining = 4 - beats;
+            if (remaining <= 0) return;
+
+            const duration = remaining >= 1 ? "q" : remaining >= 0.5 ? "8" : "16";
+            if (durationBeats[duration] > remaining) return;
+
+            const uniqueNoteIndices = [...new Set(measureNotes.map(p => p.noteIndex))];
+            const noteInsertIndex = uniqueNoteIndices.filter(i => {
+                const pos = measureNotes.find(p => p.noteIndex === i);
+                return pos && pos.x < clickX;
+            }).length;
+
+            measure.notes.splice(noteInsertIndex, 0, {
+                rest: true,
+                duration
+            });
+            saveHistory();
+            renderScore();
+
+            } else if (hit) {
+            // 同じX座標に既存音符があり、Y座標が外れている場合は和音追加
+            const existingAtX = findNoteAtX(measureIndex, clickX);
+            if (existingAtX && !existingAtX.rest) {
+                const note = measure.notes[existingAtX.noteIndex];
+                const pitch = yToPitch(clickYLocal, false);
+                if (pitch && !note.pitches.includes(pitch) && note.pitches.length < 12) {
+                    note.pitches.push(pitch);
+                    note.pitches.sort((a, b) => {
+                        const aIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === a);
+                        const bIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === b);
+                        return aIdx - bIdx;
+                    });
+                    saveHistory();
+                    renderScore();
+                    return;
+                }
+            }
+
+            const note = measure.notes[hit.noteIndex];
+            if (note.rest) {
+                measure.notes.splice(hit.noteIndex, 1);
+            } else if (note.pitches.length === 1) {
+                measure.notes.splice(hit.noteIndex, 1);
+            } else {
+                note.pitches.splice(hit.pitchIndex, 1);
+            }
+            saveHistory();
+            renderScore();
+
+        } else {
+            const existingNote = findNoteAtX(measureIndex, clickX);
+
+            if (existingNote) {
+                const note = measure.notes[existingNote.noteIndex];
+                if (note.rest) return;
+                if (note.pitches.length >= 12) return;
+
+                const pitch = yToPitch(clickYLocal, false);
+                if (!pitch) return;
+                if (note.pitches.includes(pitch)) return;
+
+                note.pitches.push(pitch);
+                note.pitches.sort((a, b) => {
+                    const aIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === a);
+                    const bIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === b);
+                    return aIdx - bIdx;
+                });
+                saveHistory();
+                renderScore();
+
+            } else {
+                if (!isValidX) return;
+
+                const pitch = yToPitch(clickYLocal, false);
+                if (!pitch) return;
+
+                const beats = getMeasureBeats(measure);
+                const remaining = 4 - beats;
+                if (remaining <= 0) return;
+
+                const duration = remaining >= 1 ? "q" : remaining >= 0.5 ? "8" : "16";
+                if (durationBeats[duration] > remaining) return;
+
+                const measureNotePositions = notePositions.filter(
+                    p => p.measureIndex === measureIndex
+                );
+                const uniqueNoteIndices = [...new Set(measureNotePositions.map(p => p.noteIndex))];
+                const insertIndex = uniqueNoteIndices.filter(i => {
+                    const pos = measureNotePositions.find(p => p.noteIndex === i);
+                    return pos && pos.x < clickX;
+                }).length;
+
+                measure.notes.splice(insertIndex, 0, {
+                    pitches: [pitch],
+                    duration
+                });
+                saveHistory();
+                renderScore();
+            }
+        }
+
+    } else if (e.button === 2) {
+        if (hit) {
+            const note = measure.notes[hit.noteIndex];
+            const beats = getMeasureBeats(measure);
+            const remaining = 4 - beats + durationBeats[note.duration];
+            note.duration = getNextDuration(note.duration, remaining);
+            saveHistory();
+            renderScore();
+        }
+    }
+}
+
 function setupSVGEvents() {
     const scoreElement = document.getElementById("score");
     const svgs = scoreElement.querySelectorAll("svg");
+    const wrapper = document.getElementById("scoreWrapper");
 
     svgs.forEach((svg, rowIndex) => {
         const rowDiv = svg.parentElement;
@@ -939,6 +1307,24 @@ function setupSVGEvents() {
         svg.addEventListener("contextmenu", e => e.preventDefault());
 
         svg.addEventListener("mousemove", e => {
+            // ドラッグ中は選択矩形を更新し、ホバー処理はスキップ
+            if (dragState) {
+                const wrapperRect = wrapper.getBoundingClientRect();
+                dragState.currentX = e.clientX - wrapperRect.left;
+                dragState.currentY = e.clientY - wrapperRect.top;
+
+                const dx = dragState.currentX - dragState.startX;
+                const dy = dragState.currentY - dragState.startY;
+                if (!dragState.isDragging && Math.hypot(dx, dy) > DRAG_THRESHOLD) {
+                    dragState.isDragging = true;
+                }
+
+                if (dragState.isDragging) {
+                    drawSelectionRect();
+                    return;
+                }
+            }
+
             const rect = svg.getBoundingClientRect();
             const mouseX = e.clientX - rect.left;
             const mouseY = e.clientY - rect.top + rowDiv.offsetTop;
@@ -956,7 +1342,6 @@ function setupSVGEvents() {
             const pitch = yToPitch(e.clientY - rect.top, false);
             const hitNote = findNoteAt(measureIndex, mouseX, mouseY);
             const hitNoteX = findNoteAtX(measureIndex, mouseX);
-            if (hitNote) console.log("hitNote:", {noteIndex: hitNote.noteIndex, pitchIndex: hitNote.pitchIndex, pitch: hitNote.pitch});
 
             const newHovered = pitch
                 ? { measureIndex, x: mouseX, y: mouseY, pitch, hitNoteIndex: hitNote ? hitNote.noteIndex : (hitNoteX ? hitNoteX.noteIndex : null), directHit: !!hitNote }
@@ -970,6 +1355,7 @@ function setupSVGEvents() {
         });
 
         svg.addEventListener("mouseleave", () => {
+            if (dragState) return;
             if (hoveredPos !== null) {
                 hoveredPos = null;
                 renderScore();
@@ -979,180 +1365,59 @@ function setupSVGEvents() {
         svg.addEventListener("mousedown", e => {
             e.preventDefault();
 
-            const rect = svg.getBoundingClientRect();
-            const clickX = e.clientX - rect.left;
-            const clickY = e.clientY - rect.top + rowDiv.offsetTop;
-            const clickYLocal = e.clientY - rect.top;
-
-            const measureIndex = getMeasureIndexFromXY(clickX, clickY);
-            if (measureIndex < 0 || measureIndex >= score.measures.length) return;
-
-            const measure = score.measures[measureIndex];
-            const hit = findNoteAt(measureIndex, clickX, clickY);
-
-            const measuresPerRow = getMeasuresPerRow();
-            const idxInRow = measureIndex % measuresPerRow;
-            const isFirstRow = Math.floor(measureIndex / measuresPerRow) === 0;
-            const isFirstMeasure = isFirstRow && idxInRow === 0;
-            let sx;
-            if (isFirstRow) {
-                sx = idxInRow === 0 ? 20 : 20 + FIRST_MEASURE_EXTRA + idxInRow * STAVE_WIDTH_BASE;
-            } else {
-                sx = 20 + idxInRow * STAVE_WIDTH_BASE;
+            if (e.button === 0 && !e.shiftKey && !e.ctrlKey) {
+                const wrapperRect = wrapper.getBoundingClientRect();
+                dragState = {
+                    startX: e.clientX - wrapperRect.left,
+                    startY: e.clientY - wrapperRect.top,
+                    currentX: e.clientX - wrapperRect.left,
+                    currentY: e.clientY - wrapperRect.top,
+                    isDragging: false,
+                    svg,
+                    rowDiv,
+                    originalEvent: e
+                };
+                return;
             }
-            const measureWidth = isFirstMeasure ? STAVE_WIDTH_BASE + FIRST_MEASURE_EXTRA : STAVE_WIDTH_BASE;
-            const isValidX = clickX < (sx + measureWidth) * scale;
 
-            if (e.button === 0) {
-                if (e.shiftKey) {
-                    const shiftHit = notePositions
-                        .filter(pos =>
-                            pos.measureIndex === measureIndex &&
-                            Math.abs(pos.x - clickX) <= 20 * scale
-                        )
-                        .sort((a, b) => Math.abs(a.y - clickY) - Math.abs(b.y - clickY))[0] || null;
-
-                    if (shiftHit) {
-                        const note = measure.notes[shiftHit.noteIndex];
-                        const pitch = note.pitches[shiftHit.pitchIndex];
-                        if (BLACK_PITCHES.has(pitch)) {
-                            const whiteKey = Object.keys(WHITE_TO_BLACK).find(
-                                k => WHITE_TO_BLACK[k] === pitch
-                            );
-                            if (whiteKey) {
-                                note.pitches[shiftHit.pitchIndex] = whiteKey;
-                                saveHistory();
-                                renderScore();
-                            }
-                        } else if (WHITE_TO_BLACK[pitch]) {
-                            note.pitches[shiftHit.pitchIndex] = WHITE_TO_BLACK[pitch];
-                            saveHistory();
-                            renderScore();
-                        }
-                    }
-
-                } else if (e.ctrlKey) {
-                    const existingNote = findNoteAt(measureIndex, clickX, clickY);
-                    if (existingNote) return;
-                    if (!isValidX) return;
-
-                    const measureNotes = notePositions.filter(
-                        p => p.measureIndex === measureIndex
-                    );
-
-                    const beats = getMeasureBeats(measure);
-                    const remaining = 4 - beats;
-                    if (remaining <= 0) return;
-
-                    const duration = remaining >= 1 ? "q" : "8";
-                    if (durationBeats[duration] > remaining) return;
-
-                    const uniqueNoteIndices = [...new Set(measureNotes.map(p => p.noteIndex))];
-                    const noteInsertIndex = uniqueNoteIndices.filter(i => {
-                        const pos = measureNotes.find(p => p.noteIndex === i);
-                        return pos && pos.x < clickX;
-                    }).length;
-
-                    measure.notes.splice(noteInsertIndex, 0, {
-                        rest: true,
-                        duration
-                    });
-                    saveHistory();
-                    renderScore();
-
-                    } else if (hit) {
-                    // 同じX座標に既存音符があり、Y座標が外れている場合は和音追加
-                    const existingAtX = findNoteAtX(measureIndex, clickX);
-                    if (existingAtX && !existingAtX.rest) {
-                        const note = measure.notes[existingAtX.noteIndex];
-                        const pitch = yToPitch(clickYLocal, false);
-                        if (pitch && !note.pitches.includes(pitch) && note.pitches.length < 12) {
-                            note.pitches.push(pitch);
-                            note.pitches.sort((a, b) => {
-                                const aIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === a);
-                                const bIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === b);
-                                return aIdx - bIdx;
-                            });
-                            saveHistory();
-                            renderScore();
-                            return;
-                        }
-                    }
-
-                    const note = measure.notes[hit.noteIndex];
-                    if (note.rest) {
-                        measure.notes.splice(hit.noteIndex, 1);
-                    } else if (note.pitches.length === 1) {
-                        measure.notes.splice(hit.noteIndex, 1);
-                    } else {
-                        note.pitches.splice(hit.pitchIndex, 1);
-                    }
-                    saveHistory();
-                    renderScore();
-
-                } else {
-                    const existingNote = findNoteAtX(measureIndex, clickX);
-
-                    if (existingNote) {
-                        const note = measure.notes[existingNote.noteIndex];
-                        if (note.rest) return;
-                        if (note.pitches.length >= 12) return;
-
-                        const pitch = yToPitch(clickYLocal, false);
-                        if (!pitch) return;
-                        if (note.pitches.includes(pitch)) return;
-
-                        note.pitches.push(pitch);
-                        note.pitches.sort((a, b) => {
-                            const aIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === a);
-                            const bIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === b);
-                            return aIdx - bIdx;
-                        });
-                        saveHistory();
-                        renderScore();
-
-                    } else {
-                        if (!isValidX) return;
-
-                        const pitch = yToPitch(clickYLocal, false);
-                        if (!pitch) return;
-
-                        const beats = getMeasureBeats(measure);
-                        const remaining = 4 - beats;
-                        if (remaining <= 0) return;
-
-                        const duration = remaining >= 1 ? "q" : "8";
-                        if (durationBeats[duration] > remaining) return;
-
-                        const measureNotePositions = notePositions.filter(
-                            p => p.measureIndex === measureIndex
-                        );
-                        const uniqueNoteIndices = [...new Set(measureNotePositions.map(p => p.noteIndex))];
-                        const insertIndex = uniqueNoteIndices.filter(i => {
-                            const pos = measureNotePositions.find(p => p.noteIndex === i);
-                            return pos && pos.x < clickX;
-                        }).length;
-
-                        measure.notes.splice(insertIndex, 0, {
-                            pitches: [pitch],
-                            duration
-                        });
-                        saveHistory();
-                        renderScore();
-                    }
-                }
-
-            } else if (e.button === 2) {
-                if (hit) {
-                    const note = measure.notes[hit.noteIndex];
-                    const beats = getMeasureBeats(measure);
-                    const remaining = 4 - beats + durationBeats[note.duration];
-                    note.duration = getNextDuration(note.duration, remaining);
-                    saveHistory();
-                    renderScore();
-                }
-            }
+            // Shift/Ctrlクリックや右クリックはドラッグ判定をせず即時実行
+            handleNoteEdit(e, svg, rowDiv);
         });
+    });
+
+    // mouseup はドキュメント全体で監視（svg外でリリースされても確定させるため）
+    document.addEventListener("mouseup", e => {
+        if (!dragState) return;
+
+        if (dragState.isDragging) {
+            const measures = getMeasuresInDragRange(
+                dragState.startX, dragState.startY,
+                dragState.currentX, dragState.currentY
+            );
+            selectedMeasures = new Set(measures);
+            dragState = null;
+            renderScore();
+        } else {
+            // ドラッグなし → 通常の音符編集処理
+            const { svg, rowDiv, originalEvent } = dragState;
+            dragState = null;
+            drawSelectionRect();
+            if (selectedMeasures.size > 0) {
+                selectedMeasures.clear();
+                renderScore();
+            }
+            handleNoteEdit(originalEvent, svg, rowDiv);
+        }
+    });
+
+    // 何もない場所（scoreWrapper内、svg外）をクリックしたら選択解除
+    wrapper.addEventListener("mousedown", e => {
+        if (e.target.closest("svg")) return;
+        if (e.target.closest("button")) return;
+        if (selectedMeasures.size > 0) {
+            selectedMeasures.clear();
+            renderScore();
+        }
     });
 }
 
@@ -1190,9 +1455,27 @@ function updateZoom(newScale) {
     document.getElementById("zoomSlider").value = scale;
     renderScore();
     setupDeleteButtons();
+    setupInsertButtons();
     if (isPlaying) {
         rebuildNoteTimeMap();
     }
+}
+
+// 選択中の小節を一括削除
+function deleteSelectedMeasures() {
+    if (selectedMeasures.size === 0) return;
+    if (selectedMeasures.size >= score.measures.length) {
+        // 全小節が選択されている場合は最低1小節残す
+        score.measures = [{ notes: [] }];
+    } else {
+        const indices = [...selectedMeasures].sort((a, b) => b - a);
+        indices.forEach(i => score.measures.splice(i, 1));
+    }
+    selectedMeasures.clear();
+    saveHistory();
+    renderScore();
+    setupDeleteButtons();
+    setupInsertButtons();
 }
 
 async function main() {
@@ -1203,10 +1486,12 @@ async function main() {
     renderScore();
     saveHistory();
     setupDeleteButtons();
+    setupInsertButtons();
 
     window.addEventListener("resize", () => {
         renderScore();
         setupDeleteButtons();
+        setupInsertButtons();
     });
 
     document.getElementById("addMeasureBtn")
@@ -1214,9 +1499,11 @@ async function main() {
             e.preventDefault();
             const scrollY = window.scrollY;
             score.measures.push({ notes: [] });
+            selectedMeasures.clear();
             saveHistory();
             renderScore();
             setupDeleteButtons();
+            setupInsertButtons();
             window.scrollTo(0, scrollY);
         });
 
@@ -1232,6 +1519,16 @@ async function main() {
         } else if (e.ctrlKey && e.key === "y") {
             e.preventDefault();
             redo();
+        } else if (e.key === "Escape") {
+            if (selectedMeasures.size > 0) {
+                selectedMeasures.clear();
+                renderScore();
+            }
+        } else if (e.key === "Delete" || e.key === "Backspace") {
+            if (selectedMeasures.size > 0) {
+                e.preventDefault();
+                deleteSelectedMeasures();
+            }
         }
     });
 
@@ -1275,9 +1572,11 @@ async function main() {
             if (!confirm("全クリアしますか？")) return;
             score.measures = [{ notes: [] }];
             document.getElementById("scoreTitleInput").value = "NewScore";
+            selectedMeasures.clear();
             saveHistory();
             renderScore();
             setupDeleteButtons();
+            setupInsertButtons();
         });
 
     document.getElementById("undoBtn")
@@ -1293,6 +1592,13 @@ async function main() {
             } else {
                 playScore();
             }
+        });
+
+    document.getElementById("loopBtn")
+        .addEventListener("click", () => {
+            isLooping = !isLooping;
+            const icon = document.querySelector("#loopBtn i");
+            icon.style.color = isLooping ? "#4a90e2" : "#ccc";
         });
 
     document.getElementById("saveBtn")
@@ -1318,9 +1624,11 @@ async function main() {
                     score = JSON.parse(event.target.result);
                     history = [];
                     historyIndex = -1;
+                    selectedMeasures.clear();
                     saveHistory();
                     renderScore();
                     setupDeleteButtons();
+                    setupInsertButtons();
                 } catch (err) {
                     alert("JSONの読み込みに失敗しました");
                 }

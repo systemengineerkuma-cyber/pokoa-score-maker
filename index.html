@@ -107,7 +107,7 @@
             width: 28px;
             height: 28px;
             background: none;
-            color: #999;
+            color: #bbb;
             border: none;
             border-radius: 50%;
             cursor: pointer;
@@ -116,7 +116,7 @@
             align-items: center;
             justify-content: center;
             z-index: 10;
-            opacity: 0.3;
+            opacity: 0.35;
             transition: color 0.15s, opacity 0.15s;
         }
 
@@ -169,17 +169,40 @@
             width: 28px;
             height: 28px;
             background: none;
-            color: #999;
+            color: #bbb;
             border: none;
             border-radius: 50%;
             cursor: pointer;
             font-size: 16px;
             z-index: 10;
-            opacity: 0.3;
+            opacity: 0.35;
             transition: color 0.15s, opacity 0.15s;
         }
 
         .deleteMeasureBtn:hover {
+            color: #222;
+            opacity: 1;
+        }
+
+        .insertMeasureBtn {
+            position: absolute;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            background: none;
+            color: #bbb;
+            border: none;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 16px;
+            z-index: 10;
+            opacity: 0.35;
+            transition: color 0.15s, opacity 0.15s;
+        }
+
+        .insertMeasureBtn:hover {
             color: #222;
             opacity: 1;
         }
@@ -250,6 +273,7 @@
             </div>
             <div class="toolbar">
                 <button id="playBtn" tabindex="-1" title="再生/停止"><i class="fa-solid fa-play"></i></button>
+                <button id="loopBtn" tabindex="-1" title="ループ再生"><i class="fa-solid fa-repeat" style="color:#ccc;"></i></button>
                 <input type="number" id="bpmInput" value="120" min="40" max="240" step="1" style="width:52px; border:none; border-bottom:1px solid #ddd; font-size:14px; text-align:center; background:transparent; outline:none;" title="BPM">
                 <span style="font-size:11px; color:#aaa;">BPM</span>
             </div>
