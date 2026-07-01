@@ -161,6 +161,34 @@
             border-radius: 4px;
         }
 
+        .tab-container {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 12px;
+        }
+
+        .tab-btn {
+            background: none;
+            border: none;
+            border-bottom: 2px solid transparent;
+            padding: 6px 16px;
+            font-size: 14px;
+            color: #aaa;
+            cursor: pointer;
+            font-family: inherit;
+            transition: color 0.15s, border-color 0.15s;
+        }
+
+        .tab-btn:hover {
+            color: #222;
+        }
+
+        .tab-active {
+            color: #222;
+            border-bottom: 2px solid #222;
+            font-weight: 600;
+        }
+
         .deleteMeasureBtn {
             position: absolute;
             display: flex;
@@ -256,6 +284,7 @@
 
 <div id="main">
 
+    <div id="tabContainer" class="tab-container"></div>
     <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:20px;">
         <div id="toolbars" style="margin-bottom:0;">
             <div class="toolbar">
@@ -264,6 +293,15 @@
                 <button id="clearBtn" tabindex="-1" title="全クリア"><i class="fa-solid fa-trash"></i></button>
                 <button id="undoBtn" tabindex="-1" title="アンドゥ"><i class="fa-solid fa-rotate-left"></i></button>
                 <button id="redoBtn" tabindex="-1" title="リドゥ"><i class="fa-solid fa-rotate-right"></i></button>
+            </div>
+            <div class="toolbar">
+                <button id="editModeNote" tabindex="-1" title="音符モード"><i class="fa-solid fa-pencil"></i></button>
+                <button id="editModeSelect" tabindex="-1" title="選択モード"><i class="fa-solid fa-arrow-pointer"></i></button>
+            </div>
+            <div class="toolbar">
+                <button id="copyBtn" tabindex="-1" title="コピー (Ctrl+C)"><i class="fa-solid fa-copy"></i></button>
+                <button id="cutBtn" tabindex="-1" title="切り取り (Ctrl+X)"><i class="fa-solid fa-scissors"></i></button>
+                <button id="pasteBtn" tabindex="-1" title="貼り付け (Ctrl+V)" style="opacity:0.4;" disabled><i class="fa-solid fa-paste"></i></button>
             </div>
             <div class="toolbar">
                 <button id="compassBtn" tabindex="-1" title="北の向きを変える">
@@ -283,7 +321,7 @@
                 <button id="zoomIn" tabindex="-1" title="拡大"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
             </div>
         </div>
-        <div id="panelCount" style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;"></div>
+        <div id="panelCount" style="display:none; flex-wrap:wrap; gap:8px; align-items:center;"></div>
     </div>
 
     <div id="scoreTitle">
@@ -294,7 +332,7 @@
         <button id="addMeasureBtn"><i class="fa-solid fa-circle-plus"></i></button>
     </div>
 
-    <div id="imageArea"></div>
+    <div id="imageArea" style="display:none;"></div>
 
     <div id="info">
         <span><i class="fa-solid fa-arrow-pointer"></i> 左クリック</span> 音符追加 &nbsp;

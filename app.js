@@ -21,8 +21,19 @@ let animFrameId = null;
 
 // 小節範囲選択用の状態
 let selectedMeasures = new Set();
+let clipboardMeasures = []; // コピー/切り取りした小節データ
 let dragState = null; // { startX, startY, currentX, currentY, isDragging }
 const DRAG_THRESHOLD = 6; // px
+
+// 編集モード: "note"=音符モード, "select"=選択モード
+let editMode = localStorage.getItem("editMode") || "note";
+
+// タブ定義（将来タブを追加する場合はここに追記する）
+const TABS = [
+    { id: "score",  label: "五線譜" },
+    { id: "panel",  label: "パネル楽譜" },
+];
+let activeTab = localStorage.getItem("activeTab") || "score";
 
 function getAudioContext() {
     if (!audioCtx) audioCtx = new AudioContext();
@@ -383,6 +394,43 @@ function makeDummyNotes(remainingBeats) {
     return dummies;
 }
 
+function applyTabVisibility() {
+    const isScore = activeTab === "score";
+
+    // 五線譜エリア
+    document.getElementById("scoreWrapper").style.display = isScore ? "" : "none";
+
+    // パネルカウントはパネル楽譜タブのみ表示（flexを明示）
+    document.getElementById("panelCount").style.display = isScore ? "none" : "flex";
+
+    // パネル楽譜エリア
+    document.getElementById("imageArea").style.display = isScore ? "none" : "";
+
+    // タブボタンのアクティブ状態を更新
+    TABS.forEach(tab => {
+        const btn = document.getElementById(`tab-${tab.id}`);
+        if (!btn) return;
+        btn.classList.toggle("tab-active", tab.id === activeTab);
+    });
+}
+
+function switchTab(tabId) {
+    if (activeTab === tabId) return;
+    if (activeTab === "score" && isPlaying) {
+        // 五線譜→パネル楽譜切替時、再生中なら継続（何もしない）
+    }
+    activeTab = tabId;
+    localStorage.setItem("activeTab", activeTab);
+    applyTabVisibility();
+    if (activeTab === "score") {
+        renderScore();
+        setupDeleteButtons();
+        setupInsertButtons();
+    } else {
+        updateImageArea();
+    }
+}
+
 function updateImageArea() {
     document.documentElement.style.setProperty('--scale', scale);
     const imageSize = Math.round(42 * scale * 0.5);
@@ -544,6 +592,7 @@ function updateAddButton() {
 }
 
 function drawHoverPreview(context, stave, measureIndex) {
+    if (editMode === "select") return;
     if (!hoveredPos || hoveredPos.measureIndex !== measureIndex) return;
 
     try {
@@ -1302,28 +1351,14 @@ function setupSVGEvents() {
         const rowDiv = svg.parentElement;
 
         svg.setAttribute("pointer-events", "all");
-        svg.style.cursor = "crosshair";
+        // カーソルはデフォルトのまま（変更しない）
 
         svg.addEventListener("contextmenu", e => e.preventDefault());
 
         svg.addEventListener("mousemove", e => {
-            // ドラッグ中は選択矩形を更新し、ホバー処理はスキップ
-            if (dragState) {
-                const wrapperRect = wrapper.getBoundingClientRect();
-                dragState.currentX = e.clientX - wrapperRect.left;
-                dragState.currentY = e.clientY - wrapperRect.top;
-
-                const dx = dragState.currentX - dragState.startX;
-                const dy = dragState.currentY - dragState.startY;
-                if (!dragState.isDragging && Math.hypot(dx, dy) > DRAG_THRESHOLD) {
-                    dragState.isDragging = true;
-                }
-
-                if (dragState.isDragging) {
-                    drawSelectionRect();
-                    return;
-                }
-            }
+            // ドラッグ中はホバー処理をスキップ（座標更新はdocument mousemoveで行う）
+            if (dragState && dragState.isDragging) return;
+            if (dragState) return;
 
             const rect = svg.getBoundingClientRect();
             const mouseX = e.clientX - rect.left;
@@ -1361,31 +1396,52 @@ function setupSVGEvents() {
                 renderScore();
             }
         });
+    });
+}
 
-        svg.addEventListener("mousedown", e => {
-            e.preventDefault();
+// document・wrapperレベルのイベントはmain()で一度だけ登録する
+function updateEditModeButtons() {
+    const noteBtn = document.getElementById("editModeNote");
+    const selectBtn = document.getElementById("editModeSelect");
+    if (!noteBtn || !selectBtn) return;
+    noteBtn.style.color = editMode === "note" ? "#222" : "#aaa";
+    selectBtn.style.color = editMode === "select" ? "#222" : "#aaa";
+    noteBtn.style.background = editMode === "note" ? "#f0f0f0" : "";
+    selectBtn.style.background = editMode === "select" ? "#f0f0f0" : "";
+}
 
-            if (e.button === 0 && !e.shiftKey && !e.ctrlKey) {
-                const wrapperRect = wrapper.getBoundingClientRect();
-                dragState = {
-                    startX: e.clientX - wrapperRect.left,
-                    startY: e.clientY - wrapperRect.top,
-                    currentX: e.clientX - wrapperRect.left,
-                    currentY: e.clientY - wrapperRect.top,
-                    isDragging: false,
-                    svg,
-                    rowDiv,
-                    originalEvent: e
-                };
-                return;
-            }
+function setEditMode(mode) {
+    editMode = mode;
+    localStorage.setItem("editMode", editMode);
+    // 選択モードに切り替えた場合、ホバー状態をクリア
+    if (editMode === "select" && hoveredPos !== null) {
+        hoveredPos = null;
+        renderScore();
+    }
+    updateEditModeButtons();
+}
 
-            // Shift/Ctrlクリックや右クリックはドラッグ判定をせず即時実行
-            handleNoteEdit(e, svg, rowDiv);
-        });
+function setupGlobalEvents() {
+    const wrapper = document.getElementById("scoreWrapper");
+
+    // ドラッグ座標更新・確定判定（document全体で監視）
+    document.addEventListener("mousemove", e => {
+        if (!dragState) return;
+        const wrapperRect = wrapper.getBoundingClientRect();
+        dragState.currentX = e.clientX - wrapperRect.left;
+        dragState.currentY = e.clientY - wrapperRect.top;
+
+        const dx = dragState.currentX - dragState.startX;
+        const dy = dragState.currentY - dragState.startY;
+        if (!dragState.isDragging && Math.hypot(dx, dy) > DRAG_THRESHOLD) {
+            dragState.isDragging = true;
+        }
+        if (dragState.isDragging) {
+            drawSelectionRect();
+        }
     });
 
-    // mouseup はドキュメント全体で監視（svg外でリリースされても確定させるため）
+    // mouseup（svg外でリリースされても確定させるため）
     document.addEventListener("mouseup", e => {
         if (!dragState) return;
 
@@ -1398,26 +1454,89 @@ function setupSVGEvents() {
             dragState = null;
             renderScore();
         } else {
-            // ドラッグなし → 通常の音符編集処理
+            // ドラッグなし
             const { svg, rowDiv, originalEvent } = dragState;
             dragState = null;
             drawSelectionRect();
-            if (selectedMeasures.size > 0) {
-                selectedMeasures.clear();
-                renderScore();
+
+            if (editMode === "select" && svg) {
+                // 選択モード：クリックした小節を単体選択
+                const rect = svg.getBoundingClientRect();
+                const clickX = originalEvent.clientX - rect.left;
+                const clickY = originalEvent.clientY - rect.top + rowDiv.offsetTop;
+                const measureIndex = getMeasureIndexFromXY(clickX, clickY);
+                if (measureIndex >= 0 && measureIndex < score.measures.length) {
+                    selectedMeasures = new Set([measureIndex]);
+                    renderScore();
+                }
+            } else {
+                // 音符モード：通常の音符編集処理
+                if (selectedMeasures.size > 0) {
+                    selectedMeasures.clear();
+                    renderScore();
+                }
+                if (svg && editMode === "note") {
+                    handleNoteEdit(originalEvent, svg, rowDiv);
+                }
             }
-            handleNoteEdit(originalEvent, svg, rowDiv);
         }
     });
 
-    // 何もない場所（scoreWrapper内、svg外）をクリックしたら選択解除
-    wrapper.addEventListener("mousedown", e => {
-        if (e.target.closest("svg")) return;
+    // document全体のmousedownでドラッグ選択を開始（ページのどこからでも）
+    document.addEventListener("mousedown", e => {
         if (e.target.closest("button")) return;
+        if (e.target.closest("input")) return;
+        if (e.target.closest("label")) return;
+
+        // 右クリック・Shift・Ctrl は音符モード時のみSVG上で音符編集
+        if (e.button !== 0 || e.shiftKey || e.ctrlKey) {
+            if (editMode === "note") {
+                const svgEl = e.target.closest("svg");
+                if (svgEl) {
+                    const scoreElement = document.getElementById("score");
+                    const svgs = scoreElement.querySelectorAll("svg");
+                    let rowDiv = null;
+                    svgs.forEach(s => { if (s === svgEl) rowDiv = s.parentElement; });
+                    handleNoteEdit(e, svgEl, rowDiv);
+                }
+            }
+            return;
+        }
+
+        e.preventDefault();
+
+        // 前の選択をクリア
         if (selectedMeasures.size > 0) {
             selectedMeasures.clear();
-            renderScore();
+            drawSelectionRect();
         }
+
+        // SVG上からのクリックなら svg と rowDiv を記録
+        const svgEl = e.target.closest("svg");
+        let hitSvg = null;
+        let hitRowDiv = null;
+        if (svgEl) {
+            const scoreElement = document.getElementById("score");
+            const svgs = scoreElement.querySelectorAll("svg");
+            svgs.forEach(s => {
+                if (s === svgEl) {
+                    hitSvg = s;
+                    hitRowDiv = s.parentElement;
+                }
+            });
+        }
+
+        const wrapperRect = wrapper.getBoundingClientRect();
+        dragState = {
+            startX: e.clientX - wrapperRect.left,
+            startY: e.clientY - wrapperRect.top,
+            currentX: e.clientX - wrapperRect.left,
+            currentY: e.clientY - wrapperRect.top,
+            isDragging: false,
+            svg: hitSvg,
+            rowDiv: hitRowDiv,
+            originalEvent: e
+        };
     });
 }
 
@@ -1462,6 +1581,58 @@ function updateZoom(newScale) {
 }
 
 // 選択中の小節を一括削除
+function copySelectedMeasures() {
+    if (selectedMeasures.size === 0) return;
+    const indices = [...selectedMeasures].sort((a, b) => a - b);
+    clipboardMeasures = indices.map(i => JSON.parse(JSON.stringify(score.measures[i])));
+    updateClipboardButtons();
+}
+
+function cutSelectedMeasures() {
+    if (selectedMeasures.size === 0) return;
+    const indices = [...selectedMeasures].sort((a, b) => a - b);
+    clipboardMeasures = indices.map(i => JSON.parse(JSON.stringify(score.measures[i])));
+
+    // 全削除時は1小節残す
+    if (indices.length >= score.measures.length) {
+        score.measures = [{ notes: [] }];
+    } else {
+        [...indices].reverse().forEach(i => score.measures.splice(i, 1));
+    }
+    selectedMeasures.clear();
+    saveHistory();
+    renderScore();
+    setupDeleteButtons();
+    setupInsertButtons();
+    updateClipboardButtons();
+}
+
+function pasteSelectedMeasures() {
+    if (clipboardMeasures.length === 0) return;
+    if (selectedMeasures.size === 0) return;
+
+    const insertAt = Math.min(...selectedMeasures);
+    const copies = clipboardMeasures.map(m => JSON.parse(JSON.stringify(m)));
+    score.measures.splice(insertAt, 0, ...copies);
+
+    // 挿入数分だけ選択indexをシフト（元の選択小節を指し続ける）
+    const shift = copies.length;
+    selectedMeasures = new Set([...selectedMeasures].map(i => i + shift));
+
+    saveHistory();
+    renderScore();
+    setupDeleteButtons();
+    setupInsertButtons();
+}
+
+function updateClipboardButtons() {
+    const pasteBtn = document.getElementById("pasteBtn");
+    if (pasteBtn) {
+        pasteBtn.style.opacity = clipboardMeasures.length > 0 ? "1" : "0.4";
+        pasteBtn.disabled = clipboardMeasures.length === 0;
+    }
+}
+
 function deleteSelectedMeasures() {
     if (selectedMeasures.size === 0) return;
     if (selectedMeasures.size >= score.measures.length) {
@@ -1483,10 +1654,41 @@ async function main() {
     const response = await fetch("sample_score.json");
     score = await response.json();
 
+    // タブUIを動的に生成
+    const tabContainer = document.getElementById("tabContainer");
+    TABS.forEach(tab => {
+        const btn = document.createElement("button");
+        btn.id = `tab-${tab.id}`;
+        btn.className = "tab-btn";
+        btn.textContent = tab.label;
+        btn.addEventListener("click", () => switchTab(tab.id));
+        tabContainer.appendChild(btn);
+    });
+
+    applyTabVisibility();
+
     renderScore();
     saveHistory();
     setupDeleteButtons();
     setupInsertButtons();
+    setupGlobalEvents(); // document/wrapperイベントは一度だけ登録
+
+    // モード切替ボタンの初期状態を反映
+    updateEditModeButtons();
+
+    document.getElementById("editModeNote")
+        .addEventListener("click", () => setEditMode("note"));
+    document.getElementById("editModeSelect")
+        .addEventListener("click", () => setEditMode("select"));
+
+    document.getElementById("copyBtn")
+        .addEventListener("click", () => copySelectedMeasures());
+    document.getElementById("cutBtn")
+        .addEventListener("click", () => cutSelectedMeasures());
+    document.getElementById("pasteBtn")
+        .addEventListener("click", () => pasteSelectedMeasures());
+
+    updateClipboardButtons();
 
     window.addEventListener("resize", () => {
         renderScore();
@@ -1519,6 +1721,21 @@ async function main() {
         } else if (e.ctrlKey && e.key === "y") {
             e.preventDefault();
             redo();
+        } else if (e.ctrlKey && e.key === "c") {
+            if (selectedMeasures.size > 0) {
+                e.preventDefault();
+                copySelectedMeasures();
+            }
+        } else if (e.ctrlKey && e.key === "x") {
+            if (selectedMeasures.size > 0) {
+                e.preventDefault();
+                cutSelectedMeasures();
+            }
+        } else if (e.ctrlKey && e.key === "v") {
+            if (clipboardMeasures.length > 0 && selectedMeasures.size > 0) {
+                e.preventDefault();
+                pasteSelectedMeasures();
+            }
         } else if (e.key === "Escape") {
             if (selectedMeasures.size > 0) {
                 selectedMeasures.clear();
