@@ -10,13 +10,18 @@ let historyIndex = -1;
 let northDirection = 0; // 0=↑, 1=→, 2=↓, 3=←
 
 let audioCtx = null;
-let isPlaying = false;
+let playState = "stopped"; // "stopped" | "playing" | "paused"
 let isLooping = false;
-let playTimeouts = [];
 let playStartTime = null;
+let playEndTime = 0; // audioCtx時刻での再生終了予定時刻（終了検知・ループに使用）
 let noteSchedule = [];
 let noteTimeMap = [];
+let beatSchedule = []; // {beatIndex, startTime, endTime} 1エントリ=マップの1センサー分（16分音符単位）
+let noteBoundarySchedule = []; // {measureIndex, noteIndex, startTime, endTime} 1エントリ=1つの音符（休符含む）。テンポ変更の再開位置探しに使う
+let activeSourceNodes = []; // {node, startTime} 再生中にスケジュール済みの音源（曲中のテンポ変更時に先の分を止めるため）
 let currentHighlightMeasure = -1;
+let currentHighlightBeat = -1;
+let currentHighlightRailStep = null; // マップのレール上の再生位置（連続値を丸めた整数）
 let animFrameId = null;
 
 // 小節範囲選択用の状態
@@ -31,9 +36,11 @@ let editMode = localStorage.getItem("editMode") || "note";
 // タブ定義（将来タブを追加する場合はここに追記する）
 const TABS = [
     { id: "score",  label: "五線譜" },
-    { id: "panel",  label: "パネル楽譜" },
+    { id: "map",    label: "マップ" },
 ];
 let activeTab = localStorage.getItem("activeTab") || "score";
+// 廃止済みタブ（例: 旧パネル楽譜タブ）がlocalStorageに残っていた場合のフォールバック
+if (!TABS.some(t => t.id === activeTab)) activeTab = "score";
 
 function getAudioContext() {
     if (!audioCtx) audioCtx = new AudioContext();
@@ -69,8 +76,43 @@ const NOTE_FREQ = {
     "C#6": 1108.73,
 };
 
+// ドレミファソラシドのSE音声（26音分、se/フォルダ）をプリロードするキャッシュ
+// 未ロード/ファイル未用意の間はnullのままとなり、その場合はサイン波にフォールバックする
+const SE_BUFFERS = {};
+let seLoadStarted = false;
+
+function loadSeBuffers() {
+    if (seLoadStarted) return;
+    seLoadStarted = true;
+    const ctx = getAudioContext();
+    Object.keys(PITCH_TO_FILE).forEach(pitch => {
+        const file = PITCH_TO_FILE[pitch].replace(/\.jpg$/, ".mp3");
+        fetch(`se/${file}`)
+            .then(res => { if (!res.ok) throw new Error("not found"); return res.arrayBuffer(); })
+            .then(buf => ctx.decodeAudioData(buf))
+            .then(decoded => { SE_BUFFERS[pitch] = decoded; })
+            .catch(() => { /* 未用意のファイルはフォールバック(サイン波)のまま */ });
+    });
+}
+
 function playNote(pitch, startTime, duration) {
     const ctx = getAudioContext();
+    const buffer = SE_BUFFERS[pitch];
+
+    if (buffer) {
+        // 用意されたSE音声をそのまま自然長で再生（音価による打ち切りはしない）
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        const gain = ctx.createGain();
+        gain.gain.value = 0.8;
+        source.connect(gain);
+        gain.connect(ctx.destination);
+        source.start(startTime);
+        activeSourceNodes.push({ node: source, startTime });
+        return;
+    }
+
+    // SEファイルが未用意/未ロードの間はサイン波で代用
     const freq = NOTE_FREQ[pitch];
     if (!freq) return;
 
@@ -88,24 +130,49 @@ function playNote(pitch, startTime, duration) {
 
     osc.start(startTime);
     osc.stop(startTime + duration);
+    activeSourceNodes.push({ node: osc, startTime });
 }
 
 function playScore() {
-    if (isPlaying) return;
-    isPlaying = true;
+    if (playState !== "stopped") return;
+    playState = "playing";
 
     const ctx = getAudioContext();
-    const bpm = parseInt(document.getElementById("bpmInput").value) || 120;
-    const beatDuration = 60 / bpm;
-
-    let time = ctx.currentTime + 0.1;
-    playStartTime = time;
+    playStartTime = ctx.currentTime + 0.1;
     noteSchedule = [];
     noteTimeMap = [];
+    beatSchedule = [];
+    noteBoundarySchedule = [];
+    activeSourceNodes = [];
+
+    scheduleMeasuresFrom(0, 0, 0, playStartTime, null);
+
+    updatePlaybackButtons();
+    trackPlayback();
+}
+
+// startMeasureIndex小節目のstartNoteIndex番目の音符から末尾まで、beatIndexOffsetを起点の
+// ビート番号として、startTimeを起点にBPM入力欄の現在値でスケジュールする
+// （noteSchedule/noteTimeMap/beatSchedule/noteBoundarySchedule/playEndTimeに追記・更新する）
+// resumeMeasureStartTimeOverride: 曲中のテンポ変更で小節の途中から再開する場合、
+// その小節がもともと始まった時刻（表示上の小節範囲がずれないように引き継ぐ）
+function scheduleMeasuresFrom(startMeasureIndex, startNoteIndex, beatIndexOffset, startTime, resumeMeasureStartTimeOverride) {
+    const bpm = parseInt(document.getElementById("bpmInput").value) || 120;
+    const beatDuration = 60 / bpm;
+    const sixteenthDuration = beatDuration * 0.25; // マップの1センサー(16分音符)分の長さ
     const measuresPerRow = getMeasuresPerRow();
 
-    score.measures.forEach((measure, measureIndex) => {
-        const measureStartTime = time;
+    let time = startTime;
+    let beatIndex = beatIndexOffset;
+
+    for (let measureIndex = startMeasureIndex; measureIndex < score.measures.length; measureIndex++) {
+        const measure = score.measures[measureIndex];
+        const isResumeMeasure = measureIndex === startMeasureIndex;
+        const noteStartIndex = isResumeMeasure ? startNoteIndex : 0;
+        const measureStartTime = (isResumeMeasure && resumeMeasureStartTimeOverride != null)
+            ? resumeMeasureStartTimeOverride
+            : time;
+
         const rowIndex = Math.floor(measureIndex / measuresPerRow);
         const idxInRow = measureIndex % measuresPerRow;
         const isFirstRow = rowIndex === 0;
@@ -119,15 +186,36 @@ function playScore() {
         }
         const measureWidth = isFirstMeasure ? STAVE_WIDTH_BASE + FIRST_MEASURE_EXTRA : STAVE_WIDTH_BASE;
 
-        measure.notes.forEach(note => {
+        for (let noteIndex = noteStartIndex; noteIndex < measure.notes.length; noteIndex++) {
+            const note = measure.notes[noteIndex];
             const duration = (durationBeats[note.duration] || 0) * beatDuration;
             if (!note.rest && note.pitches) {
                 note.pitches.forEach(pitch => {
                     playNote(pitch, time, duration * 0.9);
                 });
             }
+
+            // マップのセンサー(16分音符)単位での開始・終了時刻を記録
+            const slotCount = Math.round((durationBeats[note.duration] || 0) / 0.25);
+            for (let s = 0; s < slotCount; s++) {
+                beatSchedule.push({
+                    beatIndex,
+                    startTime: time + s * sixteenthDuration,
+                    endTime: time + (s + 1) * sixteenthDuration,
+                });
+                beatIndex++;
+            }
+
+            // テンポ変更の再開位置探しに使う、音符単位の開始・終了時刻
+            noteBoundarySchedule.push({
+                measureIndex,
+                noteIndex,
+                startTime: time,
+                endTime: time + duration,
+            });
+
             time += duration;
-        });
+        }
 
         noteSchedule.push({
             measureIndex,
@@ -142,52 +230,154 @@ function playScore() {
             endX: (sx + measureWidth) * scale,
             rowIndex
         });
+    }
+
+    // 終了検知はtrackPlayback内でaudioCtx時刻を見て行う（setTimeoutは一時停止中もカウントが進んでしまうため使わない）
+    playEndTime = time;
+}
+
+// 再生中/一時停止中にBPMが変更されたら、今鳴っている音符が終わった直後（次の音符の頭）から
+// 新テンポを適用する。それ以前に鳴っている音はそのまま、まだ鳴っていない先の音だけ止めて敷き直す
+function applyTempoChange() {
+    if (playState === "stopped" || !audioCtx) return;
+
+    const now = audioCtx.currentTime;
+    const current = noteBoundarySchedule.find(n => now < n.endTime);
+    if (!current) return; // 既に最後の音符まで進んでいる
+
+    const resumeTime = current.endTime;
+    let resumeMeasureIndex = current.measureIndex;
+    let resumeNoteIndex = current.noteIndex + 1;
+    if (resumeNoteIndex >= score.measures[resumeMeasureIndex].notes.length) {
+        resumeMeasureIndex++;
+        resumeNoteIndex = 0;
+    }
+    if (resumeMeasureIndex >= score.measures.length) {
+        playEndTime = resumeTime;
+        return;
+    }
+
+    // まだ発音していない先の音だけを止める
+    activeSourceNodes = activeSourceNodes.filter(({ node, startTime }) => {
+        if (startTime >= resumeTime) {
+            try { node.stop(); } catch (e) { /* 既に終了済みの場合は無視 */ }
+            return false;
+        }
+        return true;
     });
 
-    const totalTime = (time - ctx.currentTime) * 1000;
-    const t = setTimeout(() => {
-        if (isLooping) {
-            isPlaying = false;
-            playScore();
-            return;
-        }
-        isPlaying = false;
-        currentHighlightMeasure = -1;
-        cancelAnimationFrame(animFrameId);
-        highlightMeasure(-1);
-        document.querySelectorAll(".playLine").forEach(el => el.remove());
-        document.getElementById("playBtn").innerHTML = '<i class="fa-solid fa-play"></i>';
-    }, totalTime);
-    playTimeouts.push(t);
+    // 再開する小節がもともと始まった時刻を引き継ぐ（表示上の小節範囲がずれないように）
+    const resumeMeasureEntry = noteSchedule.find(s => s.measureIndex === resumeMeasureIndex);
+    const resumeMeasureStartTimeOverride = resumeMeasureEntry ? resumeMeasureEntry.startTime : resumeTime;
 
-    document.getElementById("playBtn").innerHTML = '<i class="fa-solid fa-stop"></i>';
-    trackPlayback();
+    // 再開する小節（とそれ以降）の記録を消して、新テンポで敷き直す
+    noteSchedule = noteSchedule.filter(s => s.measureIndex < resumeMeasureIndex);
+    noteTimeMap = noteTimeMap.slice(0, noteSchedule.length);
+    beatSchedule = beatSchedule.filter(b => b.startTime < resumeTime);
+    noteBoundarySchedule = noteBoundarySchedule.filter(n => n.startTime < resumeTime);
+
+    scheduleMeasuresFrom(resumeMeasureIndex, resumeNoteIndex, beatSchedule.length, resumeTime, resumeMeasureStartTimeOverride);
+}
+
+// 再生を終端まで到達した状態にする（ループ時は続けて再生開始）
+function finishPlayback() {
+    playState = "stopped";
+    if (isLooping) {
+        playScore();
+        return;
+    }
+    currentHighlightMeasure = -1;
+    currentHighlightBeat = -1;
+    currentHighlightRailStep = null;
+    cancelAnimationFrame(animFrameId);
+    highlightMeasure(-1);
+    highlightMapSensor(-1);
+    highlightRailStep(null);
+    document.querySelectorAll(".playLine").forEach(el => el.remove());
+    updatePlaybackButtons();
 }
 
 function stopScore() {
-    playTimeouts.forEach(t => clearTimeout(t));
-    playTimeouts = [];
-    isPlaying = false;
+    if (playState === "stopped") return;
+    playState = "stopped";
     currentHighlightMeasure = -1;
+    currentHighlightBeat = -1;
+    currentHighlightRailStep = null;
     cancelAnimationFrame(animFrameId);
     highlightMeasure(-1);
+    highlightMapSensor(-1);
+    highlightRailStep(null);
     document.querySelectorAll(".playLine").forEach(el => el.remove());
     if (audioCtx) {
         audioCtx.close();
         audioCtx = null;
     }
-    document.getElementById("playBtn").innerHTML = '<i class="fa-solid fa-play"></i>';
+    updatePlaybackButtons();
+}
+
+// 再生中の音・スケジュールはそのままに、時間経過を止める
+function pauseScore() {
+    if (playState !== "playing") return;
+    playState = "paused";
+    if (audioCtx) audioCtx.suspend();
+    cancelAnimationFrame(animFrameId);
+    updatePlaybackButtons();
+}
+
+// 一時停止した時点から再生を続ける
+function resumeScore() {
+    if (playState !== "paused") return;
+    playState = "playing";
+    if (audioCtx) audioCtx.resume();
+    trackPlayback();
+    updatePlaybackButtons();
+}
+
+// 再生/一時停止トグルボタンと停止ボタンの見た目を状態に合わせて更新する
+function updatePlaybackButtons() {
+    const toggleBtn = document.getElementById("playBtn");
+    if (toggleBtn) {
+        toggleBtn.innerHTML = playState === "playing"
+            ? '<i class="fa-solid fa-pause"></i>'
+            : '<i class="fa-solid fa-play"></i>';
+    }
+    const stopBtn = document.getElementById("stopBtn");
+    if (stopBtn) {
+        const stopped = playState === "stopped";
+        stopBtn.disabled = stopped;
+        stopBtn.style.opacity = stopped ? "0.4" : "1";
+    }
 }
 
 function trackPlayback() {
-    if (!isPlaying || !audioCtx) return;
+    if (playState !== "playing" || !audioCtx) return;
 
     const now = audioCtx.currentTime;
+
+    if (now >= playEndTime) {
+        finishPlayback();
+        return;
+    }
 
     const current = noteSchedule.find(s => now >= s.startTime && now < s.endTime);
     if (current && current.measureIndex !== currentHighlightMeasure) {
         currentHighlightMeasure = current.measureIndex;
         highlightMeasure(currentHighlightMeasure);
+    }
+
+    const currentBeat = beatSchedule.find(b => now >= b.startTime && now < b.endTime);
+    if (currentBeat) {
+        if (currentBeat.beatIndex !== currentHighlightBeat) {
+            currentHighlightBeat = currentBeat.beatIndex;
+            highlightMapSensor(currentHighlightBeat);
+        }
+        // レールはビート内の経過に合わせて連続的に動かす（センサー中心=beatIndex*3+1）
+        const beatT = (now - currentBeat.startTime) / (currentBeat.endTime - currentBeat.startTime);
+        const railStep = currentBeat.beatIndex * 3 + 1 + beatT * 3;
+        if (Math.round(railStep) !== currentHighlightRailStep) {
+            currentHighlightRailStep = Math.round(railStep);
+            highlightRailStep(railStep);
+        }
     }
 
     for (let i = 0; i < noteTimeMap.length; i++) {
@@ -211,6 +401,27 @@ function highlightMeasure(measureIndex) {
         } else {
             group.style.outline = "none";
         }
+    });
+}
+
+// マップ上で現在再生中のセンサーを強調表示する（beatIndexは0始まり、-1で解除）
+function highlightMapSensor(beatIndex) {
+    const beatNum = beatIndex + 1;
+
+    document.querySelectorAll('#mapArea [data-cell-type="sensor"]').forEach(cell => {
+        const isActive = beatIndex >= 0 && parseInt(cell.textContent, 10) === beatNum;
+        cell.style.outline = isActive ? "3px solid #ffeb3b" : "none";
+        cell.style.zIndex = isActive ? "5" : "";
+    });
+}
+
+// マップ上のレールの色を再生位置に合わせて滑らかに動かす
+// railStepは連続値（ビート中心=整数、ビート間は補間値）で渡す。nullで解除
+function highlightRailStep(railStep) {
+    const rounded = railStep == null ? null : Math.round(railStep);
+    document.querySelectorAll('#mapArea [data-cell-type="rail"]').forEach(cell => {
+        const isActive = rounded !== null && parseInt(cell.dataset.railStep, 10) === rounded;
+        cell.style.background = isActive ? "#4a90e2" : "#555";
     });
 }
 
@@ -396,15 +607,25 @@ function makeDummyNotes(remainingBeats) {
 
 function applyTabVisibility() {
     const isScore = activeTab === "score";
+    const isMap   = activeTab === "map";
 
     // 五線譜エリア
     document.getElementById("scoreWrapper").style.display = isScore ? "" : "none";
 
-    // パネルカウントはパネル楽譜タブのみ表示（flexを明示）
-    document.getElementById("panelCount").style.display = isScore ? "none" : "flex";
+    // パネルカウント（音符マット数・レール数・センサー数）は全タブで表示
+    document.getElementById("panelCount").style.display = "flex";
 
-    // パネル楽譜エリア
-    document.getElementById("imageArea").style.display = isScore ? "none" : "";
+    // マップエリア
+    const mapArea = document.getElementById("mapArea");
+    if (mapArea) mapArea.style.display = isMap ? "" : "none";
+
+    // マップ専用ツールバー
+    const mapToolbar = document.getElementById("mapToolbar");
+    if (mapToolbar) mapToolbar.style.display = isMap ? "flex" : "none";
+
+    // ヘルプは五線譜タブのみ表示
+    const info = document.getElementById("info");
+    if (info) info.style.display = isScore ? "" : "none";
 
     // タブボタンのアクティブ状態を更新
     TABS.forEach(tab => {
@@ -416,9 +637,6 @@ function applyTabVisibility() {
 
 function switchTab(tabId) {
     if (activeTab === tabId) return;
-    if (activeTab === "score" && isPlaying) {
-        // 五線譜→パネル楽譜切替時、再生中なら継続（何もしない）
-    }
     activeTab = tabId;
     localStorage.setItem("activeTab", activeTab);
     applyTabVisibility();
@@ -426,114 +644,391 @@ function switchTab(tabId) {
         renderScore();
         setupDeleteButtons();
         setupInsertButtons();
-    } else {
-        updateImageArea();
+    } else if (activeTab === "map") {
+        renderMap();
     }
 }
 
-function updateImageArea() {
-    document.documentElement.style.setProperty('--scale', scale);
-    const imageSize = Math.round(42 * scale * 0.5);
-    const panelCountImageSize = 21;
-    const imageArea = document.getElementById("imageArea");
-    imageArea.innerHTML = "";
+// マップ設定
+let mapSettings = {
+    railDirection: "vertical",   // "vertical" | "horizontal"
+    startCorner: "top-left",     // "top-left" | "top-right" | "bottom-left" | "bottom-right"
+    sideFirst: "left",           // "left" | "right" （どちら側のセンサーを先にするか）
+    wrapByCount: true,           // true=センサー数指定, false=マス数指定
+    wrapValue: 10,               // 折り返し値
+};
 
+// マップ設定をlocalStorageから復元
+(function() {
+    const saved = localStorage.getItem("mapSettings");
+    if (saved) {
+        try { Object.assign(mapSettings, JSON.parse(saved)); } catch(e) {}
+    }
+})();
+
+function saveMapSettings() {
+    localStorage.setItem("mapSettings", JSON.stringify(mapSettings));
+}
+
+// 楽譜の全ビートを順番に返す（16分音符単位）
+function getAllBeats() {
+    const beats = [];
     score.measures.forEach((measure, measureIndex) => {
-        const group = document.createElement("div");
-        group.className = "measureGroup";
-
-        const label = document.createElement("div");
-        label.className = "measureLabel";
-        label.textContent = `${measureIndex + 1}`;
-        group.appendChild(label);
-
-        const imagesRow = document.createElement("div");
-        imagesRow.className = "measureImages";
-
-        const slots = Array(16).fill(null);
-        let slotIndex = 0;
         measure.notes.forEach(note => {
-            const beats = durationBeats[note.duration] || 0;
-            const slotCount = beats / 0.25;
+            const count = Math.round((durationBeats[note.duration] || 0) / 0.25);
+            for (let i = 0; i < count; i++) {
+                beats.push({
+                    measureIndex,
+                    note: i === 0 ? note : null, // 最初のスロットのみ音符データを持つ
+                    isFirst: i === 0,
+                });
+            }
+        });
+    });
+    return beats;
+}
 
-            if (note.rest) {
-                for (let s = 0; s < slotCount; s++) {
-                    if (slotIndex < 16) slots[slotIndex++] = { type: "rest" };
-                }
-            } else {
-                for (let s = 0; s < slotCount; s++) {
-                    if (slotIndex < 16) {
-                        slots[slotIndex++] = s === 0
-                            ? { type: "note", pitches: note.pitches }
-                            : { type: "continuation" };
+// センサー周囲（中間層のみ）への音符マット配置を計算する
+// railDir: "vertical"|"horizontal", startCorner: 始点（トロッコの進行方向を決める）
+// isLeftSide: このセンサーがレールの左側にいるか（sideFirstとビート番号から決まる）
+// pitches: 高音順にソートされた音名配列（和音は最大3つまでの前提）
+// 戻り値: [{dx, dy, z, pitch}]（センサーからの実グリッド座標オフセット。z: 常に0=中間層）
+//
+// 上位層・下位層は廃止し、中間層の3枠（遠い→横→近い、高音から順）のみを使う。
+// 「遠い/近い」「レールと反対側」はセンサーから見たローカルな向きであり、
+// 実際のグリッド座標（dx, dy）に変換する際に以下を考慮する:
+//   - レール向き(railDir): vertical→進行軸=Y・左右軸=X、horizontal→進行軸=X・左右軸=Y
+//   - 開始地点(startCorner): 進行方向の符号（top/left側開始なら+、bottom/right側開始なら-）
+//   - isLeftSide: 左側センサーなら「反対側」=マイナス方向、右側センサーなら「反対側」=プラス方向
+//     （レールの左右が入れ替わっても、置き方の考え方自体は左右対称で同一）
+function calcPanelPositions(pitches, railDir, startCorner, isLeftSide) {
+    const isVertical = railDir === "vertical";
+    const [vPart, hPart] = startCorner.split("-"); // "top"|"bottom", "left"|"right"
+    // 進行軸の符号（vertical: top→+Y方向, horizontal: left→+X方向）
+    const travelSign = isVertical
+        ? (vPart === "top" ? 1 : -1)
+        : (hPart === "left" ? 1 : -1);
+    // 左右軸の符号（左側センサーなら-1側が反対側、右側センサーなら+1側が反対側）
+    const lateralSign = isLeftSide ? 1 : -1;
+
+    // 中間層3枠（センサー中心を(0,0)としたローカル座標、斜め隣接は使用しない）
+    // lat: レールと反対側を-1とするローカル左右位置、trav: 遠い方を+1とするローカル進行位置
+    // 音の優先順位（固定）: 遠い→横→近い
+    const midRank = [
+        {lat: 0, trav: 1, z: 0},   // 遠い
+        {lat: -1, trav: 0, z: 0},  // 横（レールと反対側）
+        {lat: 0, trav: -1, z: 0},  // 近い
+    ];
+
+    // ローカル座標(lat, trav)を実グリッドオフセット(dx, dy)に変換
+    const toGridDelta = (slot) => {
+        const travelDelta = slot.trav * travelSign;
+        const lateralDelta = slot.lat * lateralSign;
+        return isVertical
+            ? { dx: lateralDelta, dy: travelDelta, z: slot.z }
+            : { dx: travelDelta, dy: lateralDelta, z: slot.z };
+    };
+
+    const positions = [];
+    // pitchesを高音順（既にソート済みと仮定）にmidRankへ割り当て（最大3つ）
+    pitches.forEach((pitch, i) => {
+        if (i >= midRank.length) return;
+        const { dx, dy, z } = toGridDelta(midRank[i]);
+        positions.push({ relX: dx, relY: dy, z, pitch });
+    });
+
+    return positions;
+}
+
+function updateMapToolbarUI() {
+    const { railDirection, startCorner, sideFirst, wrapByCount, wrapValue } = mapSettings;
+
+    const setActive = (id, active) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.style.color = active ? "#222" : "#aaa";
+        el.style.background = active ? "#f0f0f0" : "";
+    };
+
+    setActive("mapRailVertical",   railDirection === "vertical");
+    setActive("mapRailHorizontal", railDirection === "horizontal");
+    setActive("mapCorner-top-left",     startCorner === "top-left");
+    setActive("mapCorner-top-right",    startCorner === "top-right");
+    setActive("mapCorner-bottom-left",  startCorner === "bottom-left");
+    setActive("mapCorner-bottom-right", startCorner === "bottom-right");
+    setActive("mapSideLeft",  sideFirst === "left");
+    setActive("mapSideRight", sideFirst === "right");
+    setActive("mapWrapByCount", wrapByCount);
+    setActive("mapWrapByMass",  !wrapByCount);
+
+    const wrapInput = document.getElementById("mapWrapValue");
+    if (wrapInput) wrapInput.value = wrapValue;
+}
+
+// マップのグリッドデータ（レール・センサー・音符マットの配置）を計算する
+// DOM描画には依存しないので、描画不要なカウント表示（レール数・センサー数）からも呼べる
+function buildMapGrid() {
+    const { railDirection, startCorner, sideFirst, wrapByCount, wrapValue } = mapSettings;
+
+    // 全ビートを取得
+    const beats = getAllBeats();
+    const totalBeats = beats.length;
+
+    // 折り返し単位（センサー数 or マス数）
+    const wrapSensors = wrapByCount
+        ? wrapValue
+        : Math.round((wrapValue + 1) / 3);
+
+    // センサー配置計算
+    // センサーはレール方向に交互(left/right)に配置、間隔3マス
+    // sideFirst="left": センサー1→左, センサー2→右, ...
+    // sideFirst="right": センサー1→右, センサー2→左, ...
+
+    // レール向き・開始地点から、進行軸/折り返し軸の符号を決める
+    // vertical: 進行軸=Y, 折り返し軸=X / horizontal: 進行軸=X, 折り返し軸=Y
+    const isVertical = railDirection === "vertical";
+    const [vPart, hPart] = startCorner.split("-"); // "top"|"bottom", "left"|"right"
+    const travelSign = isVertical
+        ? (vPart === "top" ? 1 : -1)   // 上開始→進行軸+方向、下開始→-方向
+        : (hPart === "left" ? 1 : -1); // 左開始→進行軸+方向、右開始→-方向
+    const wrapSign = isVertical
+        ? (hPart === "left" ? 1 : -1)  // 左開始→折り返しは+方向に列を増やす、右開始→-方向
+        : (vPart === "top" ? 1 : -1);  // 上開始→折り返しは+方向に行を増やす、下開始→-方向
+
+    // グリッドセルを蓄積するMap: key="x,y,z" value={type, pitch, direction, beatNum}
+    const grid = new Map();
+
+    const setCell = (x, y, z, data) => {
+        grid.set(`${x},${y},${z}`, data);
+    };
+
+    for (let beatIdx = 0; beatIdx < totalBeats; beatIdx++) {
+        const beat = beats[beatIdx];
+        const colIdx = Math.floor(beatIdx / wrapSensors);
+        const rowIdx = beatIdx % wrapSensors;
+
+        // センサーの進行軸上の位置（3マス間隔、開始地点の向きに応じて符号が変わる）
+        const travelPos = travelSign * rowIdx * 3;
+        // センサーの左右（進行軸に対して直角）
+        const isLeftSide = sideFirst === "left"
+            ? (beatIdx % 2 === 0)
+            : (beatIdx % 2 === 1);
+        const lateralPos = isLeftSide ? -1 : 1; // レール中心線からの左右オフセット（レールに隣接）
+
+        // 折り返し軸オフセット（段ごとにずらす、開始地点の向きに応じて符号が変わる）
+        const wrapOffset = wrapSign * colIdx * 6; // 1段あたり6マス幅（左2+レール1+右2+隙間1）
+
+        // センサーの絶対グリッド座標（進行軸・折り返し軸を実際のX/Yに変換）
+        const sX = isVertical ? wrapOffset + lateralPos : travelPos;
+        const sY = isVertical ? travelPos : wrapOffset + lateralPos;
+
+        // レールセル（センサーを中心に進行軸方向へ3マス分）
+        // railStep: このビートの中心を basе(beatIdx*3+1) とした、再生位置の滑らかな補間に使う連番
+        // （dの並びは進行方向の符号に応じて時間順になるようにする）
+        const dOrder = travelSign === 1 ? [-1, 0, 1] : [1, 0, -1];
+        dOrder.forEach((d, posInTriplet) => {
+            const rx = isVertical ? wrapOffset : travelPos + d;
+            const ry = isVertical ? travelPos + d : wrapOffset;
+            setCell(rx, ry, 0, {
+                type: "rail",
+                direction: railDirection,
+                railStep: beatIdx * 3 + posInTriplet,
+            });
+        });
+
+        // センサーセル（中間層）
+        setCell(sX, sY, 0, {
+            type: "sensor",
+            beatNum: beatIdx + 1,
+            direction: railDirection,
+        });
+
+        // 音符マットの配置
+        if (beat.isFirst && beat.note && !beat.note.rest && beat.note.pitches) {
+            const sorted = [...beat.note.pitches].sort((a, b) => {
+                // 半音値で降順ソート（高音順）
+                const semitoneOf = p => {
+                    const found = [...WHITE_KEYS, ...BLACK_KEYS].find(k => k.pitch === p);
+                    return found ? found.semitone : 0;
+                };
+                return semitoneOf(b) - semitoneOf(a);
+            });
+
+            const panelPositions = calcPanelPositions(sorted, railDirection, startCorner, isLeftSide);
+
+            panelPositions.forEach(({relX, relY, z, pitch}) => {
+                const px = sX + relX;
+                const py = sY + relY;
+                setCell(px, py, z, {
+                    type: "panel",
+                    pitch,
+                    direction: northDirection,
+                });
+            });
+        }
+    }
+
+    return { grid, totalBeats };
+}
+
+function renderMap() {
+    const mapArea = document.getElementById("mapArea");
+    if (!mapArea) return;
+    mapArea.innerHTML = "";
+
+    const cellSize = Math.round(42 * scale * 0.5);
+    const imageSize = cellSize;
+
+    const { grid } = buildMapGrid();
+
+    // グリッドの範囲を計算
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    grid.forEach((_, key) => {
+        const [x, y] = key.split(",").map(Number);
+        minX = Math.min(minX, x);
+        maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y);
+        maxY = Math.max(maxY, y);
+    });
+
+    if (minX === Infinity) {
+        mapArea.innerHTML = "<p style='color:#aaa;padding:16px;'>音符がありません</p>";
+        updateCountsBar();
+        return;
+    }
+
+    // 端のセルが枠に密着して見えないよう、表示範囲の周囲に1マス分の余白を持たせる
+    minX -= 1; maxX += 1;
+    minY -= 1; maxY += 1;
+
+    const gridW = maxX - minX + 1;
+    const gridH = maxY - minY + 1;
+
+    // 層の概念は廃止（グリッドは1つだけ）
+    const z = 0;
+
+    const gridDiv = document.createElement("div");
+    gridDiv.style.cssText = `
+        display: grid;
+        grid-template-columns: repeat(${gridW}, ${cellSize}px);
+        grid-template-rows: repeat(${gridH}, ${cellSize}px);
+        gap: 1px;
+        background: #e0e0e0;
+        border: 1px solid #e0e0e0;
+        width: fit-content;
+    `;
+
+    for (let gy = 0; gy < gridH; gy++) {
+        for (let gx = 0; gx < gridW; gx++) {
+            const ax = gx + minX;
+            const ay = gy + minY;
+            const key = `${ax},${ay},${z}`;
+            const data = grid.get(key);
+
+            const cell = document.createElement("div");
+            cell.style.cssText = `
+                width: ${cellSize}px;
+                height: ${cellSize}px;
+                background: #fff;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: ${Math.max(8, cellSize * 0.25)}px;
+                color: #555;
+                box-sizing: border-box;
+                overflow: hidden;
+            `;
+
+            if (data) {
+                if (data.type === "rail") {
+                    cell.style.background = "#555";
+                    // 向きに応じた線を描画（将来画像に置き換え予定）
+                    const line = document.createElement("div");
+                    const isVert = data.direction === "vertical";
+                    line.style.cssText = `
+                        width: ${isVert ? "30%" : "100%"};
+                        height: ${isVert ? "100%" : "30%"};
+                        background: #888;
+                        border-radius: 2px;
+                    `;
+                    // data-direction属性で向きを保持（将来の画像置換用）
+                    cell.dataset.direction = data.direction;
+                    cell.dataset.cellType = "rail";
+                    cell.dataset.railStep = data.railStep;
+                    cell.appendChild(line);
+                } else if (data.type === "sensor") {
+                    cell.style.background = "#e05555";
+                    cell.style.color = "#fff";
+                    // data-direction属性で向きを保持（将来の画像置換用）
+                    cell.dataset.direction = data.direction;
+                    cell.dataset.cellType = "sensor";
+                    // センサーのレーザー方向（レールに対して直角）
+                    const isVert = data.direction === "vertical";
+                    cell.dataset.laserDirection = isVert ? "horizontal" : "vertical";
+                    cell.textContent = data.beatNum;
+                } else if (data.type === "panel") {
+                    const file = PITCH_TO_FILE[data.pitch];
+                    if (file) {
+                        const img = document.createElement("img");
+                        img.src = `img/${file}`;
+                        img.alt = data.pitch;
+                        img.style.cssText = `
+                            width: ${imageSize}px;
+                            height: ${imageSize}px;
+                            object-fit: contain;
+                        `;
+                        // コンパス方向を反映（将来の画像置換用）
+                        img.style.transform = `rotate(${northDirection * 90}deg)`;
+                        img.dataset.cellType = "panel";
+                        img.dataset.pitch = data.pitch;
+                        cell.appendChild(img);
                     }
                 }
             }
-        });
 
-        slots.forEach(slot => {
-            const cell = document.createElement("div");
+            gridDiv.appendChild(cell);
+        }
+    }
 
-            if (slot === null || slot.type === "rest" || slot.type === "continuation") {
-                cell.style.cssText = `
-                    width: ${imageSize}px;
-                    height: ${imageSize}px;
-                    border: 1px dashed #ddd;
-                    border-radius: 4px;
-                    box-sizing: border-box;
-                    flex-shrink: 0;
-                `;
-            } else if (slot.type === "note") {
-                cell.style.cssText = `
-                    width: ${imageSize}px;
-                    display: flex;
-                    flex-direction: column;
-                    align-items: center;
-                    justify-content: flex-start;
-                    gap: 2px;
-                `;
-                [...slot.pitches].reverse().forEach(pitch => {
-                    if (!PITCH_TO_FILE[pitch]) return;
-                    const img = document.createElement("img");
-                    img.src = `img/${PITCH_TO_FILE[pitch]}`;
-                    img.alt = pitch;
-                    img.style.width = `${imageSize}px`;
-                    img.style.height = `${imageSize}px`;
-                    img.style.transform = `rotate(${northDirection * 90}deg)`;
-                    cell.appendChild(img);
-                });
-            }
+    mapArea.appendChild(gridDiv);
+    updateCountsBar();
 
-            imagesRow.appendChild(cell);
-        });
+    // 再生中/一時停止中にグリッドが再構築された場合、現在位置のハイライトを再適用する
+    if (playState !== "stopped" && currentHighlightBeat >= 0) {
+        highlightMapSensor(currentHighlightBeat);
+    }
+    if (playState !== "stopped" && currentHighlightRailStep !== null) {
+        highlightRailStep(currentHighlightRailStep);
+    }
+}
 
-        group.appendChild(imagesRow);
-        imageArea.appendChild(group);
-    });
-
+// 音符マット数・レール数・センサー数の表示（全タブ共通、#panelCountに表示）
 const PITCH_TO_GROUP = {
-        "C4": "C1", "C#4": "C1",
-        "D4": "D",  "D#4": "D",
-        "E4": "E",
-        "F4": "F",  "F#4": "F",
-        "G4": "G",  "G#4": "G",
-        "A4": "A",  "A#4": "A",
-        "B4": "B",
-        "C5": "C2", "C#5": "C2",
-        "D5": "D",  "D#5": "D",
-        "E5": "E",
-        "F5": "F",  "F#5": "F",
-        "G5": "G",  "G#5": "G",
-        "A5": "A",  "A#5": "A",
-        "B5": "B",
-        "C6": "C2", "C#6": "C2",
-    };
+    "C4": "C1", "C#4": "C1",
+    "D4": "D",  "D#4": "D",
+    "E4": "E",
+    "F4": "F",  "F#4": "F",
+    "G4": "G",  "G#4": "G",
+    "A4": "A",  "A#4": "A",
+    "B4": "B",
+    "C5": "C2", "C#5": "C2",
+    "D5": "D",  "D#5": "D",
+    "E5": "E",
+    "F5": "F",  "F#5": "F",
+    "G5": "G",  "G#5": "G",
+    "A5": "A",  "A#5": "A",
+    "B5": "B",
+    "C6": "C2", "C#6": "C2",
+};
 
-    const GROUP_TO_FILE = {
-        "C1": "c.jpg", "D": "d.jpg", "E": "e.jpg",
-        "F": "f.jpg",  "G": "g.jpg", "A": "a.jpg",
-        "B": "b.jpg",  "C2": "c2.jpg"
-    };
+const GROUP_TO_FILE = {
+    "C1": "c.jpg", "D": "d.jpg", "E": "e.jpg",
+    "F": "f.jpg",  "G": "g.jpg", "A": "a.jpg",
+    "B": "b.jpg",  "C2": "c2.jpg"
+};
+
+function updateCountsBar() {
+    const panelCountImageSize = 21;
 
     const countMap = {};
     score.measures.forEach(measure => {
@@ -562,7 +1057,6 @@ const PITCH_TO_GROUP = {
         const img = document.createElement("img");
         img.src = `img/${file}`;
         img.style.cssText = `width:${panelCountImageSize}px; height:${panelCountImageSize}px;`;
-        img.style.transform = `rotate(${northDirection * 90}deg)`;
 
         const count = document.createElement("span");
         count.style.cssText = "font-size:12px; color:#999;";
@@ -572,6 +1066,32 @@ const PITCH_TO_GROUP = {
         item.appendChild(count);
         panelCount.appendChild(item);
     });
+
+    // レール数（レールマスの総数）・センサー数はマップの配置設定に基づいて計算
+    const { grid, totalBeats } = buildMapGrid();
+    let railCellCount = 0;
+    grid.forEach(data => { if (data.type === "rail") railCellCount++; });
+
+    const addCountIcon = (src, alt, count) => {
+        const item = document.createElement("div");
+        item.style.cssText = "display:flex; align-items:center; gap:4px; margin-left:8px;";
+
+        const img = document.createElement("img");
+        img.src = src;
+        img.alt = alt;
+        img.style.cssText = `width:${panelCountImageSize}px; height:${panelCountImageSize}px;`;
+
+        const label = document.createElement("span");
+        label.style.cssText = "font-size:12px; color:#999;";
+        label.textContent = `×${count}`;
+
+        item.appendChild(img);
+        item.appendChild(label);
+        panelCount.appendChild(item);
+    };
+
+    addCountIcon("img/rail.png", "レール数", railCellCount);
+    addCountIcon("img/sensor.png", "センサー数", totalBeats);
 }
 
 function updateAddButton() {
@@ -954,7 +1474,7 @@ function renderScore() {
         });
     });
 
-    updateImageArea();
+    updateCountsBar();
     updateAddButton();
     setupSVGEvents();
     drawSelectionRect();
@@ -1254,7 +1774,7 @@ function handleNoteEdit(e, svg, rowDiv) {
             if (existingAtX && !existingAtX.rest) {
                 const note = measure.notes[existingAtX.noteIndex];
                 const pitch = yToPitch(clickYLocal, false);
-                if (pitch && !note.pitches.includes(pitch) && note.pitches.length < 12) {
+                if (pitch && !note.pitches.includes(pitch) && note.pitches.length < 3) {
                     note.pitches.push(pitch);
                     note.pitches.sort((a, b) => {
                         const aIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === a);
@@ -1284,7 +1804,7 @@ function handleNoteEdit(e, svg, rowDiv) {
             if (existingNote) {
                 const note = measure.notes[existingNote.noteIndex];
                 if (note.rest) return;
-                if (note.pitches.length >= 12) return;
+                if (note.pitches.length >= 3) return;
 
                 const pitch = yToPitch(clickYLocal, false);
                 if (!pitch) return;
@@ -1575,7 +2095,8 @@ function updateZoom(newScale) {
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
-    if (isPlaying) {
+    if (activeTab === "map") renderMap();
+    if (playState !== "stopped") {
         rebuildNoteTimeMap();
     }
 }
@@ -1651,6 +2172,8 @@ function deleteSelectedMeasures() {
 
 async function main() {
 
+    loadSeBuffers();
+
     const response = await fetch("sample_score.json");
     score = await response.json();
 
@@ -1671,6 +2194,8 @@ async function main() {
     saveHistory();
     setupDeleteButtons();
     setupInsertButtons();
+    // localStorageに保存されたタブが「五線譜」以外の場合、そのタブの中身も初期描画する
+    if (activeTab === "map") renderMap();
     setupGlobalEvents(); // document/wrapperイベントは一度だけ登録
 
     // モード切替ボタンの初期状態を反映
@@ -1689,6 +2214,66 @@ async function main() {
         .addEventListener("click", () => pasteSelectedMeasures());
 
     updateClipboardButtons();
+
+    // マップ専用ツールバーのイベント登録
+    document.getElementById("mapRailVertical")?.addEventListener("click", () => {
+        mapSettings.railDirection = "vertical";
+        saveMapSettings(); updateMapToolbarUI(); renderMap();
+    });
+    document.getElementById("mapRailHorizontal")?.addEventListener("click", () => {
+        mapSettings.railDirection = "horizontal";
+        saveMapSettings(); updateMapToolbarUI(); renderMap();
+    });
+    ["top-left","top-right","bottom-left","bottom-right"].forEach(corner => {
+        document.getElementById(`mapCorner-${corner}`)?.addEventListener("click", () => {
+            mapSettings.startCorner = corner;
+            saveMapSettings(); updateMapToolbarUI(); renderMap();
+        });
+    });
+    document.getElementById("mapSideLeft")?.addEventListener("click", () => {
+        mapSettings.sideFirst = "left";
+        saveMapSettings(); updateMapToolbarUI(); renderMap();
+    });
+    document.getElementById("mapSideRight")?.addEventListener("click", () => {
+        mapSettings.sideFirst = "right";
+        saveMapSettings(); updateMapToolbarUI(); renderMap();
+    });
+    document.getElementById("mapWrapByCount")?.addEventListener("click", () => {
+        if (!mapSettings.wrapByCount) {
+            // マス数→センサー数へ変換（表示している折り返し幅の実質的な意味を保つ）
+            mapSettings.wrapValue = Math.max(1, Math.round((mapSettings.wrapValue + 1) / 3));
+        }
+        mapSettings.wrapByCount = true;
+        saveMapSettings(); updateMapToolbarUI(); renderMap();
+    });
+    document.getElementById("mapWrapByMass")?.addEventListener("click", () => {
+        if (mapSettings.wrapByCount) {
+            // センサー数→マス数へ変換（表示している折り返し幅の実質的な意味を保つ）
+            mapSettings.wrapValue = Math.max(1, mapSettings.wrapValue * 3 - 1);
+        }
+        mapSettings.wrapByCount = false;
+        saveMapSettings(); updateMapToolbarUI(); renderMap();
+    });
+    document.getElementById("mapWrapValue")?.addEventListener("change", e => {
+        mapSettings.wrapValue = Math.max(1, parseInt(e.target.value) || 1);
+        saveMapSettings(); renderMap();
+    });
+    document.getElementById("mapWrapDown")?.addEventListener("click", () => {
+        // マス数指定のときは3マス間隔（センサー間隔）に合わせて3ずつ増減する
+        const step = mapSettings.wrapByCount ? 1 : 3;
+        mapSettings.wrapValue = Math.max(1, mapSettings.wrapValue - step);
+        const el = document.getElementById("mapWrapValue");
+        if (el) el.value = mapSettings.wrapValue;
+        saveMapSettings(); renderMap();
+    });
+    document.getElementById("mapWrapUp")?.addEventListener("click", () => {
+        const step = mapSettings.wrapByCount ? 1 : 3;
+        mapSettings.wrapValue = mapSettings.wrapValue + step;
+        const el = document.getElementById("mapWrapValue");
+        if (el) el.value = mapSettings.wrapValue;
+        saveMapSettings(); renderMap();
+    });
+    updateMapToolbarUI();
 
     window.addEventListener("resize", () => {
         renderScore();
@@ -1781,7 +2366,8 @@ async function main() {
         .addEventListener("click", () => {
             northDirection = (northDirection + 1) % 4;
             document.getElementById("compassLabel").textContent = COMPASS_LABELS[northDirection];
-            updateImageArea();
+            updateCountsBar();
+            if (activeTab === "map") renderMap();
         });
 
     document.getElementById("clearBtn")
@@ -1804,12 +2390,17 @@ async function main() {
 
     document.getElementById("playBtn")
         .addEventListener("click", () => {
-            if (isPlaying) {
-                stopScore();
-            } else {
+            if (playState === "stopped") {
                 playScore();
+            } else if (playState === "playing") {
+                pauseScore();
+            } else if (playState === "paused") {
+                resumeScore();
             }
         });
+
+    document.getElementById("stopBtn")
+        .addEventListener("click", () => stopScore());
 
     document.getElementById("loopBtn")
         .addEventListener("click", () => {
@@ -1817,6 +2408,9 @@ async function main() {
             const icon = document.querySelector("#loopBtn i");
             icon.style.color = isLooping ? "#4a90e2" : "#ccc";
         });
+
+    document.getElementById("bpmInput")
+        .addEventListener("change", () => applyTempoChange());
 
     document.getElementById("saveBtn")
         .addEventListener("click", () => {
