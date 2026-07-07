@@ -450,6 +450,7 @@ function drawPlayLine(x, rowIndex) {
 
 const DURATION_ORDER = ["16", "8", "q", "h", "w"];
 const durationBeats = { "w": 4, "h": 2, "q": 1, "8": 0.5, "16": 0.25 };
+const COMPASS_LABELS = ["N↑", "N→", "N↓", "N←"];
 
 const STAVE_TOP_BASE = 40;
 const STAVE_WIDTH_BASE = 350;
@@ -2175,7 +2176,28 @@ async function main() {
     loadSeBuffers();
 
     const response = await fetch("sample_score.json");
-    score = await response.json();
+    const data = await response.json();
+    score = { timeSignature: data.timeSignature, measures: data.measures };
+
+    // サンプルJSONに表題・テンポ・コンパス・ズーム・マップ設定があれば復元する
+    if (data.title != null) {
+        document.getElementById("scoreTitleInput").value = data.title;
+    }
+    if (data.bpm != null) {
+        document.getElementById("bpmInput").value = data.bpm;
+    }
+    if (data.northDirection != null) {
+        northDirection = data.northDirection;
+        document.getElementById("compassLabel").textContent = COMPASS_LABELS[northDirection];
+    }
+    if (data.scale != null) {
+        scale = data.scale;
+        document.getElementById("zoomSlider").value = scale;
+    }
+    if (data.mapSettings) {
+        Object.assign(mapSettings, data.mapSettings);
+        saveMapSettings();
+    }
 
     // タブUIを動的に生成
     const tabContainer = document.getElementById("tabContainer");
@@ -2360,8 +2382,6 @@ async function main() {
             updateZoom(parseFloat(e.target.value));
         });
 
-    const COMPASS_LABELS = ["N↑", "N→", "N↓", "N←"];
-
     document.getElementById("compassBtn")
         .addEventListener("click", () => {
             northDirection = (northDirection + 1) % 4;
@@ -2414,12 +2434,21 @@ async function main() {
 
     document.getElementById("saveBtn")
         .addEventListener("click", () => {
-            const json = JSON.stringify(score, null, 2);
+            const title = document.getElementById("scoreTitleInput").value || "NewScore";
+            const bpm = parseInt(document.getElementById("bpmInput").value) || 120;
+            const payload = {
+                ...score,
+                title,
+                bpm,
+                northDirection,
+                scale,
+                mapSettings: { ...mapSettings },
+            };
+            const json = JSON.stringify(payload, null, 2);
             const blob = new Blob([json], { type: "application/json" });
             const url = URL.createObjectURL(blob);
             const a = document.createElement("a");
             a.href = url;
-            const title = document.getElementById("scoreTitleInput").value || "NewScore";
             a.download = `${title}.json`;
             a.click();
             URL.revokeObjectURL(url);
@@ -2432,7 +2461,29 @@ async function main() {
             const reader = new FileReader();
             reader.onload = (event) => {
                 try {
-                    score = JSON.parse(event.target.result);
+                    const data = JSON.parse(event.target.result);
+                    score = { timeSignature: data.timeSignature, measures: data.measures };
+
+                    if (data.title != null) {
+                        document.getElementById("scoreTitleInput").value = data.title;
+                    }
+                    if (data.bpm != null) {
+                        document.getElementById("bpmInput").value = data.bpm;
+                    }
+                    if (data.northDirection != null) {
+                        northDirection = data.northDirection;
+                        document.getElementById("compassLabel").textContent = COMPASS_LABELS[northDirection];
+                    }
+                    if (data.scale != null) {
+                        scale = data.scale;
+                        document.getElementById("zoomSlider").value = scale;
+                    }
+                    if (data.mapSettings) {
+                        Object.assign(mapSettings, data.mapSettings);
+                        saveMapSettings();
+                        updateMapToolbarUI();
+                    }
+
                     history = [];
                     historyIndex = -1;
                     selectedMeasures.clear();
@@ -2440,6 +2491,7 @@ async function main() {
                     renderScore();
                     setupDeleteButtons();
                     setupInsertButtons();
+                    if (activeTab === "map") renderMap();
                 } catch (err) {
                     alert("JSONの読み込みに失敗しました");
                 }
