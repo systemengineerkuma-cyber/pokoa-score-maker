@@ -271,15 +271,52 @@
                 <button id="editModeSelect" tabindex="-1" title="選択モード"><i class="fa-solid fa-arrow-pointer"></i></button>
             </div>
             <div class="toolbar">
+                <button id="durNote16" class="text-btn" data-duration="16" data-kind="note" tabindex="-1" title="16分音符" style="font-size:28px;">𝅘𝅥𝅯</button>
+                <button id="durNote8" class="text-btn" data-duration="8" data-kind="note" tabindex="-1" title="8分音符" style="font-size:28px;">𝅘𝅥𝅮</button>
+                <button id="durNoteQ" class="text-btn" data-duration="q" data-kind="note" tabindex="-1" title="4分音符" style="font-size:28px;">𝅘𝅥</button>
+                <button id="durNoteH" class="text-btn" data-duration="h" data-kind="note" tabindex="-1" title="2分音符" style="font-size:28px;">𝅗𝅥</button>
+                <button id="durNoteW" class="text-btn" data-duration="w" data-kind="note" tabindex="-1" title="全音符" style="font-size:28px;">𝅝</button>
+                <span style="display:inline-block; width:1px; height:24px; background:#ddd; margin:0 6px;"></span>
+                <button id="durRest16" class="text-btn" data-duration="16" data-kind="rest" tabindex="-1" title="16分休符" style="font-size:28px;">𝄿</button>
+                <button id="durRest8" class="text-btn" data-duration="8" data-kind="rest" tabindex="-1" title="8分休符" style="font-size:28px;">𝄾</button>
+                <button id="durRestQ" class="text-btn" data-duration="q" data-kind="rest" tabindex="-1" title="4分休符" style="font-size:28px;">𝄽</button>
+                <button id="durRestH" class="text-btn" data-duration="h" data-kind="rest" tabindex="-1" title="2分休符" style="font-size:28px;">𝄼</button>
+                <button id="durRestW" class="text-btn" data-duration="w" data-kind="rest" tabindex="-1" title="全休符" style="font-size:28px;">𝄻</button>
+            </div>
+            <div class="toolbar">
                 <button id="copyBtn" tabindex="-1" title="コピー (Ctrl+C)"><i class="fa-solid fa-copy"></i></button>
                 <button id="cutBtn" tabindex="-1" title="切り取り (Ctrl+X)"><i class="fa-solid fa-scissors"></i></button>
                 <button id="pasteBtn" tabindex="-1" title="貼り付け (Ctrl+V)" style="opacity:0.4;" disabled><i class="fa-solid fa-paste"></i></button>
             </div>
             <div class="toolbar">
-                <button id="compassBtn" tabindex="-1" title="北の向きを変える">
-                    <i class="fa-solid fa-compass"></i>
-                    <span id="compassLabel" style="font-size:10px; margin-left:2px;">N↑</span>
-                </button>
+                <span style="font-size:11px;color:#aaa;">拍子</span>
+                <button id="timeSig44" class="text-btn" tabindex="-1" title="4/4拍子">4/4</button>
+                <button id="timeSig34" class="text-btn" tabindex="-1" title="3/4拍子（ワルツ）">3/4</button>
+            </div>
+            <div class="toolbar">
+                <span style="font-size:11px;color:#aaa;">調号</span>
+                <select id="keySignatureSelect" tabindex="-1" style="font-size:13px;border:none;background:transparent;outline:none;">
+                    <option value="C">ハ長調 (C)</option>
+                    <option value="G">ト長調 (G, #1)</option>
+                    <option value="D">ニ長調 (D, #2)</option>
+                    <option value="A">イ長調 (A, #3)</option>
+                    <option value="E">ホ長調 (E, #4)</option>
+                    <option value="B">ロ長調 (B, #5)</option>
+                    <option value="F#">嬰ヘ長調 (F#, #6)</option>
+                    <option value="C#">嬰ハ長調 (C#, #7)</option>
+                    <option value="F">ヘ長調 (F, ♭1)</option>
+                    <option value="Bb">変ロ長調 (Bb, ♭2)</option>
+                    <option value="Eb">変ホ長調 (Eb, ♭3)</option>
+                    <option value="Ab">変イ長調 (Ab, ♭4)</option>
+                    <option value="Db">変ニ長調 (Db, ♭5)</option>
+                    <option value="Gb">変ト長調 (Gb, ♭6)</option>
+                    <option value="Cb">変ハ長調 (Cb, ♭7)</option>
+                </select>
+            </div>
+            <div class="toolbar">
+                <span style="font-size:11px;color:#aaa;">移調</span>
+                <button id="transposeDown" tabindex="-1" title="半音下げる">▼</button>
+                <button id="transposeUp" tabindex="-1" title="半音上げる">▲</button>
             </div>
             <div class="toolbar">
                 <button id="playBtn" tabindex="-1" title="再生/一時停止"><i class="fa-solid fa-play"></i></button>
@@ -287,11 +324,19 @@
                 <button id="loopBtn" tabindex="-1" title="ループ再生"><i class="fa-solid fa-repeat" style="color:#ccc;"></i></button>
                 <input type="number" id="bpmInput" value="120" min="40" max="240" step="1" style="width:52px; border:none; border-bottom:1px solid #ddd; font-size:14px; text-align:center; background:transparent; outline:none;" title="BPM">
                 <span style="font-size:11px; color:#aaa;">BPM</span>
+                <i class="fa-solid fa-volume-high" style="font-size:14px; color:#aaa; margin-left:8px;"></i>
+                <input type="range" id="volumeSlider" min="0" max="1" step="0.01" value="0.8" title="音量" style="width:80px; accent-color:#222;">
             </div>
             <div class="toolbar">
                 <button id="zoomOut" tabindex="-1" title="縮小"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
                 <input type="range" id="zoomSlider" min="0.25" max="1.75" step="0.01" value="1">
                 <button id="zoomIn" tabindex="-1" title="拡大"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
+            </div>
+            <div class="toolbar">
+                <button id="compassBtn" tabindex="-1" title="北の向きを変える">
+                    <i class="fa-solid fa-compass"></i>
+                    <span id="compassLabel" style="font-size:10px; margin-left:2px;">N↑</span>
+                </button>
             </div>
             <div id="panelCount" class="toolbar" style="display:none; flex-wrap:wrap;"></div>
             <div id="mapToolbar" style="display:none; margin-top:12px; flex-wrap:wrap; gap:8px; align-items:center;">
@@ -319,6 +364,10 @@
                     <input type="number" id="mapWrapValue" value="10" min="1" style="width:44px;border:none;border-bottom:1px solid #ddd;font-size:14px;text-align:center;background:transparent;outline:none;">
                     <button id="mapWrapUp" tabindex="-1">▲</button>
                 </div>
+                <div class="toolbar">
+                    <span style="font-size:11px;color:#aaa;">段の間隔</span>
+                    <input type="number" id="mapTurnLength" value="6" min="6" style="width:44px;border:none;border-bottom:1px solid #ddd;font-size:14px;text-align:center;background:transparent;outline:none;">
+                </div>
             </div>
     </div>
 
@@ -333,11 +382,11 @@
     <div id="mapArea" style="display:none; margin-top:24px;"></div>
 
     <div id="info">
-        <span><i class="fa-solid fa-arrow-pointer"></i> 左クリック</span> 音符追加 &nbsp;
-        <span><i class="fa-solid fa-arrow-pointer"></i> 左クリック（音符上）</span> 削除 &nbsp;
-        <span><i class="fa-solid fa-computer-mouse"></i> 右クリック（音符上）</span> 音価切替 &nbsp;
+        <span><i class="fa-solid fa-arrow-pointer"></i> 左クリック</span> 音符追加（ツールバーで選んだ音価） &nbsp;
+        <span><i class="fa-solid fa-arrow-pointer"></i> 左クリック（音符上・違う高さ）</span> 和音に追加 &nbsp;
+        <span><i class="fa-solid fa-computer-mouse"></i> 右クリック（音符上）</span> 削除 &nbsp;
         <span><i class="fa-solid fa-keyboard"></i> Shift + 左クリック</span> 白鍵↔黒鍵 &nbsp;
-        <span><i class="fa-solid fa-keyboard"></i> Ctrl + 左クリック</span> 休符追加
+        <span><i class="fa-solid fa-keyboard"></i> Ctrl + 左クリック</span> 休符追加（ツールバーで選んだ音価）
     </div>
 
 </div>

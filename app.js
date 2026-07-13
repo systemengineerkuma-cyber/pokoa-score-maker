@@ -10,6 +10,8 @@ let historyIndex = -1;
 let northDirection = 0; // 0=↑, 1=→, 2=↓, 3=←
 
 let audioCtx = null;
+let masterGainNode = null; // 全音源が経由するマスター音量ノード（再生中でもリアルタイムに音量変更するため）
+let volume = parseFloat(localStorage.getItem("volume")) || 0.8; // 0〜1
 let playState = "stopped"; // "stopped" | "playing" | "paused"
 let isLooping = false;
 let playStartTime = null;
@@ -33,6 +35,13 @@ const DRAG_THRESHOLD = 6; // px
 // 編集モード: "note"=音符モード, "select"=選択モード
 let editMode = localStorage.getItem("editMode") || "note";
 
+// ツールバーで選択中の音価（音符追加・休符追加の両方に使う）
+let selectedDuration = localStorage.getItem("selectedDuration") || "q";
+// ツールバーで選択中の種類（"note"|"rest"）。どちらのアイコン列がハイライトされるかを表す
+let selectedKind = localStorage.getItem("selectedKind") || "note";
+// Ctrlキーを押している間だけ、ツールバーのハイライトを音符⇔休符で反転表示する
+let isCtrlHeldForRestPreview = false;
+
 // タブ定義（将来タブを追加する場合はここに追記する）
 const TABS = [
     { id: "score",  label: "五線譜" },
@@ -43,7 +52,12 @@ let activeTab = localStorage.getItem("activeTab") || "score";
 if (!TABS.some(t => t.id === activeTab)) activeTab = "score";
 
 function getAudioContext() {
-    if (!audioCtx) audioCtx = new AudioContext();
+    if (!audioCtx) {
+        audioCtx = new AudioContext();
+        masterGainNode = audioCtx.createGain();
+        masterGainNode.gain.value = volume;
+        masterGainNode.connect(audioCtx.destination);
+    }
     return audioCtx;
 }
 
@@ -106,7 +120,7 @@ function playNote(pitch, startTime, duration) {
         const gain = ctx.createGain();
         gain.gain.value = 0.8;
         source.connect(gain);
-        gain.connect(ctx.destination);
+        gain.connect(masterGainNode);
         source.start(startTime);
         activeSourceNodes.push({ node: source, startTime });
         return;
@@ -120,7 +134,7 @@ function playNote(pitch, startTime, duration) {
     const gain = ctx.createGain();
 
     osc.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(masterGainNode);
 
     osc.type = "sine";
     osc.frequency.value = freq;
@@ -236,9 +250,10 @@ function scheduleMeasuresFrom(startMeasureIndex, startNoteIndex, beatIndexOffset
     playEndTime = time;
 }
 
-// 再生中/一時停止中にBPMが変更されたら、今鳴っている音符が終わった直後（次の音符の頭）から
-// 新テンポを適用する。それ以前に鳴っている音はそのまま、まだ鳴っていない先の音だけ止めて敷き直す
-function applyTempoChange() {
+// 再生中/一時停止中にBPMや音符データ（移調など）が変更されたら、今鳴っている音符が終わった
+// 直後（次の音符の頭）から新しい内容を適用する。それ以前に鳴っている音はそのまま、まだ鳴って
+// いない先の音だけ止めて、現在のscore/BPMを読み直して敷き直す
+function rescheduleFromCurrentPosition() {
     if (playState === "stopped" || !audioCtx) return;
 
     const now = audioCtx.currentTime;
@@ -564,15 +579,10 @@ function getMeasureBeats(measure) {
     );
 }
 
-function getNextDuration(current, remaining) {
-    const currentIndex = DURATION_ORDER.indexOf(current);
-    for (let i = 1; i <= DURATION_ORDER.length; i++) {
-        const next = DURATION_ORDER[(currentIndex + i) % DURATION_ORDER.length];
-        if (durationBeats[next] <= remaining) {
-            return next;
-        }
-    }
-    return current;
+// score.timeSignature（例: "4/4", "3/4"）から、1小節分の拍数（4分音符換算）を返す
+function getBeatsPerMeasure() {
+    const [num, den] = (score.timeSignature || "4/4").split("/").map(Number);
+    return num * 4 / den;
 }
 
 function pitchToKey(pitch) {
@@ -582,6 +592,47 @@ function pitchToKey(pitch) {
     const accidental = match[2];
     const octave = match[3];
     return { key: `${note}${accidental}/${octave}`, accidental };
+}
+
+// 半音単位での移調用: 音名(シャープ表記のみ、白鍵/黒鍵とも)
+const CHROMATIC_SHARP = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const NATURAL_SEMITONE = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+
+// pitch（例:"F#4"）をshift半音分だけ移調した新しいpitch文字列を返す（常にシャープ表記）
+function transposePitch(pitch, shift) {
+    const match = pitch.match(/^([A-Ga-g])([#b]?)(\d)$/);
+    if (!match) throw new Error(`不正な音名: ${pitch}`);
+    const letter = match[1].toUpperCase();
+    const accidental = match[2];
+    const octave = parseInt(match[3], 10);
+    const accidentalAdjust = accidental === "#" ? 1 : accidental === "b" ? -1 : 0;
+    const absolute = octave * 12 + NATURAL_SEMITONE[letter] + accidentalAdjust + shift;
+    const newOctave = Math.floor(absolute / 12);
+    const semitoneInOctave = ((absolute % 12) + 12) % 12;
+    return `${CHROMATIC_SHARP[semitoneInOctave]}${newOctave}`;
+}
+
+// 調号（キー）をshift半音分だけ移調する。異名同音は実用上一般的な表記を採用
+const KEY_SEMITONES = {
+    C: 0, G: 7, D: 2, A: 9, E: 4, B: 11, "F#": 6, "C#": 1,
+    F: 5, Bb: 10, Eb: 3, Ab: 8, Db: 1, Gb: 6, Cb: 11,
+};
+const SEMITONE_TO_KEY = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"];
+function transposeKeySignature(key, shift) {
+    const base = KEY_SEMITONES[key] ?? 0;
+    const newSemitone = ((base + shift) % 12 + 12) % 12;
+    return SEMITONE_TO_KEY[newSemitone];
+}
+
+// 曲全体をshift半音分だけ移調する（音符・調号とも）
+function transposeScore(shift) {
+    score.measures.forEach(measure => {
+        measure.notes.forEach(note => {
+            if (note.rest || !note.pitches) return;
+            note.pitches = note.pitches.map(p => transposePitch(p, shift));
+        });
+    });
+    score.keySignature = transposeKeySignature(score.keySignature || "C", shift);
 }
 
 function makeDummyNotes(remainingBeats) {
@@ -657,7 +708,17 @@ let mapSettings = {
     sideFirst: "left",           // "left" | "right" （どちら側のセンサーを先にするか）
     wrapByCount: true,           // true=センサー数指定, false=マス数指定
     wrapValue: 10,               // 折り返し値
+    turnLength: 6,               // 段と段の間（見た目上の空きマス数）。誤作動防止のため最小6
 };
+
+// 段と段の間の見た目上の空きマス数（ユーザーが実際にグリッド上で数える空きマス数と
+// 一致させるため、レール同士の実際の間隔＝この値+1として扱う）。
+// センサーは「隣接（レールから1マス）」「遠め（レールから2マス）」の2種類があり、
+// 和音パネルはそこからさらに1マス外側まで伸びうる（最大でレールから3マス）ため、
+// 隣の段と衝突しない最小値（6）を下限とする。
+function getTurnLength() {
+    return Math.max(6, Math.round(mapSettings.turnLength) || 6);
+}
 
 // マップ設定をlocalStorageから復元
 (function() {
@@ -689,60 +750,32 @@ function getAllBeats() {
     return beats;
 }
 
-// センサー周囲（中間層のみ）への音符マット配置を計算する
-// railDir: "vertical"|"horizontal", startCorner: 始点（トロッコの進行方向を決める）
-// isLeftSide: このセンサーがレールの左側にいるか（sideFirstとビート番号から決まる）
-// pitches: 高音順にソートされた音名配列（和音は最大3つまでの前提）
-// 戻り値: [{dx, dy, z, pitch}]（センサーからの実グリッド座標オフセット。z: 常に0=中間層）
-//
-// 上位層・下位層は廃止し、中間層の3枠（遠い→横→近い、高音から順）のみを使う。
-// 「遠い/近い」「レールと反対側」はセンサーから見たローカルな向きであり、
-// 実際のグリッド座標（dx, dy）に変換する際に以下を考慮する:
-//   - レール向き(railDir): vertical→進行軸=Y・左右軸=X、horizontal→進行軸=X・左右軸=Y
-//   - 開始地点(startCorner): 進行方向の符号（top/left側開始なら+、bottom/right側開始なら-）
-//   - isLeftSide: 左側センサーなら「反対側」=マイナス方向、右側センサーなら「反対側」=プラス方向
-//     （レールの左右が入れ替わっても、置き方の考え方自体は左右対称で同一）
-function calcPanelPositions(pitches, railDir, startCorner, isLeftSide) {
-    const isVertical = railDir === "vertical";
-    const [vPart, hPart] = startCorner.split("-"); // "top"|"bottom", "left"|"right"
-    // 進行軸の符号（vertical: top→+Y方向, horizontal: left→+X方向）
-    const travelSign = isVertical
-        ? (vPart === "top" ? 1 : -1)
-        : (hPart === "left" ? 1 : -1);
-    // 左右軸の符号（左側センサーなら-1側が反対側、右側センサーなら+1側が反対側）
-    const lateralSign = isLeftSide ? 1 : -1;
-
-    // 中間層3枠（センサー中心を(0,0)としたローカル座標、斜め隣接は使用しない）
-    // lat: レールと反対側を-1とするローカル左右位置、trav: 遠い方を+1とするローカル進行位置
-    // 音の優先順位（固定）: 遠い→横→近い
+// 中間層3枠（センサー中心を(0,0)としたローカル座標、斜め隣接は使用しない）への
+// 音符マット割り当てを、進行方向ベクトル(forwardVec)・レールと反対方向ベクトル(awayVec)を
+// 使って実グリッドオフセットに変換する共通処理。
+// forwardVec/awayVecはどちらも{dx,dy}が-1/0/1のいずれかの単位ベクトル。
+// 直線モードでは常に固定ベクトル、スネークモードでは経路上の位置ごとに変化するベクトルを渡す。
+function calcPanelPositionsCore(pitches, forwardVec, awayVec) {
+    // 音の優先順位（固定）: 遠い→横（レールと反対側）→近い
     const midRank = [
         {lat: 0, trav: 1, z: 0},   // 遠い
         {lat: -1, trav: 0, z: 0},  // 横（レールと反対側）
         {lat: 0, trav: -1, z: 0},  // 近い
     ];
 
-    // ローカル座標(lat, trav)を実グリッドオフセット(dx, dy)に変換
-    const toGridDelta = (slot) => {
-        const travelDelta = slot.trav * travelSign;
-        const lateralDelta = slot.lat * lateralSign;
-        return isVertical
-            ? { dx: lateralDelta, dy: travelDelta, z: slot.z }
-            : { dx: travelDelta, dy: lateralDelta, z: slot.z };
-    };
-
     const positions = [];
-    // pitchesを高音順（既にソート済みと仮定）にmidRankへ割り当て（最大3つ）
     pitches.forEach((pitch, i) => {
         if (i >= midRank.length) return;
-        const { dx, dy, z } = toGridDelta(midRank[i]);
-        positions.push({ relX: dx, relY: dy, z, pitch });
+        const slot = midRank[i];
+        const dx = slot.trav * forwardVec.dx - slot.lat * awayVec.dx;
+        const dy = slot.trav * forwardVec.dy - slot.lat * awayVec.dy;
+        positions.push({ relX: dx, relY: dy, z: slot.z, pitch });
     });
-
     return positions;
 }
 
 function updateMapToolbarUI() {
-    const { railDirection, startCorner, sideFirst, wrapByCount, wrapValue } = mapSettings;
+    const { railDirection, startCorner, sideFirst, wrapByCount, wrapValue, turnLength } = mapSettings;
 
     const setActive = (id, active) => {
         const el = document.getElementById(id);
@@ -764,26 +797,29 @@ function updateMapToolbarUI() {
 
     const wrapInput = document.getElementById("mapWrapValue");
     if (wrapInput) wrapInput.value = wrapValue;
+
+    const turnLengthInput = document.getElementById("mapTurnLength");
+    if (turnLengthInput) turnLengthInput.value = turnLength;
 }
 
 // マップのグリッドデータ（レール・センサー・音符マットの配置）を計算する
 // DOM描画には依存しないので、描画不要なカウント表示（レール数・センサー数）からも呼べる
 function buildMapGrid() {
     const { railDirection, startCorner, sideFirst, wrapByCount, wrapValue } = mapSettings;
+    const turnLength = getTurnLength();
 
     // 全ビートを取得
     const beats = getAllBeats();
     const totalBeats = beats.length;
 
-    // 折り返し単位（センサー数 or マス数）
-    const wrapSensors = wrapByCount
-        ? wrapValue
-        : Math.round((wrapValue + 1) / 3);
+    // 折り返し単位（センサー数 or マス数。レール1マスにつきセンサー1個のため同じ値）
+    const wrapSensors = wrapValue;
 
     // センサー配置計算
-    // センサーはレール方向に交互(left/right)に配置、間隔3マス
-    // sideFirst="left": センサー1→左, センサー2→右, ...
-    // sideFirst="right": センサー1→右, センサー2→左, ...
+    // センサーはレール1マスにつき1個、次の4パターンを繰り返して配置する:
+    // 「隣接(レールから1マス)側→隣接反対側→遠め(レールから2マス)側→遠め反対側」
+    // sideFirst="left": 1個目→隣接左, 2個目→隣接右, 3個目→遠め左, 4個目→遠め右, ...
+    // sideFirst="right": 1個目→隣接右, 2個目→隣接左, 3個目→遠め右, 4個目→遠め左, ...
 
     // レール向き・開始地点から、進行軸/折り返し軸の符号を決める
     // vertical: 進行軸=Y, 折り返し軸=X / horizontal: 進行軸=X, 折り返し軸=Y
@@ -805,27 +841,29 @@ function buildMapGrid() {
 
     for (let beatIdx = 0; beatIdx < totalBeats; beatIdx++) {
         const beat = beats[beatIdx];
+
+        // 4マス周期: 隣接同側→隣接反対側→遠め同側→遠め反対側
+        const cyclePos = beatIdx % 4;
+        const isLeftSide = sideFirst === "left"
+            ? (cyclePos === 0 || cyclePos === 2)
+            : (cyclePos === 1 || cyclePos === 3);
+        const isFar = cyclePos === 2 || cyclePos === 3;
+
+        // 段ごとに独立・同じ側から始まる
         const colIdx = Math.floor(beatIdx / wrapSensors);
         const rowIdx = beatIdx % wrapSensors;
 
-        // センサーの進行軸上の位置（3マス間隔、開始地点の向きに応じて符号が変わる）
-        const travelPos = travelSign * rowIdx * 3;
-        // センサーの左右（進行軸に対して直角）
-        const isLeftSide = sideFirst === "left"
-            ? (beatIdx % 2 === 0)
-            : (beatIdx % 2 === 1);
-        const lateralPos = isLeftSide ? -1 : 1; // レール中心線からの左右オフセット（レールに隣接）
+        const travelPos = travelSign * rowIdx; // レール1マスにつきビート1つ
+        const lateralPos = (isLeftSide ? -1 : 1) * (isFar ? 2 : 1); // レール中心線からの左右オフセット
+        const wrapOffset = wrapSign * colIdx * (turnLength + 1); // 段ごとの間隔（レール同士の実際の間隔＝見た目の空きマス数+1）
 
-        // 折り返し軸オフセット（段ごとにずらす、開始地点の向きに応じて符号が変わる）
-        const wrapOffset = wrapSign * colIdx * 6; // 1段あたり6マス幅（左2+レール1+右2+隙間1）
-
-        // センサーの絶対グリッド座標（進行軸・折り返し軸を実際のX/Yに変換）
         const sX = isVertical ? wrapOffset + lateralPos : travelPos;
         const sY = isVertical ? travelPos : wrapOffset + lateralPos;
 
-        // レールセル（センサーを中心に進行軸方向へ3マス分）
-        // railStep: このビートの中心を basе(beatIdx*3+1) とした、再生位置の滑らかな補間に使う連番
-        // （dの並びは進行方向の符号に応じて時間順になるようにする）
+        const forwardVec = isVertical ? { dx: 0, dy: travelSign } : { dx: travelSign, dy: 0 };
+        const awayVec = isVertical ? { dx: lateralPos > 0 ? 1 : -1, dy: 0 } : { dx: 0, dy: lateralPos > 0 ? 1 : -1 };
+
+        // dの並びは進行方向の符号に応じて時間順になるようにする
         const dOrder = travelSign === 1 ? [-1, 0, 1] : [1, 0, -1];
         dOrder.forEach((d, posInTriplet) => {
             const rx = isVertical ? wrapOffset : travelPos + d;
@@ -855,7 +893,7 @@ function buildMapGrid() {
                 return semitoneOf(b) - semitoneOf(a);
             });
 
-            const panelPositions = calcPanelPositions(sorted, railDirection, startCorner, isLeftSide);
+            const panelPositions = calcPanelPositionsCore(sorted, forwardVec, awayVec);
 
             panelPositions.forEach(({relX, relY, z, pitch}) => {
                 const px = sX + relX;
@@ -1175,9 +1213,13 @@ function undo() {
     historyIndex--;
     score = JSON.parse(history[historyIndex]);
     selectedMeasures.clear();
+    updateTimeSignatureButtons();
+    updateKeySignatureUI();
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
+    if (activeTab === "map") renderMap();
+    rescheduleFromCurrentPosition();
 }
 
 function redo() {
@@ -1185,9 +1227,13 @@ function redo() {
     historyIndex++;
     score = JSON.parse(history[historyIndex]);
     selectedMeasures.clear();
+    updateTimeSignatureButtons();
+    updateKeySignatureUI();
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
+    if (activeTab === "map") renderMap();
+    rescheduleFromCurrentPosition();
 }
 
 function getMeasuresPerRow() {
@@ -1324,6 +1370,7 @@ function renderScore() {
 
             if (isFirstMeasure) {
                 stave.addClef("treble");
+                stave.addKeySignature(score.keySignature || "C");
                 stave.addTimeSignature(score.timeSignature);
             }
 
@@ -1378,29 +1425,23 @@ function renderScore() {
                     staveNote.setStyle({ fillStyle: hoverColor, strokeStyle: hoverColor });
                 }
 
-                note.pitches.forEach((pitch, i) => {
-                    const converted = pitchToKey(pitch);
-                    if (converted.accidental) {
-                        staveNote.addModifier(
-                            new VF.Accidental(converted.accidental), i
-                        );
-                    }
-                });
-
                 return staveNote;
             });
 
-            const remainingBeats = 4 - getMeasureBeats(measure);
-            const dummyNotes = makeDummyNotes(remainingBeats);
+            const remainingBeats = getBeatsPerMeasure() - getMeasureBeats(measure);
+            const dummyNotes = makeDummyNotes(Math.max(0, remainingBeats));
             const allNotes = [...notes, ...dummyNotes];
 
-            const voice = new VF.Voice({ num_beats: 4, beat_value: 4 });
+            const [tsNum, tsDen] = score.timeSignature.split("/").map(Number);
+            const voice = new VF.Voice({ num_beats: tsNum, beat_value: tsDen });
             voice.setStrict(false);
             voice.addTickables(allNotes);
+            // 調号に基づき、必要な音符にのみ♯/♭/ナチュラルを自動付与する（小節ごとにリセット）
+            VF.Accidental.applyAccidentals([voice], score.keySignature || "C");
 
-            const formatWidth = isFirstMeasure
-                ? STAVE_WIDTH_BASE + FIRST_MEASURE_EXTRA - 80
-                : STAVE_WIDTH_BASE - 10;
+            // クレフ・調号・拍子記号が実際に消費した幅を差し引いた、音符が使える実際の幅を使う
+            // （固定オフセットだと調号の♯/♭の数によって幅が変わることに対応できないため）
+            const formatWidth = stave.getNoteEndX() - stave.getNoteStartX();
 
             new VF.Formatter()
                 .joinVoices([voice])
@@ -1740,42 +1781,68 @@ function handleNoteEdit(e, svg, rowDiv) {
                 }
             }
 
-        } else if (e.ctrlKey) {
-            const existingNote = findNoteAt(measureIndex, clickX, clickY);
-            if (existingNote) return;
-            if (!isValidX) return;
+        } else {
+            // 普段はselectedKindをそのまま使い、Ctrl押下中だけ音符⇔休符を反転する
+            const effectiveKind = e.ctrlKey
+                ? (selectedKind === "note" ? "rest" : "note")
+                : selectedKind;
 
-            const measureNotes = notePositions.filter(
-                p => p.measureIndex === measureIndex
-            );
+            if (effectiveKind === "rest") {
+                const existingNote = findNoteAt(measureIndex, clickX, clickY);
+                if (existingNote) return;
+                if (!isValidX) return;
 
-            const beats = getMeasureBeats(measure);
-            const remaining = 4 - beats;
-            if (remaining <= 0) return;
+                const measureNotes = notePositions.filter(
+                    p => p.measureIndex === measureIndex
+                );
 
-            const duration = remaining >= 1 ? "q" : remaining >= 0.5 ? "8" : "16";
-            if (durationBeats[duration] > remaining) return;
+                const beats = getMeasureBeats(measure);
+                const remaining = getBeatsPerMeasure() - beats;
+                if (durationBeats[selectedDuration] > remaining) return;
 
-            const uniqueNoteIndices = [...new Set(measureNotes.map(p => p.noteIndex))];
-            const noteInsertIndex = uniqueNoteIndices.filter(i => {
-                const pos = measureNotes.find(p => p.noteIndex === i);
-                return pos && pos.x < clickX;
-            }).length;
+                const uniqueNoteIndices = [...new Set(measureNotes.map(p => p.noteIndex))];
+                const noteInsertIndex = uniqueNoteIndices.filter(i => {
+                    const pos = measureNotes.find(p => p.noteIndex === i);
+                    return pos && pos.x < clickX;
+                }).length;
 
-            measure.notes.splice(noteInsertIndex, 0, {
-                rest: true,
-                duration
-            });
-            saveHistory();
-            renderScore();
+                measure.notes.splice(noteInsertIndex, 0, {
+                    rest: true,
+                    duration: selectedDuration
+                });
+                saveHistory();
+                renderScore();
 
             } else if (hit) {
-            // 同じX座標に既存音符があり、Y座標が外れている場合は和音追加
-            const existingAtX = findNoteAtX(measureIndex, clickX);
-            if (existingAtX && !existingAtX.rest) {
-                const note = measure.notes[existingAtX.noteIndex];
-                const pitch = yToPitch(clickYLocal, false);
-                if (pitch && !note.pitches.includes(pitch) && note.pitches.length < 3) {
+                // 同じX座標に既存音符があり、Y座標が外れている場合は和音追加（削除は右クリックで行うため、ここでは削除しない）
+                const existingAtX = findNoteAtX(measureIndex, clickX);
+                if (existingAtX && !existingAtX.rest) {
+                    const note = measure.notes[existingAtX.noteIndex];
+                    const pitch = yToPitch(clickYLocal, false);
+                    if (pitch && !note.pitches.includes(pitch) && note.pitches.length < 3) {
+                        note.pitches.push(pitch);
+                        note.pitches.sort((a, b) => {
+                            const aIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === a);
+                            const bIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === b);
+                            return aIdx - bIdx;
+                        });
+                        saveHistory();
+                        renderScore();
+                    }
+                }
+
+            } else {
+                const existingNote = findNoteAtX(measureIndex, clickX);
+
+                if (existingNote) {
+                    const note = measure.notes[existingNote.noteIndex];
+                    if (note.rest) return;
+                    if (note.pitches.length >= 3) return;
+
+                    const pitch = yToPitch(clickYLocal, false);
+                    if (!pitch) return;
+                    if (note.pitches.includes(pitch)) return;
+
                     note.pitches.push(pitch);
                     note.pitches.sort((a, b) => {
                         const aIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === a);
@@ -1784,10 +1851,39 @@ function handleNoteEdit(e, svg, rowDiv) {
                     });
                     saveHistory();
                     renderScore();
-                    return;
+
+                } else {
+                    if (!isValidX) return;
+
+                    const pitch = yToPitch(clickYLocal, false);
+                    if (!pitch) return;
+
+                    const beats = getMeasureBeats(measure);
+                    const remaining = getBeatsPerMeasure() - beats;
+                    if (durationBeats[selectedDuration] > remaining) return;
+
+                    const measureNotePositions = notePositions.filter(
+                        p => p.measureIndex === measureIndex
+                    );
+                    const uniqueNoteIndices = [...new Set(measureNotePositions.map(p => p.noteIndex))];
+                    const insertIndex = uniqueNoteIndices.filter(i => {
+                        const pos = measureNotePositions.find(p => p.noteIndex === i);
+                        return pos && pos.x < clickX;
+                    }).length;
+
+                    measure.notes.splice(insertIndex, 0, {
+                        pitches: [pitch],
+                        duration: selectedDuration
+                    });
+                    saveHistory();
+                    renderScore();
                 }
             }
+        }
 
+    } else if (e.button === 2) {
+        // 右クリック = 削除（和音の場合はクリックした音高だけを取り除く）
+        if (hit) {
             const note = measure.notes[hit.noteIndex];
             if (note.rest) {
                 measure.notes.splice(hit.noteIndex, 1);
@@ -1796,67 +1892,6 @@ function handleNoteEdit(e, svg, rowDiv) {
             } else {
                 note.pitches.splice(hit.pitchIndex, 1);
             }
-            saveHistory();
-            renderScore();
-
-        } else {
-            const existingNote = findNoteAtX(measureIndex, clickX);
-
-            if (existingNote) {
-                const note = measure.notes[existingNote.noteIndex];
-                if (note.rest) return;
-                if (note.pitches.length >= 3) return;
-
-                const pitch = yToPitch(clickYLocal, false);
-                if (!pitch) return;
-                if (note.pitches.includes(pitch)) return;
-
-                note.pitches.push(pitch);
-                note.pitches.sort((a, b) => {
-                    const aIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === a);
-                    const bIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === b);
-                    return aIdx - bIdx;
-                });
-                saveHistory();
-                renderScore();
-
-            } else {
-                if (!isValidX) return;
-
-                const pitch = yToPitch(clickYLocal, false);
-                if (!pitch) return;
-
-                const beats = getMeasureBeats(measure);
-                const remaining = 4 - beats;
-                if (remaining <= 0) return;
-
-                const duration = remaining >= 1 ? "q" : remaining >= 0.5 ? "8" : "16";
-                if (durationBeats[duration] > remaining) return;
-
-                const measureNotePositions = notePositions.filter(
-                    p => p.measureIndex === measureIndex
-                );
-                const uniqueNoteIndices = [...new Set(measureNotePositions.map(p => p.noteIndex))];
-                const insertIndex = uniqueNoteIndices.filter(i => {
-                    const pos = measureNotePositions.find(p => p.noteIndex === i);
-                    return pos && pos.x < clickX;
-                }).length;
-
-                measure.notes.splice(insertIndex, 0, {
-                    pitches: [pitch],
-                    duration
-                });
-                saveHistory();
-                renderScore();
-            }
-        }
-
-    } else if (e.button === 2) {
-        if (hit) {
-            const note = measure.notes[hit.noteIndex];
-            const beats = getMeasureBeats(measure);
-            const remaining = 4 - beats + durationBeats[note.duration];
-            note.duration = getNextDuration(note.duration, remaining);
             saveHistory();
             renderScore();
         }
@@ -1929,6 +1964,38 @@ function updateEditModeButtons() {
     selectBtn.style.color = editMode === "select" ? "#222" : "#aaa";
     noteBtn.style.background = editMode === "note" ? "#f0f0f0" : "";
     selectBtn.style.background = editMode === "select" ? "#f0f0f0" : "";
+}
+
+// 音価ボタン（音符アイコン5つ・休符アイコン5つ）の選択状態を反映する
+// 選択中の音価と一致し、かつ現在のモード（Ctrl押下中なら休符、そうでなければ音符）と種類が合うボタンだけをハイライトする
+function updateDurationButtons() {
+    // 普段はselectedKindをそのまま使い、Ctrl押下中だけ音符⇔休符を反転してハイライトする
+    const invert = k => (k === "note" ? "rest" : "note");
+    const activeKind = isCtrlHeldForRestPreview ? invert(selectedKind) : selectedKind;
+    document.querySelectorAll("button[data-kind]").forEach(btn => {
+        const active = btn.dataset.duration === selectedDuration && btn.dataset.kind === activeKind;
+        btn.style.color = active ? "#222" : "#aaa";
+        btn.style.background = active ? "#f0f0f0" : "";
+    });
+}
+
+function updateTimeSignatureButtons() {
+    const ts = score.timeSignature || "4/4";
+    const btn44 = document.getElementById("timeSig44");
+    const btn34 = document.getElementById("timeSig34");
+    if (btn44) {
+        btn44.style.color = ts === "4/4" ? "#222" : "#aaa";
+        btn44.style.background = ts === "4/4" ? "#f0f0f0" : "";
+    }
+    if (btn34) {
+        btn34.style.color = ts === "3/4" ? "#222" : "#aaa";
+        btn34.style.background = ts === "3/4" ? "#f0f0f0" : "";
+    }
+}
+
+function updateKeySignatureUI() {
+    const select = document.getElementById("keySignatureSelect");
+    if (select) select.value = score.keySignature || "C";
 }
 
 function setEditMode(mode) {
@@ -2008,6 +2075,7 @@ function setupGlobalEvents() {
         if (e.target.closest("button")) return;
         if (e.target.closest("input")) return;
         if (e.target.closest("label")) return;
+        if (e.target.closest("select")) return;
 
         // 右クリック・Shift・Ctrl は音符モード時のみSVG上で音符編集
         if (e.button !== 0 || e.shiftKey || e.ctrlKey) {
@@ -2177,7 +2245,7 @@ async function main() {
 
     const response = await fetch("sample_score.json");
     const data = await response.json();
-    score = { timeSignature: data.timeSignature, measures: data.measures };
+    score = { timeSignature: data.timeSignature, keySignature: data.keySignature || "C", measures: data.measures };
 
     // サンプルJSONに表題・テンポ・コンパス・ズーム・マップ設定があれば復元する
     if (data.title != null) {
@@ -2228,6 +2296,82 @@ async function main() {
     document.getElementById("editModeSelect")
         .addEventListener("click", () => setEditMode("select"));
 
+    // 音価ボタンの初期状態を反映
+    updateDurationButtons();
+
+    document.querySelectorAll("button[data-kind]").forEach(btn => {
+        btn.addEventListener("click", () => {
+            selectedDuration = btn.dataset.duration;
+            selectedKind = btn.dataset.kind;
+            localStorage.setItem("selectedDuration", selectedDuration);
+            localStorage.setItem("selectedKind", selectedKind);
+            updateDurationButtons();
+        });
+    });
+
+    // Ctrlキーを押している間だけ、音価ボタンの表示を休符アイコンに切り替える
+    document.addEventListener("keydown", (e) => {
+        if (e.key === "Control" && !isCtrlHeldForRestPreview) {
+            isCtrlHeldForRestPreview = true;
+            updateDurationButtons();
+        }
+    });
+    document.addEventListener("keyup", (e) => {
+        if (e.key === "Control" && isCtrlHeldForRestPreview) {
+            isCtrlHeldForRestPreview = false;
+            updateDurationButtons();
+        }
+    });
+
+    // 拍子切り替えボタンの初期状態を反映
+    updateTimeSignatureButtons();
+
+    document.getElementById("timeSig44")
+        .addEventListener("click", () => {
+            if (score.timeSignature === "4/4") return;
+            score.timeSignature = "4/4";
+            updateTimeSignatureButtons();
+            saveHistory();
+            renderScore();
+        });
+    document.getElementById("timeSig34")
+        .addEventListener("click", () => {
+            if (score.timeSignature === "3/4") return;
+            score.timeSignature = "3/4";
+            updateTimeSignatureButtons();
+            saveHistory();
+            renderScore();
+        });
+
+    // 調号セレクトの初期状態を反映
+    updateKeySignatureUI();
+
+    document.getElementById("keySignatureSelect")
+        .addEventListener("change", (e) => {
+            score.keySignature = e.target.value;
+            saveHistory();
+            renderScore();
+        });
+
+    document.getElementById("transposeUp")
+        .addEventListener("click", () => {
+            transposeScore(1);
+            updateKeySignatureUI();
+            saveHistory();
+            renderScore();
+            if (activeTab === "map") renderMap();
+            rescheduleFromCurrentPosition();
+        });
+    document.getElementById("transposeDown")
+        .addEventListener("click", () => {
+            transposeScore(-1);
+            updateKeySignatureUI();
+            saveHistory();
+            renderScore();
+            if (activeTab === "map") renderMap();
+            rescheduleFromCurrentPosition();
+        });
+
     document.getElementById("copyBtn")
         .addEventListener("click", () => copySelectedMeasures());
     document.getElementById("cutBtn")
@@ -2261,18 +2405,11 @@ async function main() {
         saveMapSettings(); updateMapToolbarUI(); renderMap();
     });
     document.getElementById("mapWrapByCount")?.addEventListener("click", () => {
-        if (!mapSettings.wrapByCount) {
-            // マス数→センサー数へ変換（表示している折り返し幅の実質的な意味を保つ）
-            mapSettings.wrapValue = Math.max(1, Math.round((mapSettings.wrapValue + 1) / 3));
-        }
+        // レール1マスにつきセンサー1個のため、センサー数とマス数は同じ値でよい
         mapSettings.wrapByCount = true;
         saveMapSettings(); updateMapToolbarUI(); renderMap();
     });
     document.getElementById("mapWrapByMass")?.addEventListener("click", () => {
-        if (mapSettings.wrapByCount) {
-            // センサー数→マス数へ変換（表示している折り返し幅の実質的な意味を保つ）
-            mapSettings.wrapValue = Math.max(1, mapSettings.wrapValue * 3 - 1);
-        }
         mapSettings.wrapByCount = false;
         saveMapSettings(); updateMapToolbarUI(); renderMap();
     });
@@ -2281,19 +2418,20 @@ async function main() {
         saveMapSettings(); renderMap();
     });
     document.getElementById("mapWrapDown")?.addEventListener("click", () => {
-        // マス数指定のときは3マス間隔（センサー間隔）に合わせて3ずつ増減する
-        const step = mapSettings.wrapByCount ? 1 : 3;
-        mapSettings.wrapValue = Math.max(1, mapSettings.wrapValue - step);
+        mapSettings.wrapValue = Math.max(1, mapSettings.wrapValue - 1);
         const el = document.getElementById("mapWrapValue");
         if (el) el.value = mapSettings.wrapValue;
         saveMapSettings(); renderMap();
     });
     document.getElementById("mapWrapUp")?.addEventListener("click", () => {
-        const step = mapSettings.wrapByCount ? 1 : 3;
-        mapSettings.wrapValue = mapSettings.wrapValue + step;
+        mapSettings.wrapValue = mapSettings.wrapValue + 1;
         const el = document.getElementById("mapWrapValue");
         if (el) el.value = mapSettings.wrapValue;
         saveMapSettings(); renderMap();
+    });
+    document.getElementById("mapTurnLength")?.addEventListener("change", e => {
+        mapSettings.turnLength = Math.max(6, parseInt(e.target.value) || 6);
+        saveMapSettings(); updateMapToolbarUI(); renderMap();
     });
     updateMapToolbarUI();
 
@@ -2430,7 +2568,15 @@ async function main() {
         });
 
     document.getElementById("bpmInput")
-        .addEventListener("change", () => applyTempoChange());
+        .addEventListener("change", () => rescheduleFromCurrentPosition());
+
+    const volumeSlider = document.getElementById("volumeSlider");
+    volumeSlider.value = volume;
+    volumeSlider.addEventListener("input", (e) => {
+        volume = parseFloat(e.target.value);
+        localStorage.setItem("volume", volume);
+        if (masterGainNode) masterGainNode.gain.value = volume;
+    });
 
     document.getElementById("saveBtn")
         .addEventListener("click", () => {
@@ -2462,7 +2608,7 @@ async function main() {
             reader.onload = (event) => {
                 try {
                     const data = JSON.parse(event.target.result);
-                    score = { timeSignature: data.timeSignature, measures: data.measures };
+                    score = { timeSignature: data.timeSignature, keySignature: data.keySignature || "C", measures: data.measures };
 
                     if (data.title != null) {
                         document.getElementById("scoreTitleInput").value = data.title;
@@ -2483,6 +2629,8 @@ async function main() {
                         saveMapSettings();
                         updateMapToolbarUI();
                     }
+                    updateTimeSignatureButtons();
+                    updateKeySignatureUI();
 
                     history = [];
                     historyIndex = -1;
