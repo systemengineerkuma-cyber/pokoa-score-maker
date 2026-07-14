@@ -39,6 +39,8 @@ let editMode = localStorage.getItem("editMode") || "note";
 let selectedDuration = localStorage.getItem("selectedDuration") || "q";
 // ツールバーで選択中の種類（"note"|"rest"）。どちらのアイコン列がハイライトされるかを表す
 let selectedKind = localStorage.getItem("selectedKind") || "note";
+// ツールバーで付点が選択中かどうか（16分音符には非対応。マップタブの16分音符単位のスロットに収まらないため）
+let dottedSelected = localStorage.getItem("dottedSelected") === "true";
 // Ctrlキーを押している間だけ、ツールバーのハイライトを音符⇔休符で反転表示する
 let isCtrlHeldForRestPreview = false;
 
@@ -61,34 +63,48 @@ function getAudioContext() {
     return audioCtx;
 }
 
-const NOTE_FREQ = {
-    "C4":  261.63,
-    "C#4": 277.18,
-    "D4":  293.66,
-    "D#4": 311.13,
-    "E4":  329.63,
-    "F4":  349.23,
-    "F#4": 369.99,
-    "G4":  392.00,
-    "G#4": 415.30,
-    "A4":  440.00,
-    "A#4": 466.16,
-    "B4":  493.88,
-    "C5":  523.25,
-    "C#5": 554.37,
-    "D5":  587.33,
-    "D#5": 622.25,
-    "E5":  659.25,
-    "F5":  698.46,
-    "F#5": 739.99,
-    "G5":  783.99,
-    "G#5": 830.61,
-    "A5":  880.00,
-    "A#5": 932.33,
-    "B5":  987.77,
-    "C6":  1046.50,
-    "C#6": 1108.73,
-};
+// 音名⇔半音番号（C0を基準に0とする）の相互変換。オクターブ・音域を制限しない
+const NATURAL_SEMITONE = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+const CHROMATIC_SHARP = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+// pitch（例:"F#4"）→C0を0とする絶対半音番号（不正な音名はnull）
+function pitchToSemitone(pitch) {
+    const match = pitch.match(/^([A-Ga-g])([#b]?)(-?\d+)$/);
+    if (!match) return null;
+    const letter = match[1].toUpperCase();
+    const accidental = match[2];
+    const octave = parseInt(match[3], 10);
+    const accidentalAdjust = accidental === "#" ? 1 : accidental === "b" ? -1 : 0;
+    return octave * 12 + NATURAL_SEMITONE[letter] + accidentalAdjust;
+}
+
+// 絶対半音番号→pitch文字列（常にシャープ表記、音域無制限）
+function semitoneToPitch(semitone) {
+    const octave = Math.floor(semitone / 12);
+    const withinOctave = ((semitone % 12) + 12) % 12;
+    return `${CHROMATIC_SHARP[withinOctave]}${octave}`;
+}
+
+// 白鍵（ドレミファソラシ）の1オクターブ内の半音オフセット
+const WHITE_OFFSETS = [0, 2, 4, 5, 7, 9, 11];
+// シャープ（黒鍵が上にある）を持つ白鍵（E, Bには上の黒鍵がない）
+const HAS_BLACK_KEY = new Set(["C", "D", "F", "G", "A"]);
+// フラット（黒鍵が下にある）を持つ白鍵（C, Fには下の黒鍵がない）
+const HAS_FLAT_KEY = new Set(["D", "E", "G", "A", "B"]);
+
+// 平均律の周波数計算（A4=440Hzを基準、音域無制限）
+function pitchToFrequency(pitch) {
+    const semitone = pitchToSemitone(pitch);
+    if (semitone === null) return null;
+    return 440 * Math.pow(2, (semitone - 57) / 12); // A4の絶対半音番号は57(C0基準)
+}
+
+// 音符マット画像・SE音声のキー（常にシャープ表記）に正規化する。
+// フラット表記（例:"Bb4"）でも同じ物理パネルを引けるようにするため
+function toCanonicalPitch(pitch) {
+    const semitone = pitchToSemitone(pitch);
+    return semitone === null ? pitch : semitoneToPitch(semitone);
+}
 
 // ドレミファソラシドのSE音声（26音分、se/フォルダ）をプリロードするキャッシュ
 // 未ロード/ファイル未用意の間はnullのままとなり、その場合はサイン波にフォールバックする
@@ -111,7 +127,7 @@ function loadSeBuffers() {
 
 function playNote(pitch, startTime, duration) {
     const ctx = getAudioContext();
-    const buffer = SE_BUFFERS[pitch];
+    const buffer = SE_BUFFERS[toCanonicalPitch(pitch)];
 
     if (buffer) {
         // 用意されたSE音声をそのまま自然長で再生（音価による打ち切りはしない）
@@ -126,8 +142,8 @@ function playNote(pitch, startTime, duration) {
         return;
     }
 
-    // SEファイルが未用意/未ロードの間はサイン波で代用
-    const freq = NOTE_FREQ[pitch];
+    // SEファイルが未用意/未ロードの間はサイン波で代用（音域は無制限）
+    const freq = pitchToFrequency(pitch);
     if (!freq) return;
 
     const osc = ctx.createOscillator();
@@ -202,7 +218,7 @@ function scheduleMeasuresFrom(startMeasureIndex, startNoteIndex, beatIndexOffset
 
         for (let noteIndex = noteStartIndex; noteIndex < measure.notes.length; noteIndex++) {
             const note = measure.notes[noteIndex];
-            const duration = (durationBeats[note.duration] || 0) * beatDuration;
+            const duration = noteBeats(note) * beatDuration;
             if (!note.rest && note.pitches) {
                 note.pitches.forEach(pitch => {
                     playNote(pitch, time, duration * 0.9);
@@ -210,7 +226,7 @@ function scheduleMeasuresFrom(startMeasureIndex, startNoteIndex, beatIndexOffset
             }
 
             // マップのセンサー(16分音符)単位での開始・終了時刻を記録
-            const slotCount = Math.round((durationBeats[note.duration] || 0) / 0.25);
+            const slotCount = Math.round(noteBeats(note) / 0.25);
             for (let s = 0; s < slotCount; s++) {
                 beatSchedule.push({
                     beatIndex,
@@ -263,16 +279,15 @@ function rescheduleFromCurrentPosition() {
     const resumeTime = current.endTime;
     let resumeMeasureIndex = current.measureIndex;
     let resumeNoteIndex = current.noteIndex + 1;
-    if (resumeNoteIndex >= score.measures[resumeMeasureIndex].notes.length) {
+    // resumeMeasureIndexが指す小節自体が（小節の削除等で）もう存在しない場合があるのでガードする
+    if (resumeMeasureIndex < score.measures.length &&
+        resumeNoteIndex >= score.measures[resumeMeasureIndex].notes.length) {
         resumeMeasureIndex++;
         resumeNoteIndex = 0;
     }
-    if (resumeMeasureIndex >= score.measures.length) {
-        playEndTime = resumeTime;
-        return;
-    }
 
-    // まだ発音していない先の音だけを止める
+    // まだ発音していない先の音（小節削除等で無効になった分も含む）を止める。
+    // 曲の終端に達している場合でもここは必ず実行し、削除済み小節の音が鳴りっぱなしにならないようにする
     activeSourceNodes = activeSourceNodes.filter(({ node, startTime }) => {
         if (startTime >= resumeTime) {
             try { node.stop(); } catch (e) { /* 既に終了済みの場合は無視 */ }
@@ -280,16 +295,19 @@ function rescheduleFromCurrentPosition() {
         }
         return true;
     });
-
-    // 再開する小節がもともと始まった時刻を引き継ぐ（表示上の小節範囲がずれないように）
-    const resumeMeasureEntry = noteSchedule.find(s => s.measureIndex === resumeMeasureIndex);
-    const resumeMeasureStartTimeOverride = resumeMeasureEntry ? resumeMeasureEntry.startTime : resumeTime;
-
-    // 再開する小節（とそれ以降）の記録を消して、新テンポで敷き直す
     noteSchedule = noteSchedule.filter(s => s.measureIndex < resumeMeasureIndex);
     noteTimeMap = noteTimeMap.slice(0, noteSchedule.length);
     beatSchedule = beatSchedule.filter(b => b.startTime < resumeTime);
     noteBoundarySchedule = noteBoundarySchedule.filter(n => n.startTime < resumeTime);
+
+    if (resumeMeasureIndex >= score.measures.length) {
+        playEndTime = resumeTime;
+        return;
+    }
+
+    // 再開する小節がもともと始まった時刻を引き継ぐ（表示上の小節範囲がずれないように）
+    const resumeMeasureEntry = noteSchedule.find(s => s.measureIndex === resumeMeasureIndex);
+    const resumeMeasureStartTimeOverride = resumeMeasureEntry ? resumeMeasureEntry.startTime : resumeTime;
 
     scheduleMeasuresFrom(resumeMeasureIndex, resumeNoteIndex, beatSchedule.length, resumeTime, resumeMeasureStartTimeOverride);
 }
@@ -467,59 +485,21 @@ const DURATION_ORDER = ["16", "8", "q", "h", "w"];
 const durationBeats = { "w": 4, "h": 2, "q": 1, "8": 0.5, "16": 0.25 };
 const COMPASS_LABELS = ["N↑", "N→", "N↓", "N←"];
 
+// 音符・休符1つ分の拍数を返す（付点は1.5倍）
+function noteBeats(note) {
+    return (durationBeats[note.duration] || 0) * (note.dotted ? 1.5 : 1);
+}
+
+// ツールバーで現在選択中の音価（付点込み）1つ分の拍数を返す
+function selectedNoteBeats() {
+    return (durationBeats[selectedDuration] || 0) * (dottedSelected ? 1.5 : 1);
+}
+
 const STAVE_TOP_BASE = 40;
 const STAVE_WIDTH_BASE = 350;
 const FIRST_MEASURE_EXTRA = 60;
 const C4_Y_BASE = 128;
 const SEMITONE_PX = 2.5;
-
-const WHITE_KEYS = [
-    { pitch: "C4", semitone: 0  },
-    { pitch: "D4", semitone: 2  },
-    { pitch: "E4", semitone: 4  },
-    { pitch: "F4", semitone: 5  },
-    { pitch: "G4", semitone: 7  },
-    { pitch: "A4", semitone: 9  },
-    { pitch: "B4", semitone: 11 },
-    { pitch: "C5", semitone: 12 },
-    { pitch: "D5", semitone: 14 },
-    { pitch: "E5", semitone: 16 },
-    { pitch: "F5", semitone: 17 },
-    { pitch: "G5", semitone: 19 },
-    { pitch: "A5", semitone: 21 },
-    { pitch: "B5", semitone: 23 },
-    { pitch: "C6", semitone: 24 },
-];
-
-const BLACK_KEYS = [
-    { pitch: "C#4", semitone: 1  },
-    { pitch: "D#4", semitone: 3  },
-    { pitch: "F#4", semitone: 6  },
-    { pitch: "G#4", semitone: 8  },
-    { pitch: "A#4", semitone: 10 },
-    { pitch: "C#5", semitone: 13 },
-    { pitch: "D#5", semitone: 15 },
-    { pitch: "F#5", semitone: 18 },
-    { pitch: "G#5", semitone: 20 },
-    { pitch: "A#5", semitone: 22 },
-    { pitch: "C#6", semitone: 25 },
-];
-
-const WHITE_TO_BLACK = {
-    "C4":  "C#4",
-    "D4":  "D#4",
-    "F4":  "F#4",
-    "G4":  "G#4",
-    "A4":  "A#4",
-    "C5":  "C#5",
-    "D5":  "D#5",
-    "F5":  "F#5",
-    "G5":  "G#5",
-    "A5":  "A#5",
-    "C6":  "C#6",
-};
-
-const BLACK_PITCHES = new Set(BLACK_KEYS.map(k => k.pitch));
 
 const PITCH_TO_FILE = {
     "C4":  "c.jpg",
@@ -550,33 +530,46 @@ const PITCH_TO_FILE = {
     "C#6": "c3_.jpg",
 };
 
-function semitoneToY(semitone) {
-    return C4_Y_BASE - semitone * SEMITONE_PX;
-}
+// クリック入力で許容するピッチ範囲。音符マットの範囲（C4〜C#6）の上下1オクターブずつ
+const MIN_INPUT_SEMITONE = pitchToSemitone("C3");
+const MAX_INPUT_SEMITONE = pitchToSemitone("C#7");
 
+// クリックY座標から最も近い白鍵の音名を返す（音域は無制限。isBlackは現状未使用だが
+// 既存の呼び出し互換のため引数として残す）
+// rawSemitoneはC4を0とする相対値（C4_Y_BASEがC4の位置のため）。
+// pitchToSemitone/semitoneToPitchはC0を0とする絶対値のため、変換時に+48（C4分）する
 function yToPitch(clickY, isBlack) {
     const baseY = clickY / scale;
-    const keys = isBlack ? BLACK_KEYS : WHITE_KEYS;
-    let closest = null;
-    let minDist = Infinity;
+    const rawSemitoneFromC4 = (C4_Y_BASE - baseY) / SEMITONE_PX;
+    const octaveGuess = Math.round(rawSemitoneFromC4 / 12);
 
-    for (const { pitch, semitone } of keys) {
-        const noteY = semitoneToY(semitone);
-        const dist = Math.abs(baseY - noteY);
-        if (dist < minDist) {
-            minDist = dist;
-            closest = pitch;
+    let closestSemitoneFromC4 = null;
+    let minDist = Infinity;
+    for (let oct = octaveGuess - 1; oct <= octaveGuess + 1; oct++) {
+        for (const offset of WHITE_OFFSETS) {
+            const semitone = oct * 12 + offset;
+            const dist = Math.abs(semitone - rawSemitoneFromC4);
+            if (dist < minDist) {
+                minDist = dist;
+                closestSemitoneFromC4 = semitone;
+            }
         }
     }
 
-    if (minDist > SEMITONE_PX) return null;
-    return closest;
-}
+    if (minDist > 1) return null; // 白鍵1つ分（ピクセル換算でSEMITONE_PX）より離れていたら該当なし
+    const naturalPitch = semitoneToPitch(closestSemitoneFromC4 + 48); // C4分(48)を足して絶対半音番号に変換
 
-function getMeasureBeats(measure) {
-    return measure.notes.reduce(
-        (sum, n) => sum + (durationBeats[n.duration] || 0), 0
-    );
+    // 現在の調号でそのレターが変化する場合は、デフォルトで調号通りの音にする
+    // （毎回Shift+クリックで直さなくて済むように。自然音が欲しい場合はShift+クリックで戻せる）
+    const match = naturalPitch.match(/^([A-G])(-?\d+)$/);
+    const accidental = match ? getKeyAccidentalMap(score.keySignature || "C")[match[1]] : null;
+    const result = accidental ? `${match[1]}${accidental}${match[2]}` : naturalPitch;
+
+    // 許容範囲外のクリックは無視する（C3〜C#7）
+    const resultSemitone = pitchToSemitone(result);
+    if (resultSemitone < MIN_INPUT_SEMITONE || resultSemitone > MAX_INPUT_SEMITONE) return null;
+
+    return result;
 }
 
 // score.timeSignature（例: "4/4", "3/4"）から、1小節分の拍数（4分音符換算）を返す
@@ -585,8 +578,42 @@ function getBeatsPerMeasure() {
     return num * 4 / den;
 }
 
+// 小節1つ分をまるごと休ませる休符（現在の拍子に合う音価）を1つ返す
+// 拍数の大きい順（付点も含む）。休符で埋め直す際、なるべく少ない数の休符になるよう貪欲法で使う
+const REST_FILL_DURATIONS = [
+    { duration: "w", dotted: true, beats: 6 },
+    { duration: "w", beats: 4 },
+    { duration: "h", dotted: true, beats: 3 },
+    { duration: "h", beats: 2 },
+    { duration: "q", dotted: true, beats: 1.5 },
+    { duration: "q", beats: 1 },
+    { duration: "8", dotted: true, beats: 0.75 },
+    { duration: "8", beats: 0.5 },
+    { duration: "16", dotted: true, beats: 0.375 },
+    { duration: "16", beats: 0.25 },
+];
+const BEAT_EPSILON = 1e-6;
+
+// 指定した拍数ちょうどを、できるだけ少ない数の休符で埋める休符データの配列を返す
+function beatsToRests(beats) {
+    const rests = [];
+    let remaining = beats;
+    for (const d of REST_FILL_DURATIONS) {
+        while (remaining >= d.beats - BEAT_EPSILON) {
+            rests.push({ rest: true, duration: d.duration, ...(d.dotted ? { dotted: true } : {}) });
+            remaining -= d.beats;
+        }
+    }
+    return rests;
+}
+
+// 新規に作る空の小節（あらかじめ全休符を入れておく。小節は常に音符か休符で埋まっている前提）
+function makeEmptyMeasure() {
+    return { notes: beatsToRests(getBeatsPerMeasure()) };
+}
+
 function pitchToKey(pitch) {
-    const match = pitch.match(/^([A-Ga-g])([#b]?)(\d)$/);
+    const match = pitch.match(/^([A-Ga-g])([#b]?)(-?\d+)$/);
     if (!match) throw new Error(`不正な音名: ${pitch}`);
     const note = match[1].toLowerCase();
     const accidental = match[2];
@@ -594,22 +621,11 @@ function pitchToKey(pitch) {
     return { key: `${note}${accidental}/${octave}`, accidental };
 }
 
-// 半音単位での移調用: 音名(シャープ表記のみ、白鍵/黒鍵とも)
-const CHROMATIC_SHARP = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-const NATURAL_SEMITONE = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
-
-// pitch（例:"F#4"）をshift半音分だけ移調した新しいpitch文字列を返す（常にシャープ表記）
+// pitch（例:"F#4"）をshift半音分だけ移調した新しいpitch文字列を返す（常にシャープ表記、音域無制限）
 function transposePitch(pitch, shift) {
-    const match = pitch.match(/^([A-Ga-g])([#b]?)(\d)$/);
-    if (!match) throw new Error(`不正な音名: ${pitch}`);
-    const letter = match[1].toUpperCase();
-    const accidental = match[2];
-    const octave = parseInt(match[3], 10);
-    const accidentalAdjust = accidental === "#" ? 1 : accidental === "b" ? -1 : 0;
-    const absolute = octave * 12 + NATURAL_SEMITONE[letter] + accidentalAdjust + shift;
-    const newOctave = Math.floor(absolute / 12);
-    const semitoneInOctave = ((absolute % 12) + 12) % 12;
-    return `${CHROMATIC_SHARP[semitoneInOctave]}${newOctave}`;
+    const semitone = pitchToSemitone(pitch);
+    if (semitone === null) throw new Error(`不正な音名: ${pitch}`);
+    return semitoneToPitch(semitone + shift);
 }
 
 // 調号（キー）をshift半音分だけ移調する。異名同音は実用上一般的な表記を採用
@@ -622,6 +638,21 @@ function transposeKeySignature(key, shift) {
     const base = KEY_SEMITONES[key] ?? 0;
     const newSemitone = ((base + shift) % 12 + 12) % 12;
     return SEMITONE_TO_KEY[newSemitone];
+}
+
+// 調号ごとに変化するレターとその臨時記号（#/b）を返す（五線譜上の付加順）
+const SHARP_KEY_ORDER = { C: 0, G: 1, D: 2, A: 3, E: 4, B: 5, "F#": 6, "C#": 7 };
+const FLAT_KEY_ORDER = { F: 1, Bb: 2, Eb: 3, Ab: 4, Db: 5, Gb: 6, Cb: 7 };
+const SHARP_LETTER_ORDER = ["F", "C", "G", "D", "A", "E", "B"];
+const FLAT_LETTER_ORDER = ["B", "E", "A", "D", "G", "C", "F"];
+function getKeyAccidentalMap(key) {
+    const map = {};
+    if (key in SHARP_KEY_ORDER) {
+        for (let i = 0; i < SHARP_KEY_ORDER[key]; i++) map[SHARP_LETTER_ORDER[i]] = "#";
+    } else if (key in FLAT_KEY_ORDER) {
+        for (let i = 0; i < FLAT_KEY_ORDER[key]; i++) map[FLAT_LETTER_ORDER[i]] = "b";
+    }
+    return map;
 }
 
 // 曲全体をshift半音分だけ移調する（音符・調号とも）
@@ -709,6 +740,7 @@ let mapSettings = {
     wrapByCount: true,           // true=センサー数指定, false=マス数指定
     wrapValue: 10,               // 折り返し値
     turnLength: 6,               // 段と段の間（見た目上の空きマス数）。誤作動防止のため最小6
+    hideUnusedSensors: false,    // true=周りに音符マットがないセンサーを配置しない（カウントにも含めない）
 };
 
 // 段と段の間の見た目上の空きマス数（ユーザーが実際にグリッド上で数える空きマス数と
@@ -737,7 +769,7 @@ function getAllBeats() {
     const beats = [];
     score.measures.forEach((measure, measureIndex) => {
         measure.notes.forEach(note => {
-            const count = Math.round((durationBeats[note.duration] || 0) / 0.25);
+            const count = Math.round(noteBeats(note) / 0.25);
             for (let i = 0; i < count; i++) {
                 beats.push({
                     measureIndex,
@@ -775,7 +807,7 @@ function calcPanelPositionsCore(pitches, forwardVec, awayVec) {
 }
 
 function updateMapToolbarUI() {
-    const { railDirection, startCorner, sideFirst, wrapByCount, wrapValue, turnLength } = mapSettings;
+    const { railDirection, startCorner, sideFirst, wrapByCount, wrapValue, turnLength, hideUnusedSensors } = mapSettings;
 
     const setActive = (id, active) => {
         const el = document.getElementById(id);
@@ -794,6 +826,7 @@ function updateMapToolbarUI() {
     setActive("mapSideRight", sideFirst === "right");
     setActive("mapWrapByCount", wrapByCount);
     setActive("mapWrapByMass",  !wrapByCount);
+    setActive("mapHideUnusedSensors", hideUnusedSensors);
 
     const wrapInput = document.getElementById("mapWrapValue");
     if (wrapInput) wrapInput.value = wrapValue;
@@ -875,22 +908,23 @@ function buildMapGrid() {
             });
         });
 
-        // センサーセル（中間層）
-        setCell(sX, sY, 0, {
-            type: "sensor",
-            beatNum: beatIdx + 1,
-            direction: railDirection,
-        });
+        // このビートに音符マットが伴うか（音符の先頭スロットのみ）
+        const hasPanel = beat.isFirst && beat.note && !beat.note.rest && beat.note.pitches;
+
+        // センサーセル（中間層）。周りに音符マットがないセンサーを隠す設定の場合はスキップする
+        if (!mapSettings.hideUnusedSensors || hasPanel) {
+            setCell(sX, sY, 0, {
+                type: "sensor",
+                beatNum: beatIdx + 1,
+                direction: railDirection,
+            });
+        }
 
         // 音符マットの配置
-        if (beat.isFirst && beat.note && !beat.note.rest && beat.note.pitches) {
+        if (hasPanel) {
             const sorted = [...beat.note.pitches].sort((a, b) => {
                 // 半音値で降順ソート（高音順）
-                const semitoneOf = p => {
-                    const found = [...WHITE_KEYS, ...BLACK_KEYS].find(k => k.pitch === p);
-                    return found ? found.semitone : 0;
-                };
-                return semitoneOf(b) - semitoneOf(a);
+                return pitchToSemitone(b) - pitchToSemitone(a);
             });
 
             const panelPositions = calcPanelPositionsCore(sorted, forwardVec, awayVec);
@@ -1006,7 +1040,7 @@ function renderMap() {
                     cell.dataset.laserDirection = isVert ? "horizontal" : "vertical";
                     cell.textContent = data.beatNum;
                 } else if (data.type === "panel") {
-                    const file = PITCH_TO_FILE[data.pitch];
+                    const file = PITCH_TO_FILE[toCanonicalPitch(data.pitch)];
                     if (file) {
                         const img = document.createElement("img");
                         img.src = `img/${file}`;
@@ -1107,9 +1141,13 @@ function updateCountsBar() {
     });
 
     // レール数（レールマスの総数）・センサー数はマップの配置設定に基づいて計算
-    const { grid, totalBeats } = buildMapGrid();
+    const { grid } = buildMapGrid();
     let railCellCount = 0;
-    grid.forEach(data => { if (data.type === "rail") railCellCount++; });
+    let sensorCellCount = 0;
+    grid.forEach(data => {
+        if (data.type === "rail") railCellCount++;
+        if (data.type === "sensor") sensorCellCount++;
+    });
 
     const addCountIcon = (src, alt, count) => {
         const item = document.createElement("div");
@@ -1130,7 +1168,7 @@ function updateCountsBar() {
     };
 
     addCountIcon("img/rail.png", "レール数", railCellCount);
-    addCountIcon("img/sensor.png", "センサー数", totalBeats);
+    addCountIcon("img/sensor.png", "センサー数", sensorCellCount);
 }
 
 function updateAddButton() {
@@ -1148,58 +1186,6 @@ function updateAddButton() {
     btn.style.width = `${28 * scale}px`;
     btn.style.height = `${28 * scale}px`;
     btn.style.fontSize = `${16 * scale}px`;
-}
-
-function drawHoverPreview(context, stave, measureIndex) {
-    if (editMode === "select") return;
-    if (!hoveredPos || hoveredPos.measureIndex !== measureIndex) return;
-
-    try {
-        const converted = pitchToKey(hoveredPos.pitch);
-        const previewNote = new VF.StaveNote({
-            keys: [converted.key],
-            duration: "q",
-            auto_stem: true
-        });
-
-        if (converted.accidental) {
-            previewNote.addModifier(
-                new VF.Accidental(converted.accidental), 0
-            );
-        }
-
-        const voice = new VF.Voice({ num_beats: 1, beat_value: 4 });
-        voice.setStrict(false);
-        voice.addTickables([previewNote]);
-
-        new VF.Formatter()
-            .joinVoices([voice])
-            .format([voice], 0);
-
-        previewNote.setContext(context).setStave(stave);
-
-        const targetX = hoveredPos.x / scale;
-        const currentX = previewNote.getAbsoluteX();
-        const noteHeadWidth = 6;
-
-        previewNote.setXShift(targetX - currentX - noteHeadWidth);
-        previewNote.setStyle({
-            fillStyle: "rgba(74, 144, 226, 0.4)",
-            strokeStyle: "rgba(74, 144, 226, 0.4)"
-        });
-        previewNote.setStemStyle({
-            fillStyle: "rgba(0,0,0,0)",
-            strokeStyle: "rgba(0,0,0,0)"
-        });
-        previewNote.setFlagStyle({
-            fillStyle: "rgba(0,0,0,0)",
-            strokeStyle: "rgba(0,0,0,0)"
-        });
-        previewNote.draw();
-
-    } catch (e) {
-        // プレビュー描画エラーは無視
-    }
 }
 
 function saveHistory() {
@@ -1390,15 +1376,60 @@ function renderScore() {
             );
             context.restore();
 
-            if (!measure.notes || measure.notes.length === 0) {
-                drawHoverPreview(context, stave, measureIndex);
+            // このコマでのホバープレビュー内容を先に計算する（新規音符/休符の挿入 or 和音への音追加）
+            const preview = computeHoverPreview(measureIndex, measure);
+
+            // 実際にレンダリングする音符データ列（プレビュー用のダミーを含む場合がある）。
+            // origIndexMap[i] は renderNoteData[i] に対応する measure.notes 側の実インデックス（プレビューはnull）
+            const renderNoteData = [...(measure.notes || [])];
+            const origIndexMap = renderNoteData.map((_, i) => i);
+            // 上書きプレビュー時、「元々あったもの」と「新しく置かれるもの」の
+            // どちらか一方は通常のレンダリングでは表示されなくなるため、そちらを半透明の
+            // 追加オーバーレイとして後から重ね描きする（overlayGhostに情報を残す）
+            let overlayGhost = null;
+            if (preview && (preview.type === "splitNote" || preview.type === "splitRest")) {
+                const leading = beatsToRests(preview.leadingBeats);
+                const trailing = beatsToRests(preview.trailingBeats);
+                const center = preview.type === "splitRest"
+                    ? { rest: true, duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}), __preview: true }
+                    : { pitches: [preview.pitch], duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}), __preview: true };
+                const replacement = [...leading, center, ...trailing];
+                const original = measure.notes[preview.targetIndex];
+                // 新しい配置（分割後）は通常通り描画されるので、元の休符（分割前）をグループの中央に重ね描きする
+                overlayGhost = {
+                    style: "before",
+                    rest: true,
+                    duration: original.duration,
+                    dotted: !!original.dotted,
+                    groupStart: preview.targetIndex,
+                    groupLength: replacement.length
+                };
+                renderNoteData.splice(preview.targetIndex, 1, ...replacement);
+                origIndexMap.splice(preview.targetIndex, 1, ...replacement.map(() => null));
+            } else if (preview && preview.type === "overwriteWithRest") {
+                // 休符モードで既存音符の上にホバー：音符データ自体は変更せず通常通り描画し、
+                // 上書き後（休符）のプレビューを同じ位置に重ね描きする
+                overlayGhost = {
+                    style: "after",
+                    rest: true,
+                    duration: preview.duration,
+                    dotted: preview.dotted,
+                    groupStart: preview.existingNoteIndex,
+                    groupLength: 1
+                };
+            }
+
+            if (renderNoteData.length === 0) {
                 return;
             }
 
-            const notes = measure.notes.map((note, noteIndex) => {
-                const isHovered = hoveredPos &&
+            const previewColor = "rgba(74, 144, 226, 0.45)";
+
+            const notes = renderNoteData.map((note, renderIdx) => {
+                const realNoteIndex = origIndexMap[renderIdx];
+                const isHovered = realNoteIndex !== null && hoveredPos &&
                     hoveredPos.measureIndex === measureIndex &&
-                    hoveredPos.hitNoteIndex === noteIndex &&
+                    hoveredPos.hitNoteIndex === realNoteIndex &&
                     hoveredPos.directHit === true;
 
                 const hoverColor = "rgba(220, 50, 50, 0.7)";
@@ -1406,29 +1437,64 @@ function renderScore() {
                 if (note.rest) {
                     const restNote = new VF.StaveNote({
                         keys: ["b/4"],
-                        duration: note.duration + "r"
+                        duration: note.duration + "r",
+                        ...(note.dotted ? { dots: 1 } : {})
                     });
-                    if (isHovered) {
+                    if (note.dotted) {
+                        VF.Dot.buildAndAttach([restNote], { all: true });
+                    }
+                    if (note.__preview) {
+                        restNote.setStyle({ fillStyle: previewColor, strokeStyle: previewColor });
+                    } else if (isHovered) {
                         restNote.setStyle({ fillStyle: hoverColor, strokeStyle: hoverColor });
                     }
                     return restNote;
                 }
 
-                const keys = note.pitches.map(p => pitchToKey(p).key);
+                // 和音追加プレビュー：既存の和音にプレビュー用のピッチを一時的に混ぜて描画する
+                let pitches = note.pitches;
+                let previewPitchIndex = -1;
+                if (preview && preview.type === "chordAdd" && realNoteIndex === preview.existingNoteIndex) {
+                    pitches = [...note.pitches, preview.pitch].sort((a, b) => pitchToSemitone(a) - pitchToSemitone(b));
+                    previewPitchIndex = pitches.indexOf(preview.pitch);
+                }
+
+                const keys = pitches.map(p => pitchToKey(p).key);
                 const staveNote = new VF.StaveNote({
                     keys,
                     duration: note.duration,
-                    auto_stem: true
+                    auto_stem: true,
+                    ...(note.dotted ? { dots: 1 } : {})
                 });
+                if (note.dotted) {
+                    VF.Dot.buildAndAttach([staveNote], { all: true });
+                }
 
-                if (isHovered) {
-                    staveNote.setStyle({ fillStyle: hoverColor, strokeStyle: hoverColor });
+                if (note.__preview) {
+                    staveNote.setStyle({ fillStyle: previewColor, strokeStyle: previewColor });
+                    staveNote.setStemStyle({ fillStyle: "rgba(0,0,0,0)", strokeStyle: "rgba(0,0,0,0)" });
+                    staveNote.setFlagStyle({ fillStyle: "rgba(0,0,0,0)", strokeStyle: "rgba(0,0,0,0)" });
+                } else {
+                    // 音符マット（物理パネル）が存在しない音域（C4〜C#6の範囲外）はオレンジでハイライトする
+                    const unsupportedColor = "#e08000";
+                    pitches.forEach((p, i) => {
+                        if (i === previewPitchIndex) {
+                            staveNote.setKeyStyle(i, { fillStyle: previewColor, strokeStyle: previewColor });
+                        } else if (!PITCH_TO_FILE[toCanonicalPitch(p)]) {
+                            staveNote.setKeyStyle(i, { fillStyle: unsupportedColor, strokeStyle: unsupportedColor });
+                        }
+                    });
+
+                    if (isHovered) {
+                        staveNote.setStyle({ fillStyle: hoverColor, strokeStyle: hoverColor });
+                    }
                 }
 
                 return staveNote;
             });
 
-            const remainingBeats = getBeatsPerMeasure() - getMeasureBeats(measure);
+            const totalBeats = renderNoteData.reduce((sum, n) => sum + noteBeats(n), 0);
+            const remainingBeats = getBeatsPerMeasure() - totalBeats;
             const dummyNotes = makeDummyNotes(Math.max(0, remainingBeats));
             const allNotes = [...notes, ...dummyNotes];
 
@@ -1448,7 +1514,7 @@ function renderScore() {
                 .format([voice], formatWidth);
 
             const beams = VF.Beam.generateBeams(
-                notes.filter((_, i) => !measure.notes[i].rest)
+                notes.filter((_, i) => !renderNoteData[i].rest)
             );
 
             beams.forEach(beam => {
@@ -1466,12 +1532,85 @@ function renderScore() {
                 beam.setContext(context).draw();
             });
 
-            notes.forEach((staveNote, noteIndex) => {
+            // 小節の中身が休符1つだけ（例: 全休符）の場合、そのまま描画すると音符エリアの先頭に
+            // 寄って見えるため、音符エリアの中央に来るよう見た目上シフトする。
+            // （StaveNoteのgetBoundingBox/getAbsoluteXはdraw前・setXShiftとの組み合わせでは信頼できないため、
+            // 実際に描画されたDOM要素の位置を測ってからtransformで補正する）
+            let soleRestCenterShift = 0;
+            if (renderNoteData.length === 1 && renderNoteData[0].rest) {
+                try {
+                    const bb = notes[0].getBoundingBox();
+                    if (bb) {
+                        const noteAreaCenterX = (stave.getNoteStartX() + stave.getNoteEndX()) / 2;
+                        const currentCenterX = bb.getX() + bb.getW() / 2;
+                        soleRestCenterShift = noteAreaCenterX - currentCenterX;
+                        const groups = context.svg.querySelectorAll("g.vf-stavenote");
+                        const targetGroup = groups[groups.length - 1];
+                        if (targetGroup) {
+                            targetGroup.setAttribute("transform", `translate(${soleRestCenterShift}, 0)`);
+                        }
+                    }
+                } catch (e) {
+                    // 補正に失敗しても本体の表示自体は継続する
+                }
+            }
+
+            // 上書きプレビュー：「元々あったもの」または「新しく置かれるもの」のうち、
+            // 通常の描画には出てこない側を、対象グループの中央に半透明で重ね描きする
+            if (overlayGhost) {
+                try {
+                    const groupNotes = notes.slice(overlayGhost.groupStart, overlayGhost.groupStart + overlayGhost.groupLength);
+                    let ghostMinX = Infinity, ghostMaxX = -Infinity;
+                    groupNotes.forEach(sn => {
+                        const bb = sn.getBoundingBox();
+                        if (bb) {
+                            ghostMinX = Math.min(ghostMinX, bb.getX());
+                            ghostMaxX = Math.max(ghostMaxX, bb.getX() + bb.getW());
+                        }
+                    });
+                    if (ghostMinX < ghostMaxX) {
+                        const ghostCenterX = (ghostMinX + ghostMaxX) / 2;
+                        const ghostNote = new VF.StaveNote({
+                            keys: ["b/4"],
+                            duration: overlayGhost.duration + "r",
+                            ...(overlayGhost.dotted ? { dots: 1 } : {})
+                        });
+                        if (overlayGhost.dotted) {
+                            VF.Dot.buildAndAttach([ghostNote], { all: true });
+                        }
+                        const ghostVoice = new VF.Voice({ num_beats: 1, beat_value: 4 });
+                        ghostVoice.setStrict(false);
+                        ghostVoice.addTickables([ghostNote]);
+                        new VF.Formatter().joinVoices([ghostVoice]).format([ghostVoice], 0);
+                        ghostNote.setContext(context).setStave(stave);
+                        ghostNote.setXShift(ghostCenterX - ghostNote.getAbsoluteX());
+                        const ghostColor = overlayGhost.style === "before"
+                            ? "rgba(120, 120, 120, 0.5)"
+                            : previewColor;
+                        // note.setStyle()だけでは単独描画（voice.draw()を経由しない）時にSVGへ反映されないため、
+                        // contextのfill/strokeを直接指定してから描画する
+                        context.save();
+                        context.setFillStyle(ghostColor);
+                        context.setStrokeStyle(ghostColor);
+                        ghostNote.draw();
+                        context.restore();
+                    }
+                } catch (e) {
+                    // オーバーレイの描画失敗は無視する（本体の描画には影響させない）
+                }
+            }
+
+            notes.forEach((staveNote, renderIdx) => {
+                const realNoteIndex = origIndexMap[renderIdx];
+                if (realNoteIndex === null) return; // プレビュー用のダミーはクリック判定に含めない
+                const noteIndex = realNoteIndex;
                 const noteData = measure.notes[noteIndex];
                 const bb = staveNote.getBoundingBox();
-                const nx = staveNote.getAbsoluteX() * scale;
-                const nxLeft = bb ? bb.getX() * scale : nx - 6 * scale;
-                const nxRight = bb ? (bb.getX() + bb.getW()) * scale : nx + 6 * scale;
+                // 休符1つだけの小節は見た目上センタリングしているため、判定座標もそのぶんずらす
+                const centerShiftPx = soleRestCenterShift * scale;
+                const nx = staveNote.getAbsoluteX() * scale + centerShiftPx;
+                const nxLeft = bb ? (bb.getX() * scale + centerShiftPx) : nx - 6 * scale;
+                const nxRight = bb ? ((bb.getX() + bb.getW()) * scale + centerShiftPx) : nx + 6 * scale;
                 const svgOffsetTop = rowDiv.offsetTop;
 
                 if (noteData.rest) {
@@ -1493,26 +1632,38 @@ function renderScore() {
 
                 const bbX = bb ? bb.getX() * scale : nx;
                 const bbW = bb ? bb.getW() * scale : 12 * scale;
-                const pitchCount = noteData.pitches.length;
+                const lastPitchIndex = noteData.pitches.length - 1;
 
-                noteData.pitches.forEach((pitch, pitchIndex) => {
-                    const ny = staveNote.getYs()[pitchIndex] * scale + svgOffsetTop;
-                    const sliceW = bbW / pitchCount;
+                // 和音追加プレビュー中は、staveNote自体はプレビュー用ピッチも混ぜて構築されているため、
+                // 実データのピッチがstaveNote内の何番目のキーに対応するかを合わせる必要がある
+                const hasChordPreview = preview && preview.type === "chordAdd" && noteIndex === preview.existingNoteIndex;
+                const combinedPitches = hasChordPreview
+                    ? [...noteData.pitches, preview.pitch].sort((a, b) => pitchToSemitone(a) - pitchToSemitone(b))
+                    : noteData.pitches;
+
+                // 和音内の各ピッチの判定領域は、等分割ではなく実際のノートヘッド位置を使う
+                // （臨時記号がついたピッチがある場合、幅が均等でなくなるため）。
+                // 一番左/右のピッチだけは、臨時記号の余白も含めて全体のbboxまで広げる
+                noteData.pitches.forEach((pitch, dataIndex) => {
+                    const renderPitchIndex = hasChordPreview ? combinedPitches.indexOf(pitch) : dataIndex;
+                    const ny = staveNote.getYs()[renderPitchIndex] * scale + svgOffsetTop;
+                    const nh = staveNote.noteHeads && staveNote.noteHeads[renderPitchIndex];
+                    const nhBB = nh ? nh.getBoundingBox() : null;
+                    const nhLeft = nhBB ? nhBB.getX() * scale : bbX;
+                    const nhRight = nhBB ? (nhBB.getX() + nhBB.getW()) * scale : bbX + bbW;
                     notePositions.push({
                         x: nx,
-                        xLeft: bbX + sliceW * pitchIndex,
-                        xRight: bbX + sliceW * (pitchIndex + 1),
+                        xLeft: dataIndex === 0 ? bbX : nhLeft,
+                        xRight: dataIndex === lastPitchIndex ? (bbX + bbW) : nhRight,
                         y: ny,
                         pitch,
                         measureIndex,
                         noteIndex,
-                        pitchIndex,
+                        pitchIndex: dataIndex,
                         rowIndex
                     });
                 });
             });
-
-            drawHoverPreview(context, stave, measureIndex);
         });
     });
 
@@ -1663,12 +1814,14 @@ function setupInsertButtons() {
         btn.style.fontSize = `${16 * scale}px`;
 
         btn.addEventListener("click", () => {
-            score.measures.splice(measureIndex, 0, { notes: [] });
+            score.measures.splice(measureIndex, 0, makeEmptyMeasure());
             selectedMeasures.clear();
             saveHistory();
             renderScore();
             setupDeleteButtons();
             setupInsertButtons();
+            if (activeTab === "map") renderMap();
+            rescheduleFromCurrentPosition();
         });
 
         wrapper.appendChild(btn);
@@ -1692,6 +1845,92 @@ function findNoteAt(measureIndex, clickX, clickY, looseness = 1) {
         Math.abs(pos.y - clickY) <= 5 * scale * looseness
     );
     return hit || null;
+}
+
+// 小節内のX座標（clickX）が、拍数換算でどの位置（拍単位）にあたるかを返す。
+// 小節は常に音符/休符で埋まっている前提なので、小節全体の表示幅を拍数で比例配分して近似する
+function xToBeatPosition(measureIndex, clickX) {
+    const { left, right } = getMeasureXRange(measureIndex);
+    const totalBeats = getBeatsPerMeasure();
+    if (right <= left || totalBeats <= 0) return null;
+    return (clickX - left) / (right - left) * totalBeats;
+}
+
+// clickXが小節内のどの音符/休符（measure.notesのインデックス）にあたるかを、拍位置から探す。
+// 見つかった場合 { index, segStart, segBeats } を返す（segStartはその要素の開始拍位置）
+function findSegmentAtBeatPosition(measure, beatPos) {
+    if (beatPos === null) return null;
+    let cursor = 0;
+    for (let i = 0; i < measure.notes.length; i++) {
+        const segBeats = noteBeats(measure.notes[i]);
+        const segStart = cursor;
+        const segEnd = cursor + segBeats;
+        cursor = segEnd;
+        if (beatPos >= segStart - BEAT_EPSILON && beatPos < segEnd - BEAT_EPSILON) {
+            return { index: i, segStart, segBeats };
+        }
+    }
+    return null;
+}
+
+// 休符（1つ分）を、選択中の音価のスロット単位で分割する位置を計算する。
+// wantedBeats単位でスロット数を割り出し、hoverの拍位置に一番近いスロットへ吸い付ける
+function computeSplitForSegment(segStart, segBeats, hoverBeatPos, wantedBeats) {
+    const nSlots = Math.floor(segBeats / wantedBeats + BEAT_EPSILON);
+    if (nSlots < 1) return null;
+    let slotIndex = Math.floor((hoverBeatPos - segStart) / wantedBeats);
+    slotIndex = Math.max(0, Math.min(nSlots - 1, slotIndex));
+    const leadingBeats = slotIndex * wantedBeats;
+    const trailingBeats = segBeats - leadingBeats - wantedBeats;
+    return { leadingBeats, trailingBeats };
+}
+
+// ホバー中に「クリックしたら実際にどうなるか」を計算する。
+// 小節は常に音符/休符で埋まっている前提なので、対象は必ずxToBeatPosition/findSegmentAtBeatPositionで
+// measure.notesから直接特定する（notePositionsは前回描画のスナップショットで、プレビュー自体が
+// 対象を差し替えて描画することがあるため、次のクリック判定の材料としては使わない）。
+// 戻り値: { type: "splitNote"|"splitRest"|"chordAdd"|"overwriteWithRest", ... } または null
+function computeHoverPreview(measureIndex, measure) {
+    if (editMode !== "note") return null;
+    if (!hoveredPos || hoveredPos.measureIndex !== measureIndex || !hoveredPos.pitch) return null;
+
+    const invert = k => (k === "note" ? "rest" : "note");
+    const effectiveKind = isCtrlHeldForRestPreview ? invert(selectedKind) : selectedKind;
+
+    const beatPos = xToBeatPosition(measureIndex, hoveredPos.x);
+    const segment = findSegmentAtBeatPosition(measure, beatPos);
+    if (!segment) return null;
+    const target = measure.notes[segment.index];
+
+    if (!target.rest) {
+        // 既存音符：休符モードならその音符を丸ごと休符で上書き、音符モードなら和音への音追加
+        if (effectiveKind === "rest") {
+            return {
+                type: "overwriteWithRest",
+                existingNoteIndex: segment.index,
+                duration: target.duration,
+                dotted: !!target.dotted
+            };
+        }
+        if (!target.pitches) return null;
+        if (target.pitches.includes(hoveredPos.pitch) || target.pitches.length >= 3) return null;
+        return { type: "chordAdd", existingNoteIndex: segment.index, pitch: hoveredPos.pitch };
+    }
+
+    // 休符：選択中の音価のスロット単位で分割して新規に置く
+    const wantedBeats = selectedNoteBeats();
+    if (wantedBeats <= 0) return null;
+
+    const split = computeSplitForSegment(segment.segStart, segment.segBeats, beatPos, wantedBeats);
+    if (!split) return null;
+
+    return {
+        type: effectiveKind === "rest" ? "splitRest" : "splitNote",
+        targetIndex: segment.index,
+        leadingBeats: split.leadingBeats,
+        trailingBeats: split.trailingBeats,
+        pitch: effectiveKind === "rest" ? null : hoveredPos.pitch,
+    };
 }
 
 function getMeasureIndexFromXY(clickX, clickY) {
@@ -1729,6 +1968,11 @@ function getMeasureIndexFromXY(clickX, clickY) {
 
 // 実際の音符編集処理（ドラッグでない通常クリック時に呼ばれる）
 function handleNoteEdit(e, svg, rowDiv) {
+    // クリック直後にrenderScore()すると、クリック前のホバー位置（プレビュー計算のもとになったnotePositions）が
+    // データ変更後には古くなっており、変更後の音符と重複したプレビューが一瞬表示されてしまう。
+    // クリックした時点でホバー状態は無効化し、次のmousemoveで再計算させる
+    hoveredPos = null;
+
     const rect = svg.getBoundingClientRect();
     const clickX = e.clientX - rect.left;
     const clickY = e.clientY - rect.top + rowDiv.offsetTop;
@@ -1765,19 +2009,27 @@ function handleNoteEdit(e, svg, rowDiv) {
             if (shiftHit) {
                 const note = measure.notes[shiftHit.noteIndex];
                 const pitch = note.pitches[shiftHit.pitchIndex];
-                if (BLACK_PITCHES.has(pitch)) {
-                    const whiteKey = Object.keys(WHITE_TO_BLACK).find(
-                        k => WHITE_TO_BLACK[k] === pitch
-                    );
-                    if (whiteKey) {
-                        note.pitches[shiftHit.pitchIndex] = whiteKey;
+                const match = pitch.match(/^([A-G])([#b]?)(-?\d+)$/);
+                if (match) {
+                    const [, letter, accidental, octave] = match;
+                    const hasSharp = HAS_BLACK_KEY.has(letter);
+                    const hasFlat = HAS_FLAT_KEY.has(letter);
+                    // 自然音→シャープ→フラット→自然音の順で巡回する（存在しない状態は飛ばす）。
+                    // 調号がフラット系の場合でもアクシデンタルなしで表現できるように、
+                    // 同じ物理パネルをシャープ表記・フラット表記の両方で選べるようにしている
+                    let nextAccidental;
+                    if (accidental === "") {
+                        nextAccidental = hasSharp ? "#" : (hasFlat ? "b" : "");
+                    } else if (accidental === "#") {
+                        nextAccidental = hasFlat ? "b" : "";
+                    } else {
+                        nextAccidental = "";
+                    }
+                    if (nextAccidental !== accidental) {
+                        note.pitches[shiftHit.pitchIndex] = `${letter}${nextAccidental}${octave}`;
                         saveHistory();
                         renderScore();
                     }
-                } else if (WHITE_TO_BLACK[pitch]) {
-                    note.pitches[shiftHit.pitchIndex] = WHITE_TO_BLACK[pitch];
-                    saveHistory();
-                    renderScore();
                 }
             }
 
@@ -1787,113 +2039,81 @@ function handleNoteEdit(e, svg, rowDiv) {
                 ? (selectedKind === "note" ? "rest" : "note")
                 : selectedKind;
 
-            if (effectiveKind === "rest") {
-                const existingNote = findNoteAt(measureIndex, clickX, clickY);
-                if (existingNote) return;
-                if (!isValidX) return;
+            if (!isValidX) return;
 
-                const measureNotes = notePositions.filter(
-                    p => p.measureIndex === measureIndex
-                );
+            const beatPos = xToBeatPosition(measureIndex, clickX);
+            const segment = findSegmentAtBeatPosition(measure, beatPos);
+            if (!segment) return;
+            const target = measure.notes[segment.index];
 
-                const beats = getMeasureBeats(measure);
-                const remaining = getBeatsPerMeasure() - beats;
-                if (durationBeats[selectedDuration] > remaining) return;
-
-                const uniqueNoteIndices = [...new Set(measureNotes.map(p => p.noteIndex))];
-                const noteInsertIndex = uniqueNoteIndices.filter(i => {
-                    const pos = measureNotes.find(p => p.noteIndex === i);
-                    return pos && pos.x < clickX;
-                }).length;
-
-                measure.notes.splice(noteInsertIndex, 0, {
-                    rest: true,
-                    duration: selectedDuration
-                });
-                saveHistory();
-                renderScore();
-
-            } else if (hit) {
-                // 同じX座標に既存音符があり、Y座標が外れている場合は和音追加（削除は右クリックで行うため、ここでは削除しない）
-                const existingAtX = findNoteAtX(measureIndex, clickX);
-                if (existingAtX && !existingAtX.rest) {
-                    const note = measure.notes[existingAtX.noteIndex];
+            if (!target.rest) {
+                if (effectiveKind === "rest") {
+                    // 休符モードで既存音符の上に置くと、その音符を同じ長さの休符で上書きする
+                    measure.notes[segment.index] = {
+                        rest: true,
+                        duration: target.duration,
+                        ...(target.dotted ? { dotted: true } : {})
+                    };
+                    saveHistory();
+                    renderScore();
+                } else {
+                    // 既存の和音への音追加
                     const pitch = yToPitch(clickYLocal, false);
-                    if (pitch && !note.pitches.includes(pitch) && note.pitches.length < 3) {
-                        note.pitches.push(pitch);
-                        note.pitches.sort((a, b) => {
-                            const aIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === a);
-                            const bIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === b);
-                            return aIdx - bIdx;
-                        });
+                    if (pitch && !target.pitches.includes(pitch) && target.pitches.length < 3) {
+                        target.pitches.push(pitch);
+                        target.pitches.sort((a, b) => pitchToSemitone(a) - pitchToSemitone(b));
                         saveHistory();
                         renderScore();
                     }
                 }
-
             } else {
-                const existingNote = findNoteAtX(measureIndex, clickX);
+                // 休符：選択中の音価のスロット単位で分割して新規に置く
+                const wantedBeats = selectedNoteBeats();
+                if (wantedBeats <= 0) return;
 
-                if (existingNote) {
-                    const note = measure.notes[existingNote.noteIndex];
-                    if (note.rest) return;
-                    if (note.pitches.length >= 3) return;
+                const split = computeSplitForSegment(segment.segStart, segment.segBeats, beatPos, wantedBeats);
+                if (!split) return; // 選択中の音価がこの休符に収まらない
 
-                    const pitch = yToPitch(clickYLocal, false);
-                    if (!pitch) return;
-                    if (note.pitches.includes(pitch)) return;
-
-                    note.pitches.push(pitch);
-                    note.pitches.sort((a, b) => {
-                        const aIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === a);
-                        const bIdx = [...WHITE_KEYS, ...BLACK_KEYS].findIndex(k => k.pitch === b);
-                        return aIdx - bIdx;
-                    });
-                    saveHistory();
-                    renderScore();
-
+                let centerEntry;
+                if (effectiveKind === "rest") {
+                    centerEntry = { rest: true, duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}) };
                 } else {
-                    if (!isValidX) return;
-
                     const pitch = yToPitch(clickYLocal, false);
                     if (!pitch) return;
-
-                    const beats = getMeasureBeats(measure);
-                    const remaining = getBeatsPerMeasure() - beats;
-                    if (durationBeats[selectedDuration] > remaining) return;
-
-                    const measureNotePositions = notePositions.filter(
-                        p => p.measureIndex === measureIndex
-                    );
-                    const uniqueNoteIndices = [...new Set(measureNotePositions.map(p => p.noteIndex))];
-                    const insertIndex = uniqueNoteIndices.filter(i => {
-                        const pos = measureNotePositions.find(p => p.noteIndex === i);
-                        return pos && pos.x < clickX;
-                    }).length;
-
-                    measure.notes.splice(insertIndex, 0, {
-                        pitches: [pitch],
-                        duration: selectedDuration
-                    });
-                    saveHistory();
-                    renderScore();
+                    centerEntry = { pitches: [pitch], duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}) };
                 }
+
+                const replacement = [
+                    ...beatsToRests(split.leadingBeats),
+                    centerEntry,
+                    ...beatsToRests(split.trailingBeats)
+                ];
+                measure.notes.splice(segment.index, 1, ...replacement);
+                saveHistory();
+                renderScore();
             }
         }
 
     } else if (e.button === 2) {
-        // 右クリック = 削除（和音の場合はクリックした音高だけを取り除く）
+        // 右クリック = 削除。小節は常に音符/休符で埋まっている前提なので、
+        // 休符は削除できず（既に「空いている」状態のため）、単音は同じ長さの休符に置き換える
         if (hit) {
             const note = measure.notes[hit.noteIndex];
             if (note.rest) {
-                measure.notes.splice(hit.noteIndex, 1);
+                // 何もしない
             } else if (note.pitches.length === 1) {
-                measure.notes.splice(hit.noteIndex, 1);
+                measure.notes[hit.noteIndex] = {
+                    rest: true,
+                    duration: note.duration,
+                    ...(note.dotted ? { dotted: true } : {})
+                };
+                saveHistory();
+                renderScore();
             } else {
                 note.pitches.splice(hit.pitchIndex, 1);
+                saveHistory();
+                renderScore();
             }
-            saveHistory();
-            renderScore();
         }
     }
 }
@@ -1966,14 +2186,17 @@ function updateEditModeButtons() {
     selectBtn.style.background = editMode === "select" ? "#f0f0f0" : "";
 }
 
-// 音価ボタン（音符アイコン5つ・休符アイコン5つ）の選択状態を反映する
-// 選択中の音価と一致し、かつ現在のモード（Ctrl押下中なら休符、そうでなければ音符）と種類が合うボタンだけをハイライトする
+// 音価ボタン（音符/休符アイコン・付点版含む）の選択状態を反映する
+// 選択中の音価・付点有無と一致し、かつ現在のモード（Ctrl押下中なら休符、そうでなければ音符）と種類が合うボタンだけをハイライトする
 function updateDurationButtons() {
     // 普段はselectedKindをそのまま使い、Ctrl押下中だけ音符⇔休符を反転してハイライトする
     const invert = k => (k === "note" ? "rest" : "note");
     const activeKind = isCtrlHeldForRestPreview ? invert(selectedKind) : selectedKind;
     document.querySelectorAll("button[data-kind]").forEach(btn => {
-        const active = btn.dataset.duration === selectedDuration && btn.dataset.kind === activeKind;
+        const btnDotted = btn.dataset.dotted === "true";
+        const active = btn.dataset.duration === selectedDuration &&
+            btn.dataset.kind === activeKind &&
+            btnDotted === dottedSelected;
         btn.style.color = active ? "#222" : "#aaa";
         btn.style.background = active ? "#f0f0f0" : "";
     });
@@ -2185,7 +2408,7 @@ function cutSelectedMeasures() {
 
     // 全削除時は1小節残す
     if (indices.length >= score.measures.length) {
-        score.measures = [{ notes: [] }];
+        score.measures = [makeEmptyMeasure()];
     } else {
         [...indices].reverse().forEach(i => score.measures.splice(i, 1));
     }
@@ -2195,6 +2418,8 @@ function cutSelectedMeasures() {
     setupDeleteButtons();
     setupInsertButtons();
     updateClipboardButtons();
+    if (activeTab === "map") renderMap();
+    rescheduleFromCurrentPosition();
 }
 
 function pasteSelectedMeasures() {
@@ -2213,6 +2438,8 @@ function pasteSelectedMeasures() {
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
+    if (activeTab === "map") renderMap();
+    rescheduleFromCurrentPosition();
 }
 
 function updateClipboardButtons() {
@@ -2227,7 +2454,7 @@ function deleteSelectedMeasures() {
     if (selectedMeasures.size === 0) return;
     if (selectedMeasures.size >= score.measures.length) {
         // 全小節が選択されている場合は最低1小節残す
-        score.measures = [{ notes: [] }];
+        score.measures = [makeEmptyMeasure()];
     } else {
         const indices = [...selectedMeasures].sort((a, b) => b - a);
         indices.forEach(i => score.measures.splice(i, 1));
@@ -2237,6 +2464,8 @@ function deleteSelectedMeasures() {
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
+    if (activeTab === "map") renderMap();
+    rescheduleFromCurrentPosition();
 }
 
 async function main() {
@@ -2303,8 +2532,10 @@ async function main() {
         btn.addEventListener("click", () => {
             selectedDuration = btn.dataset.duration;
             selectedKind = btn.dataset.kind;
+            dottedSelected = btn.dataset.dotted === "true";
             localStorage.setItem("selectedDuration", selectedDuration);
             localStorage.setItem("selectedKind", selectedKind);
+            localStorage.setItem("dottedSelected", dottedSelected);
             updateDurationButtons();
         });
     });
@@ -2433,6 +2664,10 @@ async function main() {
         mapSettings.turnLength = Math.max(6, parseInt(e.target.value) || 6);
         saveMapSettings(); updateMapToolbarUI(); renderMap();
     });
+    document.getElementById("mapHideUnusedSensors")?.addEventListener("click", () => {
+        mapSettings.hideUnusedSensors = !mapSettings.hideUnusedSensors;
+        saveMapSettings(); updateMapToolbarUI(); renderMap();
+    });
     updateMapToolbarUI();
 
     window.addEventListener("resize", () => {
@@ -2445,13 +2680,15 @@ async function main() {
         .addEventListener("click", (e) => {
             e.preventDefault();
             const scrollY = window.scrollY;
-            score.measures.push({ notes: [] });
+            score.measures.push(makeEmptyMeasure());
             selectedMeasures.clear();
             saveHistory();
             renderScore();
             setupDeleteButtons();
             setupInsertButtons();
             window.scrollTo(0, scrollY);
+            if (activeTab === "map") renderMap();
+            rescheduleFromCurrentPosition();
         });
 
     document.addEventListener("keydown", e => {
@@ -2531,7 +2768,7 @@ async function main() {
     document.getElementById("clearBtn")
         .addEventListener("click", () => {
             if (!confirm("全クリアしますか？")) return;
-            score.measures = [{ notes: [] }];
+            score.measures = [makeEmptyMeasure()];
             document.getElementById("scoreTitleInput").value = "NewScore";
             selectedMeasures.clear();
             saveHistory();

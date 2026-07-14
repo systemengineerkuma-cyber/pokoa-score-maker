@@ -277,11 +277,21 @@
                 <button id="durNoteH" class="text-btn" data-duration="h" data-kind="note" tabindex="-1" title="2分音符" style="font-size:28px;">𝅗𝅥</button>
                 <button id="durNoteW" class="text-btn" data-duration="w" data-kind="note" tabindex="-1" title="全音符" style="font-size:28px;">𝅝</button>
                 <span style="display:inline-block; width:1px; height:24px; background:#ddd; margin:0 6px;"></span>
+                <button id="durNote8Dot" class="text-btn" data-duration="8" data-kind="note" data-dotted="true" tabindex="-1" title="付点8分音符" style="font-size:28px;">𝅘𝅥𝅮.</button>
+                <button id="durNoteQDot" class="text-btn" data-duration="q" data-kind="note" data-dotted="true" tabindex="-1" title="付点4分音符" style="font-size:28px;">𝅘𝅥.</button>
+                <button id="durNoteHDot" class="text-btn" data-duration="h" data-kind="note" data-dotted="true" tabindex="-1" title="付点2分音符" style="font-size:28px;">𝅗𝅥.</button>
+                <button id="durNoteWDot" class="text-btn" data-duration="w" data-kind="note" data-dotted="true" tabindex="-1" title="付点全音符" style="font-size:28px;">𝅝.</button>
+                <span style="display:inline-block; width:1px; height:24px; background:#ddd; margin:0 6px;"></span>
                 <button id="durRest16" class="text-btn" data-duration="16" data-kind="rest" tabindex="-1" title="16分休符" style="font-size:28px;">𝄿</button>
                 <button id="durRest8" class="text-btn" data-duration="8" data-kind="rest" tabindex="-1" title="8分休符" style="font-size:28px;">𝄾</button>
                 <button id="durRestQ" class="text-btn" data-duration="q" data-kind="rest" tabindex="-1" title="4分休符" style="font-size:28px;">𝄽</button>
                 <button id="durRestH" class="text-btn" data-duration="h" data-kind="rest" tabindex="-1" title="2分休符" style="font-size:28px;">𝄼</button>
                 <button id="durRestW" class="text-btn" data-duration="w" data-kind="rest" tabindex="-1" title="全休符" style="font-size:28px;">𝄻</button>
+                <span style="display:inline-block; width:1px; height:24px; background:#ddd; margin:0 6px;"></span>
+                <button id="durRest8Dot" class="text-btn" data-duration="8" data-kind="rest" data-dotted="true" tabindex="-1" title="付点8分休符" style="font-size:28px;">𝄾.</button>
+                <button id="durRestQDot" class="text-btn" data-duration="q" data-kind="rest" data-dotted="true" tabindex="-1" title="付点4分休符" style="font-size:28px;">𝄽.</button>
+                <button id="durRestHDot" class="text-btn" data-duration="h" data-kind="rest" data-dotted="true" tabindex="-1" title="付点2分休符" style="font-size:28px;">𝄼.</button>
+                <button id="durRestWDot" class="text-btn" data-duration="w" data-kind="rest" data-dotted="true" tabindex="-1" title="付点全休符" style="font-size:28px;">𝄻.</button>
             </div>
             <div class="toolbar">
                 <button id="copyBtn" tabindex="-1" title="コピー (Ctrl+C)"><i class="fa-solid fa-copy"></i></button>
@@ -367,6 +377,9 @@
                 <div class="toolbar">
                     <span style="font-size:11px;color:#aaa;">段の間隔</span>
                     <input type="number" id="mapTurnLength" value="6" min="6" style="width:44px;border:none;border-bottom:1px solid #ddd;font-size:14px;text-align:center;background:transparent;outline:none;">
+                </div>
+                <div class="toolbar">
+                    <button id="mapHideUnusedSensors" class="text-btn" tabindex="-1" title="周りに音符マットがないセンサーを非表示にする（カウントにも含めない）">未使用センサー非表示</button>
                 </div>
             </div>
     </div>
