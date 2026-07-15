@@ -899,6 +899,7 @@
   ],
   "title": "道案内（ポケットモンスター）",
   "keySignature": "A",
+  "grandStaff": false,
   "bpm": 150,
   "northDirection": 0,
   "scale": 0.72,

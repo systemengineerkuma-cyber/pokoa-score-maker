@@ -3,6 +3,11 @@ const VF = VexFlow;
 let score = null;
 let scale = 1;
 let notePositions = [];
+// 小節ごとの実際の音符エリアのX範囲（scale適用済み）。クレフ・調号・拍子記号が実際に消費した幅を
+// 差し引いた実測値（VexFlowのgetNoteStartX/getNoteEndX）で、renderScore()のたびに更新される。
+// 固定幅（sx〜sx+measureWidth）で近似すると、調号のシャープ/フラットの数によって実際の音符エリアが
+// 変わることに対応できず、ホバー/クリック位置と実際の音符配置がずれるため、xToBeatPositionはこちらを使う
+let measureNoteAreaRanges = [];
 let hoveredPos = null;
 let hoveredMeasureForDelete = null;
 let history = [];
@@ -85,8 +90,6 @@ function semitoneToPitch(semitone) {
     return `${CHROMATIC_SHARP[withinOctave]}${octave}`;
 }
 
-// 白鍵（ドレミファソラシ）の1オクターブ内の半音オフセット
-const WHITE_OFFSETS = [0, 2, 4, 5, 7, 9, 11];
 // シャープ（黒鍵が上にある）を持つ白鍵（E, Bには上の黒鍵がない）
 const HAS_BLACK_KEY = new Set(["C", "D", "F", "G", "A"]);
 // フラット（黒鍵が下にある）を持つ白鍵（C, Fには下の黒鍵がない）
@@ -473,7 +476,7 @@ function drawPlayLine(x, rowIndex) {
         left: ${x}px;
         top: ${STAVE_TOP_BASE * scale}px;
         width: 2px;
-        height: ${120 * scale}px;
+        height: ${(score.grandStaff ? GRAND_STAFF_GAP + 120 : 120) * scale}px;
         background: rgba(74, 144, 226, 0.6);
         pointer-events: none;
         z-index: 20;
@@ -498,8 +501,33 @@ function selectedNoteBeats() {
 const STAVE_TOP_BASE = 40;
 const STAVE_WIDTH_BASE = 350;
 const FIRST_MEASURE_EXTRA = 60;
-const C4_Y_BASE = 128;
-const SEMITONE_PX = 2.5;
+// 小節の最後の音符/休符が終止線（バーライン）とほぼ重なって見える問題への対処。
+// VexFlowのFormatterは、与えた幅(formatWidth)ぴったりまで音符を敷き詰めようとするため、
+// 最後の音符/休符がバーラインの直前（1〜2px程度）まで詰まってしまい、特に休符の場合は
+// バーラインの線と重なって見えなくなることがあった。実際に渡すformatWidthを少し狭くして、
+// バーラインの手前に必ず余白ができるようにする
+const MEASURE_END_PADDING = 10;
+// VexFlowは音符を「半音」単位ではなく「五線譜上の位置（自然音の文字1つ分）」単位で等間隔に配置する
+// （全音・半音どちらの隣接でも、自然音同士なら常に同じ幅になる）。そのため、クリックY座標から
+// ピッチを逆算する際は半音単位ではなくこの文字単位（diatonic step）で計算しないと、C4から離れた
+// ピッチほど誤差が蓄積してずれてしまう（実測して確認済み: 実際の描画は常にDIATONIC_STEP_PXの等間隔）
+const DIATONIC_STEP_PX = 5;
+// C4の実際の描画Y座標（STAVE_TOP_BASE=40, scale=1のときの実測値）
+const C4_Y_BASE = 130;
+
+// グランドスタッフ（上段・下段とも ト音記号）関連の定数。
+// 2段は全く同じクレフのため、下段は上段をGRAND_STAFF_GAPぶん下にずらしただけの座標系になる
+const GRAND_STAFF_GAP = 75;
+const STAVE_TOP_LOWER = STAVE_TOP_BASE + GRAND_STAFF_GAP;
+const C4_Y_LOWER = C4_Y_BASE + GRAND_STAFF_GAP;
+// この音（C5）以上は上段、未満は下段に表示する
+const GRAND_STAFF_SPLIT_SEMITONE = pitchToSemitone("C5");
+// C4から見たC5のdiatonic step数（C,D,E,F,G,A,Bの7音で1オクターブ）
+const GRAND_STAFF_SPLIT_DIATONIC = 7;
+
+// 自然音のレター(C〜B)をC4からのdiatonic step（1文字=1step）に変換する際のオフセット
+const LETTER_DIATONIC_OFFSET = { C: 0, D: 1, E: 2, F: 3, G: 4, A: 5, B: 6 };
+const DIATONIC_LETTERS = ["C", "D", "E", "F", "G", "A", "B"];
 
 const PITCH_TO_FILE = {
     "C4":  "c.jpg",
@@ -534,30 +562,50 @@ const PITCH_TO_FILE = {
 const MIN_INPUT_SEMITONE = pitchToSemitone("C3");
 const MAX_INPUT_SEMITONE = pitchToSemitone("C#7");
 
+// クリックY座標（行内ローカル、rowDiv.offsetTopを含まない）から、上段・下段どちらに近いかを判定し、
+// その段でのC4基準Y座標を返す。上段・下段は全く同じクレフ（ト音記号）なので、
+// 「どちらの段の範囲に近いか」だけを判定すれば、あとは既存と同じ式でピッチを計算できる
+function c4YForClick(clickY) {
+    if (!score.grandStaff) return C4_Y_BASE;
+    const baseY = clickY / scale;
+    // 上段の分割音（C5）と下段の分割音の1つ下（B4）のY座標の中間を境界にする
+    // （このC5/B4はあくまで境界線の位置を決めるための目安であり、実際にどちらの段に
+    // 配置されるかはピッチではなくクリックした位置そのもので決まる）
+    const upperSplitY = C4_Y_BASE - GRAND_STAFF_SPLIT_DIATONIC * DIATONIC_STEP_PX;
+    const lowerSplitY = C4_Y_LOWER - (GRAND_STAFF_SPLIT_DIATONIC - 1) * DIATONIC_STEP_PX;
+    const boundaryY = (upperSplitY + lowerSplitY) / 2;
+    return baseY < boundaryY ? C4_Y_BASE : C4_Y_LOWER;
+}
+
+// クリックY座標が上段/下段どちらの領域と判定されるか（1段譜表ならfalse固定）。
+// ピッチに関わらず、ユーザーがクリックした場所そのものでどちらの段に音符を置くかを決めるために使う
+function isUpperFrameForClick(clickY) {
+    return !!score.grandStaff && c4YForClick(clickY) === C4_Y_BASE;
+}
+
 // クリックY座標から最も近い白鍵の音名を返す（音域は無制限。isBlackは現状未使用だが
 // 既存の呼び出し互換のため引数として残す）
-// rawSemitoneはC4を0とする相対値（C4_Y_BASEがC4の位置のため）。
-// pitchToSemitone/semitoneToPitchはC0を0とする絶対値のため、変換時に+48（C4分）する
+// rawDiatonicはC4を0とするdiatonic step（自然音の文字1つ分）の相対値
+// （クリック位置に応じて上段/下段いずれかのC4位置を基準にする）
 function yToPitch(clickY, isBlack) {
     const baseY = clickY / scale;
-    const rawSemitoneFromC4 = (C4_Y_BASE - baseY) / SEMITONE_PX;
-    const octaveGuess = Math.round(rawSemitoneFromC4 / 12);
+    const c4Y = c4YForClick(clickY);
+    const rawDiatonicFromC4 = (c4Y - baseY) / DIATONIC_STEP_PX;
+    const diatonicFromC4 = Math.round(rawDiatonicFromC4);
 
-    let closestSemitoneFromC4 = null;
-    let minDist = Infinity;
-    for (let oct = octaveGuess - 1; oct <= octaveGuess + 1; oct++) {
-        for (const offset of WHITE_OFFSETS) {
-            const semitone = oct * 12 + offset;
-            const dist = Math.abs(semitone - rawSemitoneFromC4);
-            if (dist < minDist) {
-                minDist = dist;
-                closestSemitoneFromC4 = semitone;
-            }
-        }
-    }
+    if (Math.abs(rawDiatonicFromC4 - diatonicFromC4) > 0.5) return null; // 自然音の位置から半文字分より離れていたら該当なし
 
-    if (minDist > 1) return null; // 白鍵1つ分（ピクセル換算でSEMITONE_PX）より離れていたら該当なし
-    const naturalPitch = semitoneToPitch(closestSemitoneFromC4 + 48); // C4分(48)を足して絶対半音番号に変換
+    // diatonic step数をレター・オクターブに変換（C,D,E,F,G,A,Bの7音で1オクターブ進む）
+    const octaveOffset = Math.floor(diatonicFromC4 / 7);
+    const letterIdx = ((diatonicFromC4 % 7) + 7) % 7;
+    const letter = DIATONIC_LETTERS[letterIdx];
+    const octave = 4 + octaveOffset;
+    const absSemitone = pitchToSemitone(`${letter}${octave}`);
+
+    // どちらの段に置くかはピッチではなく、クリックした場所（c4YForClickの判定）で決まる。
+    // そのためここではピッチによるクランプは行わない（isUpperFrameForClickを別途参照して
+    // 呼び出し側でnote.upperPitchesに記録する）
+    const naturalPitch = semitoneToPitch(absSemitone);
 
     // 現在の調号でそのレターが変化する場合は、デフォルトで調号通りの音にする
     // （毎回Shift+クリックで直さなくて済むように。自然音が欲しい場合はShift+クリックで戻せる）
@@ -1182,7 +1230,7 @@ function updateAddButton() {
     const lastSvgWidth = parseFloat(lastSvg.getAttribute("width") || 0);
 
     btn.style.left = `${lastSvgWidth + 4}px`;
-    btn.style.top = `${lastRowDiv.offsetTop + (STAVE_TOP_BASE + 46) * scale}px`;
+    btn.style.top = `${lastRowDiv.offsetTop + (STAVE_TOP_BASE + 46 + (score.grandStaff ? GRAND_STAFF_GAP / 2 : 0)) * scale}px`;
     btn.style.width = `${28 * scale}px`;
     btn.style.height = `${28 * scale}px`;
     btn.style.fontSize = `${16 * scale}px`;
@@ -1201,6 +1249,7 @@ function undo() {
     selectedMeasures.clear();
     updateTimeSignatureButtons();
     updateKeySignatureUI();
+    updateStaffLayoutButtons();
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
@@ -1215,6 +1264,7 @@ function redo() {
     selectedMeasures.clear();
     updateTimeSignatureButtons();
     updateKeySignatureUI();
+    updateStaffLayoutButtons();
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
@@ -1308,9 +1358,263 @@ function getMeasuresInDragRange(x1, y1, x2, y2) {
     return result;
 }
 
+// あるピッチが上段（グランドスタッフの上側、C5以上）に属するかどうか
+function isUpperStaffPitch(pitch) {
+    return pitchToSemitone(pitch) >= GRAND_STAFF_SPLIT_SEMITONE;
+}
+
+// どのピッチが上段/下段どちらに属するかは、ピッチの高さではなく「入力した時にどちらの段を
+// クリックしたか」で個別に決まる。note.upperPitches（そのnoteのpitchesのうち上段に属するものだけを
+// 列挙した配列。JSON保存のためSetではなく配列で持つ）に明示的に記録し、そこに無いピッチは下段扱いにする。
+// note.upperPitchesが無い（1段→2段変換前の古いデータ等）場合のみ、ピッチの高さ（C5基準）による
+// 従来ルールにフォールバックする
+function pitchBelongsToUpperStaff(pitch, note) {
+    if (note.upperPitches) return note.upperPitches.includes(pitch);
+    return isUpperStaffPitch(pitch);
+}
+
+// 1段分（グランドスタッフの上段/下段、または1段譜表の唯一の段）のStaveNote配列を構築する。
+// renderNoteData/origIndexMapは小節全体（プレビュー込み）のデータ列で、複数の段がある場合は共通のものを渡す。
+// belongsToStaff(pitch, note)は、そのピッチをこの段に描画すべきかどうかを返す関数
+// （1段譜表なら常にtrueを返す関数を渡す）。note.forceUpperは、1段→2段への変換時に
+// 既存の音符へ一律付与されるフラグで、ピッチによる自動振り分けを上書きして常に上段に固定する
+// 和音はこの段に属するピッチだけを抜き出して描画し、このタイミングでこの段に何も無い場合は
+// 同じ長さの休符で埋める（実データが休符の場合は元々全段に同じ休符を表示する）。
+// 戻り値: { notes, meta }。meta[i]はnotes[i]に対応するクリック判定用の情報
+//   { realNoteIndex, isRest, dataPitchIndices }
+//   dataPitchIndicesは実データ(measure.notes[realNoteIndex].pitches)内でのインデックスの配列
+//  （和音追加プレビューで混ぜたピッチの位置はnullになる。このスタッフに実データが無い場合は空配列）
+function buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap, belongsToStaff, hoveredPos) {
+    const previewColor = "rgba(74, 144, 226, 0.45)";
+    const hoverColor = "rgba(220, 50, 50, 0.7)";
+    const unsupportedColor = "#e08000";
+
+    const notes = [];
+    const meta = [];
+
+    renderNoteData.forEach((note, renderIdx) => {
+        const realNoteIndex = origIndexMap[renderIdx];
+        const isHovered = realNoteIndex !== null && hoveredPos &&
+            hoveredPos.measureIndex === measureIndex &&
+            hoveredPos.hitNoteIndex === realNoteIndex &&
+            hoveredPos.directHit === true;
+
+        if (note.rest) {
+            const restNote = new VF.StaveNote({
+                keys: ["b/4"],
+                duration: note.duration + "r",
+                ...(note.dotted ? { dots: 1 } : {})
+            });
+            if (note.dotted) {
+                VF.Dot.buildAndAttach([restNote], { all: true });
+            }
+            if (note.__preview) {
+                restNote.setStyle({ fillStyle: previewColor, strokeStyle: previewColor });
+            } else if (isHovered) {
+                restNote.setStyle({ fillStyle: hoverColor, strokeStyle: hoverColor });
+            }
+            notes.push(restNote);
+            meta.push({ realNoteIndex, isRest: true, dataPitchIndices: [] });
+            return;
+        }
+
+        // 和音追加プレビュー：既存の和音にプレビュー用のピッチを一時的に混ぜて描画する
+        let pitches = note.pitches;
+        let previewPitchIndex = -1;
+        if (preview && preview.type === "chordAdd" && realNoteIndex === preview.existingNoteIndex) {
+            pitches = [...note.pitches, preview.pitch].sort((a, b) => pitchToSemitone(a) - pitchToSemitone(b));
+            previewPitchIndex = pitches.indexOf(preview.pitch);
+        }
+
+        // pitches配列のうち、この段に属するインデックスだけ抜き出す。
+        // 和音追加プレビュー中のピッチ（previewPitchIndex）は、まだnote.upperPitchesに
+        // 記録されていないため、note側の判定ではなく現在ホバーしている段（preview.isUpper）を使う
+        const staffLocalIndices = [];
+        pitches.forEach((p, i) => {
+            const belongs = i === previewPitchIndex && preview.isUpper !== undefined
+                ? preview.isUpper
+                : belongsToStaff(p, note);
+            if (belongs) staffLocalIndices.push(i);
+        });
+
+        if (staffLocalIndices.length === 0) {
+            // この段にはこのタイミングで何も無い→同じ長さの休符で埋める
+            const restNote = new VF.StaveNote({
+                keys: ["b/4"],
+                duration: note.duration + "r",
+                ...(note.dotted ? { dots: 1 } : {})
+            });
+            if (note.dotted) {
+                VF.Dot.buildAndAttach([restNote], { all: true });
+            }
+            notes.push(restNote);
+            meta.push({ realNoteIndex, isRest: true, dataPitchIndices: [] });
+            return;
+        }
+
+        const staffPitches = staffLocalIndices.map(i => pitches[i]);
+        const keys = staffPitches.map(p => pitchToKey(p).key);
+        const staveNote = new VF.StaveNote({
+            keys,
+            duration: note.duration,
+            auto_stem: true,
+            ...(note.dotted ? { dots: 1 } : {})
+        });
+        if (note.dotted) {
+            VF.Dot.buildAndAttach([staveNote], { all: true });
+        }
+
+        if (note.__preview) {
+            staveNote.setStyle({ fillStyle: previewColor, strokeStyle: previewColor });
+            staveNote.setStemStyle({ fillStyle: "rgba(0,0,0,0)", strokeStyle: "rgba(0,0,0,0)" });
+            staveNote.setFlagStyle({ fillStyle: "rgba(0,0,0,0)", strokeStyle: "rgba(0,0,0,0)" });
+        } else {
+            staffLocalIndices.forEach((origI, localI) => {
+                if (origI === previewPitchIndex) {
+                    staveNote.setKeyStyle(localI, { fillStyle: previewColor, strokeStyle: previewColor });
+                } else if (!PITCH_TO_FILE[toCanonicalPitch(pitches[origI])]) {
+                    staveNote.setKeyStyle(localI, { fillStyle: unsupportedColor, strokeStyle: unsupportedColor });
+                }
+            });
+            if (isHovered) {
+                staveNote.setStyle({ fillStyle: hoverColor, strokeStyle: hoverColor });
+            }
+        }
+
+        // dataPitchIndices: 実データ(note.pitches)内でのインデックスに変換
+        // （プレビューで混ぜたピッチ自身の位置はnullにする）
+        const dataPitchIndices = staffLocalIndices.map(i => {
+            if (i === previewPitchIndex) return null;
+            return note.pitches.indexOf(pitches[i]);
+        });
+
+        notes.push(staveNote);
+        meta.push({ realNoteIndex, isRest: false, dataPitchIndices });
+    });
+
+    return { notes, meta };
+}
+
+// buildStaffNotesの結果（1段分）について、notePositions（クリック判定用）を記録する
+function recordNotePositionsForStaff(measure, measureIndex, rowIndex, rowDiv, staffResult, centerShiftPx) {
+    staffResult.notes.forEach((staveNote, renderIdx) => {
+        const m = staffResult.meta[renderIdx];
+        if (m.realNoteIndex === null) return; // プレビュー用のダミーはクリック判定に含めない
+        const noteIndex = m.realNoteIndex;
+        const noteData = measure.notes[noteIndex];
+        const bb = staveNote.getBoundingBox();
+        const nx = staveNote.getAbsoluteX() * scale + centerShiftPx;
+        const nxLeft = bb ? (bb.getX() * scale + centerShiftPx) : nx - 6 * scale;
+        const nxRight = bb ? ((bb.getX() + bb.getW()) * scale + centerShiftPx) : nx + 6 * scale;
+        const svgOffsetTop = rowDiv.offsetTop;
+
+        if (m.isRest) {
+            // 実データが休符の場合のみ記録する（和音の一部がこの段に無いために休符化した場合は、
+            // 実データ側の段でクリック判定を記録済みなのでここでは記録しない）
+            if (noteData.rest) {
+                const ny = staveNote.getYs()[0] * scale + svgOffsetTop;
+                notePositions.push({
+                    x: nx, xLeft: nxLeft, xRight: nxRight, y: ny,
+                    pitch: null, rest: true, measureIndex, noteIndex, pitchIndex: 0, rowIndex
+                });
+            }
+            return;
+        }
+
+        const bbX = bb ? bb.getX() * scale : nx;
+        const bbW = bb ? bb.getW() * scale : 12 * scale;
+        const dataIndices = m.dataPitchIndices;
+        const lastLocalIdx = dataIndices.length - 1;
+
+        dataIndices.forEach((dataIndex, localIdx) => {
+            if (dataIndex === null) return; // プレビュー用のピッチは記録しない
+            const ny = staveNote.getYs()[localIdx] * scale + svgOffsetTop;
+            const nh = staveNote.noteHeads && staveNote.noteHeads[localIdx];
+            const nhBB = nh ? nh.getBoundingBox() : null;
+            const nhLeft = nhBB ? nhBB.getX() * scale : bbX;
+            const nhRight = nhBB ? (nhBB.getX() + nhBB.getW()) * scale : bbX + bbW;
+            notePositions.push({
+                x: nx,
+                xLeft: localIdx === 0 ? bbX : nhLeft,
+                xRight: localIdx === lastLocalIdx ? (bbX + bbW) : nhRight,
+                y: ny,
+                pitch: noteData.pitches[dataIndex],
+                measureIndex,
+                noteIndex,
+                pitchIndex: dataIndex,
+                rowIndex
+            });
+        });
+    });
+}
+
+// 小節の中身が休符1つだけ（例: 全休符）の場合、そのまま描画すると音符エリアの先頭に
+// 寄って見えるため、音符エリアの中央に来るよう見た目上シフトする。
+// （StaveNoteのgetBoundingBox/getAbsoluteXはdraw前・setXShiftとの組み合わせでは信頼できないため、
+// 実際に描画されたDOM要素の位置を測ってからtransformで補正する）。戻り値は適用したシフト量（raw単位）
+function centerSoleRestOnStave(context, stave, note) {
+    try {
+        const bb = note.getBoundingBox();
+        if (!bb) return 0;
+        const noteAreaCenterX = (stave.getNoteStartX() + stave.getNoteEndX()) / 2;
+        const currentCenterX = bb.getX() + bb.getW() / 2;
+        const shift = noteAreaCenterX - currentCenterX;
+        const groups = context.svg.querySelectorAll("g.vf-stavenote");
+        const targetGroup = groups[groups.length - 1];
+        if (targetGroup) {
+            targetGroup.setAttribute("transform", `translate(${shift}, 0)`);
+        }
+        return shift;
+    } catch (e) {
+        return 0;
+    }
+}
+
+// 上書きプレビュー：「元々あったもの」または「新しく置かれるもの」のうち、
+// 通常の描画には出てこない側を、対象グループの中央に半透明で重ね描きする
+function drawOverlayGhost(context, stave, notesArray, overlayGhost, color) {
+    try {
+        const groupNotes = notesArray.slice(overlayGhost.groupStart, overlayGhost.groupStart + overlayGhost.groupLength);
+        let ghostMinX = Infinity, ghostMaxX = -Infinity;
+        groupNotes.forEach(sn => {
+            const bb = sn.getBoundingBox();
+            if (bb) {
+                ghostMinX = Math.min(ghostMinX, bb.getX());
+                ghostMaxX = Math.max(ghostMaxX, bb.getX() + bb.getW());
+            }
+        });
+        if (ghostMinX >= ghostMaxX) return;
+        const ghostCenterX = (ghostMinX + ghostMaxX) / 2;
+        const ghostNote = new VF.StaveNote({
+            keys: ["b/4"],
+            duration: overlayGhost.duration + "r",
+            ...(overlayGhost.dotted ? { dots: 1 } : {})
+        });
+        if (overlayGhost.dotted) {
+            VF.Dot.buildAndAttach([ghostNote], { all: true });
+        }
+        const ghostVoice = new VF.Voice({ num_beats: 1, beat_value: 4 });
+        ghostVoice.setStrict(false);
+        ghostVoice.addTickables([ghostNote]);
+        new VF.Formatter().joinVoices([ghostVoice]).format([ghostVoice], 0);
+        ghostNote.setContext(context).setStave(stave);
+        ghostNote.setXShift(ghostCenterX - ghostNote.getAbsoluteX());
+        // note.setStyle()だけでは単独描画（voice.draw()を経由しない）時にSVGへ反映されないため、
+        // contextのfill/strokeを直接指定してから描画する
+        context.save();
+        context.setFillStyle(color);
+        context.setStrokeStyle(color);
+        ghostNote.draw();
+        context.restore();
+    } catch (e) {
+        // オーバーレイの描画失敗は無視する（本体の描画には影響させない）
+    }
+}
+
 function renderScore() {
     const scrollY = window.scrollY;
     notePositions = [];
+    measureNoteAreaRanges = [];
 
     const scoreElement = document.getElementById("score");
     scoreElement.innerHTML = "";
@@ -1337,7 +1641,8 @@ function renderScore() {
         scoreElement.appendChild(rowDiv);
 
         const renderer = new VF.Renderer(rowDiv, VF.Renderer.Backends.SVG);
-        renderer.resize(rowWidth, 200 * scale);
+        const rowBottom = score.grandStaff ? STAVE_TOP_LOWER + 150 : STAVE_TOP_BASE + 150;
+        renderer.resize(rowWidth, rowBottom * scale);
         renderer.getContext().scale(scale, scale);
         const context = renderer.getContext();
 
@@ -1352,19 +1657,47 @@ function renderScore() {
             }
 
             const measureWidth = isFirstMeasure ? STAVE_WIDTH_BASE + FIRST_MEASURE_EXTRA : STAVE_WIDTH_BASE;
-            const stave = new VF.Stave(sx, STAVE_TOP_BASE, measureWidth);
+            const upperStave = new VF.Stave(sx, STAVE_TOP_BASE, measureWidth);
+            const lowerStave = score.grandStaff ? new VF.Stave(sx, STAVE_TOP_LOWER, measureWidth) : null;
 
             if (isFirstMeasure) {
-                stave.addClef("treble");
-                stave.addKeySignature(score.keySignature || "C");
-                stave.addTimeSignature(score.timeSignature);
+                upperStave.addClef("treble");
+                upperStave.addKeySignature(score.keySignature || "C");
+                upperStave.addTimeSignature(score.timeSignature);
+                if (lowerStave) {
+                    lowerStave.addClef("treble");
+                    lowerStave.addKeySignature(score.keySignature || "C");
+                    lowerStave.addTimeSignature(score.timeSignature);
+                }
             }
 
             if (measureIndex === score.measures.length - 1) {
-                stave.setEndBarType(VF.Barline.type.END);
+                upperStave.setEndBarType(VF.Barline.type.END);
+                if (lowerStave) lowerStave.setEndBarType(VF.Barline.type.END);
             }
 
-            stave.setContext(context).draw();
+            upperStave.setContext(context).draw();
+            if (lowerStave) lowerStave.setContext(context).draw();
+
+            // クレフ・調号・拍子記号が実際に消費した幅を差し引いた、実際の音符エリアのX範囲を記録する
+            // （調号のシャープ/フラットの数によって変わるため、固定幅の近似ではホバー/クリック位置がずれる）
+            measureNoteAreaRanges[measureIndex] = {
+                rowIndex,
+                left: upperStave.getNoteStartX() * scale,
+                right: upperStave.getNoteEndX() * scale
+            };
+
+            if (lowerStave && indexInRow === 0) {
+                // 行の先頭小節でだけ、上段・下段を連結する中括弧と縦線を描く
+                new VF.StaveConnector(upperStave, lowerStave)
+                    .setType(VF.StaveConnector.type.BRACE)
+                    .setContext(context)
+                    .draw();
+                new VF.StaveConnector(upperStave, lowerStave)
+                    .setType(VF.StaveConnector.type.SINGLE_LEFT)
+                    .setContext(context)
+                    .draw();
+            }
 
             context.save();
             context.setFont("Arial", 11);
@@ -1392,30 +1725,40 @@ function renderScore() {
                 const trailing = beatsToRests(preview.trailingBeats);
                 const center = preview.type === "splitRest"
                     ? { rest: true, duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}), __preview: true }
-                    : { pitches: [preview.pitch], duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}), __preview: true };
+                    : {
+                        pitches: [preview.pitch], duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}), __preview: true,
+                        ...(score.grandStaff ? { upperPitches: preview.isUpper ? [preview.pitch] : [] } : {})
+                    };
                 const replacement = [...leading, center, ...trailing];
                 const original = measure.notes[preview.targetIndex];
-                // 新しい配置（分割後）は通常通り描画されるので、元の休符（分割前）をグループの中央に重ね描きする
+                // 新しい配置（分割後）は通常通り描画されるので、元の休符（分割前）をグループの中央に重ね描きする。
+                // 元は休符（両段に共通表示）なので、上段・下段両方に重ね描きする
                 overlayGhost = {
                     style: "before",
-                    rest: true,
                     duration: original.duration,
                     dotted: !!original.dotted,
                     groupStart: preview.targetIndex,
-                    groupLength: replacement.length
+                    groupLength: replacement.length,
+                    showOnUpper: true,
+                    showOnLower: true
                 };
                 renderNoteData.splice(preview.targetIndex, 1, ...replacement);
                 origIndexMap.splice(preview.targetIndex, 1, ...replacement.map(() => null));
             } else if (preview && preview.type === "overwriteWithRest") {
                 // 休符モードで既存音符の上にホバー：音符データ自体は変更せず通常通り描画し、
-                // 上書き後（休符）のプレビューを同じ位置に重ね描きする
+                // 上書き後（休符）のプレビューを同じ位置に重ね描きする。
+                // 元の音符が上段/下段どちらにあったかに応じて、重ね描き先を決める
+                const originalNote = measure.notes[preview.existingNoteIndex];
+                const showOnUpper = !score.grandStaff || originalNote.pitches.some(p => pitchBelongsToUpperStaff(p, originalNote));
+                const showOnLower = score.grandStaff && originalNote.pitches.some(p => !pitchBelongsToUpperStaff(p, originalNote));
                 overlayGhost = {
                     style: "after",
-                    rest: true,
                     duration: preview.duration,
                     dotted: preview.dotted,
                     groupStart: preview.existingNoteIndex,
-                    groupLength: 1
+                    groupLength: 1,
+                    showOnUpper,
+                    showOnLower
                 };
             }
 
@@ -1425,99 +1768,58 @@ function renderScore() {
 
             const previewColor = "rgba(74, 144, 226, 0.45)";
 
-            const notes = renderNoteData.map((note, renderIdx) => {
-                const realNoteIndex = origIndexMap[renderIdx];
-                const isHovered = realNoteIndex !== null && hoveredPos &&
-                    hoveredPos.measureIndex === measureIndex &&
-                    hoveredPos.hitNoteIndex === realNoteIndex &&
-                    hoveredPos.directHit === true;
-
-                const hoverColor = "rgba(220, 50, 50, 0.7)";
-
-                if (note.rest) {
-                    const restNote = new VF.StaveNote({
-                        keys: ["b/4"],
-                        duration: note.duration + "r",
-                        ...(note.dotted ? { dots: 1 } : {})
-                    });
-                    if (note.dotted) {
-                        VF.Dot.buildAndAttach([restNote], { all: true });
-                    }
-                    if (note.__preview) {
-                        restNote.setStyle({ fillStyle: previewColor, strokeStyle: previewColor });
-                    } else if (isHovered) {
-                        restNote.setStyle({ fillStyle: hoverColor, strokeStyle: hoverColor });
-                    }
-                    return restNote;
-                }
-
-                // 和音追加プレビュー：既存の和音にプレビュー用のピッチを一時的に混ぜて描画する
-                let pitches = note.pitches;
-                let previewPitchIndex = -1;
-                if (preview && preview.type === "chordAdd" && realNoteIndex === preview.existingNoteIndex) {
-                    pitches = [...note.pitches, preview.pitch].sort((a, b) => pitchToSemitone(a) - pitchToSemitone(b));
-                    previewPitchIndex = pitches.indexOf(preview.pitch);
-                }
-
-                const keys = pitches.map(p => pitchToKey(p).key);
-                const staveNote = new VF.StaveNote({
-                    keys,
-                    duration: note.duration,
-                    auto_stem: true,
-                    ...(note.dotted ? { dots: 1 } : {})
-                });
-                if (note.dotted) {
-                    VF.Dot.buildAndAttach([staveNote], { all: true });
-                }
-
-                if (note.__preview) {
-                    staveNote.setStyle({ fillStyle: previewColor, strokeStyle: previewColor });
-                    staveNote.setStemStyle({ fillStyle: "rgba(0,0,0,0)", strokeStyle: "rgba(0,0,0,0)" });
-                    staveNote.setFlagStyle({ fillStyle: "rgba(0,0,0,0)", strokeStyle: "rgba(0,0,0,0)" });
-                } else {
-                    // 音符マット（物理パネル）が存在しない音域（C4〜C#6の範囲外）はオレンジでハイライトする
-                    const unsupportedColor = "#e08000";
-                    pitches.forEach((p, i) => {
-                        if (i === previewPitchIndex) {
-                            staveNote.setKeyStyle(i, { fillStyle: previewColor, strokeStyle: previewColor });
-                        } else if (!PITCH_TO_FILE[toCanonicalPitch(p)]) {
-                            staveNote.setKeyStyle(i, { fillStyle: unsupportedColor, strokeStyle: unsupportedColor });
-                        }
-                    });
-
-                    if (isHovered) {
-                        staveNote.setStyle({ fillStyle: hoverColor, strokeStyle: hoverColor });
-                    }
-                }
-
-                return staveNote;
-            });
+            const upperResult = buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap,
+                score.grandStaff ? pitchBelongsToUpperStaff : () => true,
+                hoveredPos);
+            const lowerResult = score.grandStaff
+                ? buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap,
+                    (p, note) => !pitchBelongsToUpperStaff(p, note), hoveredPos)
+                : null;
 
             const totalBeats = renderNoteData.reduce((sum, n) => sum + noteBeats(n), 0);
             const remainingBeats = getBeatsPerMeasure() - totalBeats;
-            const dummyNotes = makeDummyNotes(Math.max(0, remainingBeats));
-            const allNotes = [...notes, ...dummyNotes];
+            const upperDummies = makeDummyNotes(Math.max(0, remainingBeats));
+            const upperAllNotes = [...upperResult.notes, ...upperDummies];
 
             const [tsNum, tsDen] = score.timeSignature.split("/").map(Number);
-            const voice = new VF.Voice({ num_beats: tsNum, beat_value: tsDen });
-            voice.setStrict(false);
-            voice.addTickables(allNotes);
-            // 調号に基づき、必要な音符にのみ♯/♭/ナチュラルを自動付与する（小節ごとにリセット）
-            VF.Accidental.applyAccidentals([voice], score.keySignature || "C");
+            const upperVoice = new VF.Voice({ num_beats: tsNum, beat_value: tsDen });
+            upperVoice.setStrict(false);
+            upperVoice.addTickables(upperAllNotes);
+            let lowerVoice = null;
+            if (lowerResult) {
+                const lowerDummies = makeDummyNotes(Math.max(0, remainingBeats));
+                const lowerAllNotes = [...lowerResult.notes, ...lowerDummies];
+                lowerVoice = new VF.Voice({ num_beats: tsNum, beat_value: tsDen });
+                lowerVoice.setStrict(false);
+                lowerVoice.addTickables(lowerAllNotes);
+            }
+
+            // 調号に基づき、必要な音符にのみ♯/♭/ナチュラルを自動付与する（段ごと・小節ごとにリセット）
+            VF.Accidental.applyAccidentals([upperVoice], score.keySignature || "C");
+            if (lowerVoice) VF.Accidental.applyAccidentals([lowerVoice], score.keySignature || "C");
 
             // クレフ・調号・拍子記号が実際に消費した幅を差し引いた、音符が使える実際の幅を使う
-            // （固定オフセットだと調号の♯/♭の数によって幅が変わることに対応できないため）
-            const formatWidth = stave.getNoteEndX() - stave.getNoteStartX();
+            // （固定オフセットだと調号の♯/♭の数によって幅が変わることに対応できないため）。
+            // 最後の音符/休符がバーラインと重ならないよう、少し余白を残す
+            const formatWidth = upperStave.getNoteEndX() - upperStave.getNoteStartX() - MEASURE_END_PADDING;
 
-            new VF.Formatter()
-                .joinVoices([voice])
-                .format([voice], formatWidth);
+            const formatter = new VF.Formatter();
+            formatter.joinVoices([upperVoice]);
+            if (lowerVoice) {
+                formatter.joinVoices([lowerVoice]);
+                formatter.format([upperVoice, lowerVoice], formatWidth);
+            } else {
+                formatter.format([upperVoice], formatWidth);
+            }
 
-            const beams = VF.Beam.generateBeams(
-                notes.filter((_, i) => !renderNoteData[i].rest)
+            const upperBeams = VF.Beam.generateBeams(
+                upperResult.notes.filter((_, i) => !upperResult.meta[i].isRest)
             );
+            const lowerBeams = lowerResult
+                ? VF.Beam.generateBeams(lowerResult.notes.filter((_, i) => !lowerResult.meta[i].isRest))
+                : [];
 
-            beams.forEach(beam => {
+            [...upperBeams, ...lowerBeams].forEach(beam => {
                 beam.getNotes().forEach(note => {
                     note.setFlagStyle({
                         fillStyle: "transparent",
@@ -1526,144 +1828,47 @@ function renderScore() {
                 });
             });
 
-            voice.draw(context, stave);
-
-            beams.forEach(beam => {
-                beam.setContext(context).draw();
-            });
+            upperVoice.draw(context, upperStave);
 
             // 小節の中身が休符1つだけ（例: 全休符）の場合、そのまま描画すると音符エリアの先頭に
             // 寄って見えるため、音符エリアの中央に来るよう見た目上シフトする。
             // （StaveNoteのgetBoundingBox/getAbsoluteXはdraw前・setXShiftとの組み合わせでは信頼できないため、
             // 実際に描画されたDOM要素の位置を測ってからtransformで補正する）
-            let soleRestCenterShift = 0;
-            if (renderNoteData.length === 1 && renderNoteData[0].rest) {
-                try {
-                    const bb = notes[0].getBoundingBox();
-                    if (bb) {
-                        const noteAreaCenterX = (stave.getNoteStartX() + stave.getNoteEndX()) / 2;
-                        const currentCenterX = bb.getX() + bb.getW() / 2;
-                        soleRestCenterShift = noteAreaCenterX - currentCenterX;
-                        const groups = context.svg.querySelectorAll("g.vf-stavenote");
-                        const targetGroup = groups[groups.length - 1];
-                        if (targetGroup) {
-                            targetGroup.setAttribute("transform", `translate(${soleRestCenterShift}, 0)`);
-                        }
-                    }
-                } catch (e) {
-                    // 補正に失敗しても本体の表示自体は継続する
+            const soloRestCase = renderNoteData.length === 1 && renderNoteData[0].rest;
+            let upperCenterShift = 0;
+            if (soloRestCase) {
+                upperCenterShift = centerSoleRestOnStave(context, upperStave, upperResult.notes[0]);
+            }
+
+            let lowerCenterShift = 0;
+            if (lowerVoice) {
+                lowerVoice.draw(context, lowerStave);
+                if (soloRestCase) {
+                    lowerCenterShift = centerSoleRestOnStave(context, lowerStave, lowerResult.notes[0]);
                 }
             }
+
+            upperBeams.forEach(beam => beam.setContext(context).draw());
+            lowerBeams.forEach(beam => beam.setContext(context).draw());
 
             // 上書きプレビュー：「元々あったもの」または「新しく置かれるもの」のうち、
             // 通常の描画には出てこない側を、対象グループの中央に半透明で重ね描きする
             if (overlayGhost) {
-                try {
-                    const groupNotes = notes.slice(overlayGhost.groupStart, overlayGhost.groupStart + overlayGhost.groupLength);
-                    let ghostMinX = Infinity, ghostMaxX = -Infinity;
-                    groupNotes.forEach(sn => {
-                        const bb = sn.getBoundingBox();
-                        if (bb) {
-                            ghostMinX = Math.min(ghostMinX, bb.getX());
-                            ghostMaxX = Math.max(ghostMaxX, bb.getX() + bb.getW());
-                        }
-                    });
-                    if (ghostMinX < ghostMaxX) {
-                        const ghostCenterX = (ghostMinX + ghostMaxX) / 2;
-                        const ghostNote = new VF.StaveNote({
-                            keys: ["b/4"],
-                            duration: overlayGhost.duration + "r",
-                            ...(overlayGhost.dotted ? { dots: 1 } : {})
-                        });
-                        if (overlayGhost.dotted) {
-                            VF.Dot.buildAndAttach([ghostNote], { all: true });
-                        }
-                        const ghostVoice = new VF.Voice({ num_beats: 1, beat_value: 4 });
-                        ghostVoice.setStrict(false);
-                        ghostVoice.addTickables([ghostNote]);
-                        new VF.Formatter().joinVoices([ghostVoice]).format([ghostVoice], 0);
-                        ghostNote.setContext(context).setStave(stave);
-                        ghostNote.setXShift(ghostCenterX - ghostNote.getAbsoluteX());
-                        const ghostColor = overlayGhost.style === "before"
-                            ? "rgba(120, 120, 120, 0.5)"
-                            : previewColor;
-                        // note.setStyle()だけでは単独描画（voice.draw()を経由しない）時にSVGへ反映されないため、
-                        // contextのfill/strokeを直接指定してから描画する
-                        context.save();
-                        context.setFillStyle(ghostColor);
-                        context.setStrokeStyle(ghostColor);
-                        ghostNote.draw();
-                        context.restore();
-                    }
-                } catch (e) {
-                    // オーバーレイの描画失敗は無視する（本体の描画には影響させない）
+                const ghostColor = overlayGhost.style === "before"
+                    ? "rgba(120, 120, 120, 0.5)"
+                    : previewColor;
+                if (overlayGhost.showOnUpper) {
+                    drawOverlayGhost(context, upperStave, upperResult.notes, overlayGhost, ghostColor);
+                }
+                if (overlayGhost.showOnLower && lowerResult) {
+                    drawOverlayGhost(context, lowerStave, lowerResult.notes, overlayGhost, ghostColor);
                 }
             }
 
-            notes.forEach((staveNote, renderIdx) => {
-                const realNoteIndex = origIndexMap[renderIdx];
-                if (realNoteIndex === null) return; // プレビュー用のダミーはクリック判定に含めない
-                const noteIndex = realNoteIndex;
-                const noteData = measure.notes[noteIndex];
-                const bb = staveNote.getBoundingBox();
-                // 休符1つだけの小節は見た目上センタリングしているため、判定座標もそのぶんずらす
-                const centerShiftPx = soleRestCenterShift * scale;
-                const nx = staveNote.getAbsoluteX() * scale + centerShiftPx;
-                const nxLeft = bb ? (bb.getX() * scale + centerShiftPx) : nx - 6 * scale;
-                const nxRight = bb ? ((bb.getX() + bb.getW()) * scale + centerShiftPx) : nx + 6 * scale;
-                const svgOffsetTop = rowDiv.offsetTop;
-
-                if (noteData.rest) {
-                    const ny = staveNote.getYs()[0] * scale + svgOffsetTop;
-                    notePositions.push({
-                        x: nx,
-                        xLeft: nxLeft,
-                        xRight: nxRight,
-                        y: ny,
-                        pitch: null,
-                        rest: true,
-                        measureIndex,
-                        noteIndex,
-                        pitchIndex: 0,
-                        rowIndex
-                    });
-                    return;
-                }
-
-                const bbX = bb ? bb.getX() * scale : nx;
-                const bbW = bb ? bb.getW() * scale : 12 * scale;
-                const lastPitchIndex = noteData.pitches.length - 1;
-
-                // 和音追加プレビュー中は、staveNote自体はプレビュー用ピッチも混ぜて構築されているため、
-                // 実データのピッチがstaveNote内の何番目のキーに対応するかを合わせる必要がある
-                const hasChordPreview = preview && preview.type === "chordAdd" && noteIndex === preview.existingNoteIndex;
-                const combinedPitches = hasChordPreview
-                    ? [...noteData.pitches, preview.pitch].sort((a, b) => pitchToSemitone(a) - pitchToSemitone(b))
-                    : noteData.pitches;
-
-                // 和音内の各ピッチの判定領域は、等分割ではなく実際のノートヘッド位置を使う
-                // （臨時記号がついたピッチがある場合、幅が均等でなくなるため）。
-                // 一番左/右のピッチだけは、臨時記号の余白も含めて全体のbboxまで広げる
-                noteData.pitches.forEach((pitch, dataIndex) => {
-                    const renderPitchIndex = hasChordPreview ? combinedPitches.indexOf(pitch) : dataIndex;
-                    const ny = staveNote.getYs()[renderPitchIndex] * scale + svgOffsetTop;
-                    const nh = staveNote.noteHeads && staveNote.noteHeads[renderPitchIndex];
-                    const nhBB = nh ? nh.getBoundingBox() : null;
-                    const nhLeft = nhBB ? nhBB.getX() * scale : bbX;
-                    const nhRight = nhBB ? (nhBB.getX() + nhBB.getW()) * scale : bbX + bbW;
-                    notePositions.push({
-                        x: nx,
-                        xLeft: dataIndex === 0 ? bbX : nhLeft,
-                        xRight: dataIndex === lastPitchIndex ? (bbX + bbW) : nhRight,
-                        y: ny,
-                        pitch,
-                        measureIndex,
-                        noteIndex,
-                        pitchIndex: dataIndex,
-                        rowIndex
-                    });
-                });
-            });
+            recordNotePositionsForStaff(measure, measureIndex, rowIndex, rowDiv, upperResult, upperCenterShift * scale);
+            if (lowerResult) {
+                recordNotePositionsForStaff(measure, measureIndex, rowIndex, rowDiv, lowerResult, lowerCenterShift * scale);
+            }
         });
     });
 
@@ -1684,7 +1889,7 @@ function drawSelectionRect() {
     if (!rowDivs.length || !score.measures.length) return;
 
     let previewSet = null;
-    if (dragState && dragState.isDragging) {
+    if (editMode === "select" && dragState && dragState.isDragging) {
         previewSet = new Set(getMeasuresInDragRange(
             dragState.startX, dragState.startY,
             dragState.currentX, dragState.currentY
@@ -1703,7 +1908,7 @@ function drawSelectionRect() {
         if (!rowDiv) return;
 
         const top = rowDiv.offsetTop + (STAVE_TOP_BASE - 6) * scale;
-        const height = 130 * scale;
+        const height = (score.grandStaff ? GRAND_STAFF_GAP + 130 : 130) * scale;
 
         const el = document.createElement("div");
         el.className = "selectionHighlight";
@@ -1753,7 +1958,7 @@ function setupDeleteButtons() {
         const rowOffsetTop = rowDiv ? rowDiv.offsetTop : 0;
 
         const leftPos = (sx + measureWidth / 2 - 14) * scale;
-        const topPos = rowOffsetTop + (STAVE_TOP_BASE + 110) * scale;
+        const topPos = rowOffsetTop + ((score.grandStaff ? STAVE_TOP_LOWER : STAVE_TOP_BASE) + 110) * scale;
 
         btn.style.left = `${leftPos}px`;
         btn.style.top = `${topPos}px`;
@@ -1804,7 +2009,7 @@ function setupInsertButtons() {
         const rowOffsetTop = rowDiv ? rowDiv.offsetTop : 0;
 
         const leftPos = (sx - 14) * scale;
-        const topPos = rowOffsetTop + (STAVE_TOP_BASE + 110) * scale;
+        const topPos = rowOffsetTop + ((score.grandStaff ? STAVE_TOP_LOWER : STAVE_TOP_BASE) + 110) * scale;
 
         btn.style.left = `${leftPos}px`;
         btn.style.top = `${topPos}px`;
@@ -1838,19 +2043,24 @@ function findNoteAtX(measureIndex, clickX) {
 }
 
 function findNoteAt(measureIndex, clickX, clickY, looseness = 1) {
+    // Y方向の許容量はDIATONIC_STEP_PX（隣接する自然音同士の間隔）の半分にする。
+    // これより広いと、隣り合う段（五線譜上の位置）の音符同士で判定範囲が重なってしまい、
+    // クリックしたつもりの音符と別の音符を誤って拾ってしまうことがあった
     const hit = notePositions.find(pos =>
         pos.measureIndex === measureIndex &&
         clickX >= pos.xLeft &&
         clickX < pos.xRight &&
-        Math.abs(pos.y - clickY) <= 5 * scale * looseness
+        Math.abs(pos.y - clickY) <= (DIATONIC_STEP_PX / 2) * scale * looseness
     );
     return hit || null;
 }
 
 // 小節内のX座標（clickX）が、拍数換算でどの位置（拍単位）にあたるかを返す。
-// 小節は常に音符/休符で埋まっている前提なので、小節全体の表示幅を拍数で比例配分して近似する
+// 小節は常に音符/休符で埋まっている前提なので、実際の音符エリアの表示幅を拍数で比例配分して近似する。
+// measureNoteAreaRanges（renderScore()内で実測したクレフ・調号・拍子記号を除いた実際の音符エリア）を
+// 優先して使う。未描画などで値が無い場合のみ、小節全体の箱（クレフ等を含む）で近似するgetMeasureXRangeにフォールバックする
 function xToBeatPosition(measureIndex, clickX) {
-    const { left, right } = getMeasureXRange(measureIndex);
+    const { left, right } = measureNoteAreaRanges[measureIndex] || getMeasureXRange(measureIndex);
     const totalBeats = getBeatsPerMeasure();
     if (right <= left || totalBeats <= 0) return null;
     return (clickX - left) / (right - left) * totalBeats;
@@ -1914,7 +2124,7 @@ function computeHoverPreview(measureIndex, measure) {
         }
         if (!target.pitches) return null;
         if (target.pitches.includes(hoveredPos.pitch) || target.pitches.length >= 3) return null;
-        return { type: "chordAdd", existingNoteIndex: segment.index, pitch: hoveredPos.pitch };
+        return { type: "chordAdd", existingNoteIndex: segment.index, pitch: hoveredPos.pitch, isUpper: hoveredPos.isUpper };
     }
 
     // 休符：選択中の音価のスロット単位で分割して新規に置く
@@ -1930,6 +2140,7 @@ function computeHoverPreview(measureIndex, measure) {
         leadingBeats: split.leadingBeats,
         trailingBeats: split.trailingBeats,
         pitch: effectiveKind === "rest" ? null : hoveredPos.pitch,
+        isUpper: hoveredPos.isUpper,
     };
 }
 
@@ -2057,11 +2268,15 @@ function handleNoteEdit(e, svg, rowDiv) {
                     saveHistory();
                     renderScore();
                 } else {
-                    // 既存の和音への音追加
+                    // 既存の和音への音追加。どちらの段に属するかはクリックした位置で決まる
                     const pitch = yToPitch(clickYLocal, false);
                     if (pitch && !target.pitches.includes(pitch) && target.pitches.length < 3) {
                         target.pitches.push(pitch);
                         target.pitches.sort((a, b) => pitchToSemitone(a) - pitchToSemitone(b));
+                        if (score.grandStaff) {
+                            if (!target.upperPitches) target.upperPitches = [];
+                            if (isUpperFrameForClick(clickYLocal)) target.upperPitches.push(pitch);
+                        }
                         saveHistory();
                         renderScore();
                     }
@@ -2080,7 +2295,11 @@ function handleNoteEdit(e, svg, rowDiv) {
                 } else {
                     const pitch = yToPitch(clickYLocal, false);
                     if (!pitch) return;
-                    centerEntry = { pitches: [pitch], duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}) };
+                    // どちらの段に置くかはクリックした位置で決まる
+                    centerEntry = {
+                        pitches: [pitch], duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}),
+                        ...(score.grandStaff ? { upperPitches: isUpperFrameForClick(clickYLocal) ? [pitch] : [] } : {})
+                    };
                 }
 
                 const replacement = [
@@ -2151,11 +2370,12 @@ function setupSVGEvents() {
             }
 
             const pitch = yToPitch(e.clientY - rect.top, false);
+            const isUpper = isUpperFrameForClick(e.clientY - rect.top);
             const hitNote = findNoteAt(measureIndex, mouseX, mouseY);
             const hitNoteX = findNoteAtX(measureIndex, mouseX);
 
             const newHovered = pitch
-                ? { measureIndex, x: mouseX, y: mouseY, pitch, hitNoteIndex: hitNote ? hitNote.noteIndex : (hitNoteX ? hitNoteX.noteIndex : null), directHit: !!hitNote }
+                ? { measureIndex, x: mouseX, y: mouseY, pitch, isUpper, hitNoteIndex: hitNote ? hitNote.noteIndex : (hitNoteX ? hitNoteX.noteIndex : null), directHit: !!hitNote }
                 : null;
 
             const changed = JSON.stringify(newHovered) !== JSON.stringify(hoveredPos);
@@ -2221,6 +2441,20 @@ function updateKeySignatureUI() {
     if (select) select.value = score.keySignature || "C";
 }
 
+function updateStaffLayoutButtons() {
+    const isGrand = !!score.grandStaff;
+    const btnSingle = document.getElementById("staffLayoutSingle");
+    const btnGrand = document.getElementById("staffLayoutGrand");
+    if (btnSingle) {
+        btnSingle.style.color = !isGrand ? "#222" : "#aaa";
+        btnSingle.style.background = !isGrand ? "#f0f0f0" : "";
+    }
+    if (btnGrand) {
+        btnGrand.style.color = isGrand ? "#222" : "#aaa";
+        btnGrand.style.background = isGrand ? "#f0f0f0" : "";
+    }
+}
+
 function setEditMode(mode) {
     editMode = mode;
     localStorage.setItem("editMode", editMode);
@@ -2257,11 +2491,14 @@ function setupGlobalEvents() {
         if (!dragState) return;
 
         if (dragState.isDragging) {
-            const measures = getMeasuresInDragRange(
-                dragState.startX, dragState.startY,
-                dragState.currentX, dragState.currentY
-            );
-            selectedMeasures = new Set(measures);
+            // 小節のドラッグ選択は選択モードのときのみ有効にする（音符モード中の誤選択防止）
+            if (editMode === "select") {
+                const measures = getMeasuresInDragRange(
+                    dragState.startX, dragState.startY,
+                    dragState.currentX, dragState.currentY
+                );
+                selectedMeasures = new Set(measures);
+            }
             dragState = null;
             renderScore();
         } else {
@@ -2474,7 +2711,7 @@ async function main() {
 
     const response = await fetch("sample_score.json");
     const data = await response.json();
-    score = { timeSignature: data.timeSignature, keySignature: data.keySignature || "C", measures: data.measures };
+    score = { timeSignature: data.timeSignature, keySignature: data.keySignature || "C", grandStaff: !!data.grandStaff, measures: data.measures };
 
     // サンプルJSONに表題・テンポ・コンパス・ズーム・マップ設定があれば復元する
     if (data.title != null) {
@@ -2582,6 +2819,39 @@ async function main() {
             score.keySignature = e.target.value;
             saveHistory();
             renderScore();
+        });
+
+    // 譜表レイアウト（1段／グランドスタッフ）切り替え
+    updateStaffLayoutButtons();
+    document.getElementById("staffLayoutSingle")
+        .addEventListener("click", () => {
+            if (!score.grandStaff) return;
+            score.grandStaff = false;
+            updateStaffLayoutButtons();
+            saveHistory();
+            renderScore();
+            setupDeleteButtons();
+            setupInsertButtons();
+        });
+    document.getElementById("staffLayoutGrand")
+        .addEventListener("click", () => {
+            if (score.grandStaff) return;
+            // 1段から2段への変換時点では、既存の音符は音高によらず全て上段に集約する。
+            // 「その時点で存在したピッチ」だけをnote.upperPitchesに記録する（note単位のフラグに
+            // すると、後から同じ和音に追加した新しいピッチまで上段に固定されてしまうため、
+            // ピッチ単位で個別に記録する）。2段化した後にユーザーが新しく追加する音符・
+            // 和音への追加分は、クリックした位置（上段/下段）でそのつど決まる
+            score.measures.forEach(m => {
+                (m.notes || []).forEach(n => {
+                    if (!n.rest) n.upperPitches = [...n.pitches];
+                });
+            });
+            score.grandStaff = true;
+            updateStaffLayoutButtons();
+            saveHistory();
+            renderScore();
+            setupDeleteButtons();
+            setupInsertButtons();
         });
 
     document.getElementById("transposeUp")
@@ -2845,7 +3115,7 @@ async function main() {
             reader.onload = (event) => {
                 try {
                     const data = JSON.parse(event.target.result);
-                    score = { timeSignature: data.timeSignature, keySignature: data.keySignature || "C", measures: data.measures };
+                    score = { timeSignature: data.timeSignature, keySignature: data.keySignature || "C", grandStaff: !!data.grandStaff, measures: data.measures };
 
                     if (data.title != null) {
                         document.getElementById("scoreTitleInput").value = data.title;
@@ -2868,6 +3138,7 @@ async function main() {
                     }
                     updateTimeSignatureButtons();
                     updateKeySignatureUI();
+                    updateStaffLayoutButtons();
 
                     history = [];
                     historyIndex = -1;
