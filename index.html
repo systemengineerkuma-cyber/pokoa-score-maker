@@ -32,6 +32,18 @@
             gap: 12px;
         }
 
+        #stickyHeader {
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            background: #f5f5f5;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        #stickyHeader .sticky-toolbars-inner {
+            padding: 24px 24px 0 24px;
+        }
+
         header h1 {
             font-size: 18px;
             font-weight: 600;
@@ -250,15 +262,15 @@
 </head>
 <body>
 
-<header>
-    <i class="fa-solid fa-music"></i>
-    <h1>ぽこあスコアメーカー</h1>
-</header>
+<div id="stickyHeader">
+    <header>
+        <i class="fa-solid fa-music"></i>
+        <h1>ぽこあスコアメーカー</h1>
+    </header>
 
-<div id="main">
-
-    <div id="tabContainer" class="tab-container"></div>
-    <div id="toolbars">
+    <div class="sticky-toolbars-inner">
+        <div id="tabContainer" class="tab-container"></div>
+        <div id="toolbars">
             <div class="toolbar">
                 <label id="loadBtn" tabindex="-1" title="開く"><i class="fa-solid fa-folder-open"></i><input type="file" id="loadFile" accept=".json" style="display:none"></label>
                 <button id="saveBtn" tabindex="-1" title="保存"><i class="fa-solid fa-floppy-disk"></i></button>
@@ -403,7 +415,11 @@
                     <button id="mapHideUnusedSensors" class="text-btn" tabindex="-1" title="周りに音符マットがないセンサーを非表示にする（カウントにも含めない）">未使用センサー非表示</button>
                 </div>
             </div>
+        </div>
     </div>
+</div>
+
+<div id="main">
 
     <div id="scoreTitle">
         <input type="text" id="scoreTitleInput" placeholder="楽譜の名前" value="NewScore">
