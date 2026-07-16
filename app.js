@@ -3,6 +3,12 @@ const VF = VexFlow;
 let score = null;
 let scale = 1;
 let notePositions = [];
+// notePositionsは毎回の描画で作り直され、ホバー中のプレビューが対象を差し替えて
+// 描画するとその対象の実測位置が一時的に消えてしまう（プレビューされていない他の
+// 要素の実測位置を使ってスロット判定を行いたいfindMeasuredSegmentには不向き）。
+// そのため、プレビューが乗っていない「素の」状態の実測位置だけを、段（measureIndex:staff）
+// 単位でキャッシュしておく。renderScore()を跨いで保持し、プレビュー中の段は更新しない
+let stableNotePositions = new Map();
 // 小節ごとの実際の音符エリアのX範囲（scale適用済み）。クレフ・調号・拍子記号が実際に消費した幅を
 // 差し引いた実測値（VexFlowのgetNoteStartX/getNoteEndX）で、renderScore()のたびに更新される。
 // 固定幅（sx〜sx+measureWidth）で近似すると、調号のシャープ/フラットの数によって実際の音符エリアが
@@ -23,8 +29,11 @@ let playStartTime = null;
 let playEndTime = 0; // audioCtx時刻での再生終了予定時刻（終了検知・ループに使用）
 let noteSchedule = [];
 let noteTimeMap = [];
-let beatSchedule = []; // {beatIndex, startTime, endTime} 1エントリ=マップの1センサー分（16分音符単位）
-let noteBoundarySchedule = []; // {measureIndex, noteIndex, startTime, endTime} 1エントリ=1つの音符（休符含む）。テンポ変更の再開位置探しに使う
+let beatSchedule = []; // {beatIndex, startTime, endTime} 1エントリ=マップの1センサー分（16分音符単位）。上段・下段どちらの音符内容にも依存しない算術スケジュール
+// {measureIndex, noteIndex, startTime, endTime} 1エントリ=1つの音符（休符含む）。テンポ変更の再開位置探しに使う。
+// 上段・下段は完全に独立したリズムを持てるため、それぞれ専用の境界スケジュールを持つ
+let upperNoteBoundarySchedule = [];
+let lowerNoteBoundarySchedule = [];
 let activeSourceNodes = []; // {node, startTime} 再生中にスケジュール済みの音源（曲中のテンポ変更時に先の分を止めるため）
 let currentHighlightMeasure = -1;
 let currentHighlightBeat = -1;
@@ -175,36 +184,45 @@ function playScore() {
     noteSchedule = [];
     noteTimeMap = [];
     beatSchedule = [];
-    noteBoundarySchedule = [];
+    upperNoteBoundarySchedule = [];
+    lowerNoteBoundarySchedule = [];
     activeSourceNodes = [];
 
-    scheduleMeasuresFrom(0, 0, 0, playStartTime, null);
+    scheduleMeasuresFrom(0, { noteIndex: 0, time: playStartTime }, { noteIndex: 0, time: playStartTime }, 0, null);
 
     updatePlaybackButtons();
     trackPlayback();
 }
 
-// startMeasureIndex小節目のstartNoteIndex番目の音符から末尾まで、beatIndexOffsetを起点の
-// ビート番号として、startTimeを起点にBPM入力欄の現在値でスケジュールする
-// （noteSchedule/noteTimeMap/beatSchedule/noteBoundarySchedule/playEndTimeに追記・更新する）
+// startMeasureIndex小節目から末尾まで、BPM入力欄の現在値でスケジュールする
+// （noteSchedule/noteTimeMap/beatSchedule/upperNoteBoundarySchedule/lowerNoteBoundarySchedule/
+// playEndTimeに追記・更新する）。
+// upperResume/lowerResume: それぞれ{noteIndex, time}。上段・下段は完全に独立したリズムを持てるため、
+// テンポ変更等での再開位置（どの音符から続きを鳴らすか・実際に鳴らし直す時刻）は段ごとに異なりうる。
+// beatIndexOffset: マップ用ビート番号（センサー番号）の続き番号
 // resumeMeasureStartTimeOverride: 曲中のテンポ変更で小節の途中から再開する場合、
 // その小節がもともと始まった時刻（表示上の小節範囲がずれないように引き継ぐ）
-function scheduleMeasuresFrom(startMeasureIndex, startNoteIndex, beatIndexOffset, startTime, resumeMeasureStartTimeOverride) {
+function scheduleMeasuresFrom(startMeasureIndex, upperResume, lowerResume, beatIndexOffset, resumeMeasureStartTimeOverride) {
     const bpm = parseInt(document.getElementById("bpmInput").value) || 120;
     const beatDuration = 60 / bpm;
     const sixteenthDuration = beatDuration * 0.25; // マップの1センサー(16分音符)分の長さ
     const measuresPerRow = getMeasuresPerRow();
+    const beatsPerMeasure = getBeatsPerMeasure();
+    const measureDuration = beatsPerMeasure * beatDuration;
 
-    let time = startTime;
+    // 小節単位のスケジュール（noteSchedule: 小節ハイライト用、noteTimeMap: 再生位置ライン用、
+    // beatSchedule: マップのセンサー点灯用）は、上段・下段どちらの音符内容にも依存しない。
+    // 小節はどちらの配列で見ても必ず同じ拍数で埋まっているため、小節の開始・終了時刻はBPMと
+    // 小節番号だけで決まる純粋な算術で求められる
+    let time = Math.min(upperResume.time, lowerResume.time);
     let beatIndex = beatIndexOffset;
 
     for (let measureIndex = startMeasureIndex; measureIndex < score.measures.length; measureIndex++) {
-        const measure = score.measures[measureIndex];
         const isResumeMeasure = measureIndex === startMeasureIndex;
-        const noteStartIndex = isResumeMeasure ? startNoteIndex : 0;
         const measureStartTime = (isResumeMeasure && resumeMeasureStartTimeOverride != null)
             ? resumeMeasureStartTimeOverride
             : time;
+        const measureEndTime = measureStartTime + measureDuration;
 
         const rowIndex = Math.floor(measureIndex / measuresPerRow);
         const idxInRow = measureIndex % measuresPerRow;
@@ -219,54 +237,58 @@ function scheduleMeasuresFrom(startMeasureIndex, startNoteIndex, beatIndexOffset
         }
         const measureWidth = isFirstMeasure ? STAVE_WIDTH_BASE + FIRST_MEASURE_EXTRA : STAVE_WIDTH_BASE;
 
-        for (let noteIndex = noteStartIndex; noteIndex < measure.notes.length; noteIndex++) {
-            const note = measure.notes[noteIndex];
-            const duration = noteBeats(note) * beatDuration;
-            if (!note.rest && note.pitches) {
-                note.pitches.forEach(pitch => {
-                    playNote(pitch, time, duration * 0.9);
-                });
-            }
-
-            // マップのセンサー(16分音符)単位での開始・終了時刻を記録
-            const slotCount = Math.round(noteBeats(note) / 0.25);
-            for (let s = 0; s < slotCount; s++) {
-                beatSchedule.push({
-                    beatIndex,
-                    startTime: time + s * sixteenthDuration,
-                    endTime: time + (s + 1) * sixteenthDuration,
-                });
-                beatIndex++;
-            }
-
-            // テンポ変更の再開位置探しに使う、音符単位の開始・終了時刻
-            noteBoundarySchedule.push({
-                measureIndex,
-                noteIndex,
-                startTime: time,
-                endTime: time + duration,
-            });
-
-            time += duration;
-        }
-
-        noteSchedule.push({
-            measureIndex,
-            startTime: measureStartTime,
-            endTime: time
-        });
-
+        noteSchedule.push({ measureIndex, startTime: measureStartTime, endTime: measureEndTime });
         noteTimeMap.push({
             startTime: measureStartTime,
-            endTime: time,
+            endTime: measureEndTime,
             startX: sx * scale,
             endX: (sx + measureWidth) * scale,
             rowIndex
         });
+
+        // マップのセンサー(16分音符)単位での開始・終了時刻を記録。再開直後の小節は、
+        // 実際に鳴らし直す時刻（time）から小節末尾までの残り分だけ生成する
+        // （それより前のスロットは、reschedule側で既存のbeatScheduleがそのまま残っている）
+        while (time < measureEndTime - 1e-9) {
+            const slotEnd = Math.min(time + sixteenthDuration, measureEndTime);
+            beatSchedule.push({ beatIndex, startTime: time, endTime: slotEnd });
+            beatIndex++;
+            time = slotEnd;
+        }
+        time = measureEndTime;
     }
 
     // 終了検知はtrackPlayback内でaudioCtx時刻を見て行う（setTimeoutは一時停止中もカウントが進んでしまうため使わない）
     playEndTime = time;
+
+    // 実際の発音（playNote呼び出し）と、再開位置探しに使う音符境界スケジュールは、
+    // 上段・下段それぞれ独立にその配列を歩いて生成する（リズムが異なるため、鳴らす時刻の
+    // 進み方も独立している）
+    function scheduleStream(notesAccessor, boundarySchedule, resume) {
+        // resume.timeは「その段の小節開始時刻＋スキップした音符の拍数分」であるはず（呼び出し元で
+        // 保証）なので、残りの音符を順に足していけば、再開小節の末尾でちょうど小節終了時刻に一致する。
+        // そのため2小節目以降は特別な調整をせず、そのままtを引き継げばよい
+        let t = resume.time;
+        for (let measureIndex = startMeasureIndex; measureIndex < score.measures.length; measureIndex++) {
+            const measure = score.measures[measureIndex];
+            const notes = notesAccessor(measure);
+            const isResumeMeasure = measureIndex === startMeasureIndex;
+            const noteStartIndex = isResumeMeasure ? resume.noteIndex : 0;
+
+            for (let noteIndex = noteStartIndex; noteIndex < notes.length; noteIndex++) {
+                const note = notes[noteIndex];
+                const duration = noteBeats(note) * beatDuration;
+                if (!note.rest && note.pitches) {
+                    note.pitches.forEach(pitch => playNote(pitch, t, duration * 0.9));
+                }
+                boundarySchedule.push({ measureIndex, noteIndex, startTime: t, endTime: t + duration });
+                t += duration;
+            }
+        }
+    }
+
+    scheduleStream(m => m.upperNotes, upperNoteBoundarySchedule, upperResume);
+    scheduleStream(m => m.lowerNotes, lowerNoteBoundarySchedule, lowerResume);
 }
 
 // 再生中/一時停止中にBPMや音符データ（移調など）が変更されたら、今鳴っている音符が終わった
@@ -276,23 +298,34 @@ function rescheduleFromCurrentPosition() {
     if (playState === "stopped" || !audioCtx) return;
 
     const now = audioCtx.currentTime;
-    const current = noteBoundarySchedule.find(n => now < n.endTime);
-    if (!current) return; // 既に最後の音符まで進んでいる
+    // 小節単位のスケジュール（算術のみ、上段・下段どちらの音符内容にも依存しない）で
+    // 「今どの小節か」を特定する
+    const currentMeasureEntry = noteSchedule.find(s => now < s.endTime);
+    if (!currentMeasureEntry) return; // 既に最後の小節まで進んでいる
 
-    const resumeTime = current.endTime;
-    let resumeMeasureIndex = current.measureIndex;
-    let resumeNoteIndex = current.noteIndex + 1;
-    // resumeMeasureIndexが指す小節自体が（小節の削除等で）もう存在しない場合があるのでガードする
-    if (resumeMeasureIndex < score.measures.length &&
-        resumeNoteIndex >= score.measures[resumeMeasureIndex].notes.length) {
-        resumeMeasureIndex++;
-        resumeNoteIndex = 0;
+    const resumeMeasureIndex = currentMeasureEntry.measureIndex;
+    const resumeMeasureStartTimeOverride = currentMeasureEntry.startTime;
+
+    // 上段・下段それぞれ独立に「今鳴っている音符」を見つけ、その直後から続きを敷き直す
+    // （見つからなければ、その段はこの小節をもう鳴らし終えているので小節の頭から再開する）
+    function findStreamResume(boundarySchedule) {
+        const current = boundarySchedule.find(n => n.measureIndex === resumeMeasureIndex && now < n.endTime);
+        if (current) {
+            return { time: current.endTime, noteIndex: current.noteIndex + 1 };
+        }
+        return { time: resumeMeasureStartTimeOverride, noteIndex: 0 };
     }
+
+    const upperResume = findStreamResume(upperNoteBoundarySchedule);
+    const lowerResume = findStreamResume(lowerNoteBoundarySchedule);
+    // 上段・下段どちらか早く再開する方の時刻を、算術スケジュール（noteSchedule/noteTimeMap/
+    // beatSchedule）を敷き直す起点にする
+    const earliestResumeTime = Math.min(upperResume.time, lowerResume.time);
 
     // まだ発音していない先の音（小節削除等で無効になった分も含む）を止める。
     // 曲の終端に達している場合でもここは必ず実行し、削除済み小節の音が鳴りっぱなしにならないようにする
     activeSourceNodes = activeSourceNodes.filter(({ node, startTime }) => {
-        if (startTime >= resumeTime) {
+        if (startTime >= earliestResumeTime) {
             try { node.stop(); } catch (e) { /* 既に終了済みの場合は無視 */ }
             return false;
         }
@@ -300,19 +333,16 @@ function rescheduleFromCurrentPosition() {
     });
     noteSchedule = noteSchedule.filter(s => s.measureIndex < resumeMeasureIndex);
     noteTimeMap = noteTimeMap.slice(0, noteSchedule.length);
-    beatSchedule = beatSchedule.filter(b => b.startTime < resumeTime);
-    noteBoundarySchedule = noteBoundarySchedule.filter(n => n.startTime < resumeTime);
+    beatSchedule = beatSchedule.filter(b => b.startTime < earliestResumeTime);
+    upperNoteBoundarySchedule = upperNoteBoundarySchedule.filter(n => n.measureIndex < resumeMeasureIndex);
+    lowerNoteBoundarySchedule = lowerNoteBoundarySchedule.filter(n => n.measureIndex < resumeMeasureIndex);
 
     if (resumeMeasureIndex >= score.measures.length) {
-        playEndTime = resumeTime;
+        playEndTime = earliestResumeTime;
         return;
     }
 
-    // 再開する小節がもともと始まった時刻を引き継ぐ（表示上の小節範囲がずれないように）
-    const resumeMeasureEntry = noteSchedule.find(s => s.measureIndex === resumeMeasureIndex);
-    const resumeMeasureStartTimeOverride = resumeMeasureEntry ? resumeMeasureEntry.startTime : resumeTime;
-
-    scheduleMeasuresFrom(resumeMeasureIndex, resumeNoteIndex, beatSchedule.length, resumeTime, resumeMeasureStartTimeOverride);
+    scheduleMeasuresFrom(resumeMeasureIndex, upperResume, lowerResume, beatSchedule.length, resumeMeasureStartTimeOverride);
 }
 
 // 再生を終端まで到達した状態にする（ループ時は続けて再生開始）
@@ -583,6 +613,12 @@ function isUpperFrameForClick(clickY) {
     return !!score.grandStaff && c4YForClick(clickY) === C4_Y_BASE;
 }
 
+// クリック/ホバーが上段・下段どちらの音符列（measure.upperNotes/lowerNotes）を対象にしているかを
+// 一箇所で決める。1段譜表（!score.grandStaff）のときは常に上段（唯一の段）を対象にする
+function staffForClick(clickY) {
+    return isUpperFrameForClick(clickY) || !score.grandStaff ? "upper" : "lower";
+}
+
 // クリックY座標から最も近い白鍵の音名を返す（音域は無制限。isBlackは現状未使用だが
 // 既存の呼び出し互換のため引数として残す）
 // rawDiatonicはC4を0とするdiatonic step（自然音の文字1つ分）の相対値
@@ -603,8 +639,8 @@ function yToPitch(clickY, isBlack) {
     const absSemitone = pitchToSemitone(`${letter}${octave}`);
 
     // どちらの段に置くかはピッチではなく、クリックした場所（c4YForClickの判定）で決まる。
-    // そのためここではピッチによるクランプは行わない（isUpperFrameForClickを別途参照して
-    // 呼び出し側でnote.upperPitchesに記録する）
+    // そのためここではピッチによるクランプは行わない（呼び出し側がstaffForClickで
+    // upperNotes/lowerNotesどちらの配列を操作するかを別途決める）
     const naturalPitch = semitoneToPitch(absSemitone);
 
     // 現在の調号でそのレターが変化する場合は、デフォルトで調号通りの音にする
@@ -624,6 +660,11 @@ function yToPitch(clickY, isBlack) {
 function getBeatsPerMeasure() {
     const [num, den] = (score.timeSignature || "4/4").split("/").map(Number);
     return num * 4 / den;
+}
+
+// 和音として同時に鳴らせるピッチ数の上限（デフォルト3、UIで1〜11に変更可能）
+function getChordMax() {
+    return score.chordMax || 3;
 }
 
 // 小節1つ分をまるごと休ませる休符（現在の拍子に合う音価）を1つ返す
@@ -655,9 +696,13 @@ function beatsToRests(beats) {
     return rests;
 }
 
-// 新規に作る空の小節（あらかじめ全休符を入れておく。小節は常に音符か休符で埋まっている前提）
+// 新規に作る空の小節（あらかじめ全休符を入れておく。小節は常に音符か休符で埋まっている前提）。
+// 上段・下段は完全に独立した音符列なので、それぞれ個別に全休符で埋める
 function makeEmptyMeasure() {
-    return { notes: beatsToRests(getBeatsPerMeasure()) };
+    return {
+        upperNotes: beatsToRests(getBeatsPerMeasure()),
+        lowerNotes: beatsToRests(getBeatsPerMeasure())
+    };
 }
 
 function pitchToKey(pitch) {
@@ -703,12 +748,14 @@ function getKeyAccidentalMap(key) {
     return map;
 }
 
-// 曲全体をshift半音分だけ移調する（音符・調号とも）
+// 曲全体をshift半音分だけ移調する（音符・調号とも）。上段・下段の両方を移調する
 function transposeScore(shift) {
     score.measures.forEach(measure => {
-        measure.notes.forEach(note => {
-            if (note.rest || !note.pitches) return;
-            note.pitches = note.pitches.map(p => transposePitch(p, shift));
+        [measure.upperNotes, measure.lowerNotes].forEach(notes => {
+            notes.forEach(note => {
+                if (note.rest || !note.pitches) return;
+                note.pitches = note.pitches.map(p => transposePitch(p, shift));
+            });
         });
     });
     score.keySignature = transposeKeySignature(score.keySignature || "C", shift);
@@ -812,11 +859,11 @@ function saveMapSettings() {
     localStorage.setItem("mapSettings", JSON.stringify(mapSettings));
 }
 
-// 楽譜の全ビートを順番に返す（16分音符単位）
-function getAllBeats() {
+// 指定した段（上段/下段）の音符列を、楽譜全体で16分音符単位のビート列にフラット化する
+function flattenNotesToBeats(notesAccessor) {
     const beats = [];
     score.measures.forEach((measure, measureIndex) => {
-        measure.notes.forEach(note => {
+        notesAccessor(measure).forEach(note => {
             const count = Math.round(noteBeats(note) / 0.25);
             for (let i = 0; i < count; i++) {
                 beats.push({
@@ -828,6 +875,28 @@ function getAllBeats() {
         });
     });
     return beats;
+}
+
+// 楽譜の全ビートを順番に返す（16分音符単位）。実物のぽこあポケモンはトロッコ1本・レール1本のため、
+// センサー列は1つしか作れない。上段・下段は完全に独立したリズムを持てるので、それぞれ独立に
+// フラット化した上で、両方の音の開始タイミングを合わせて1つの列にマージする
+// （同じスロットで両方が音符開始していれば、ピッチを合算した1つの和音として扱う）
+function getAllBeats() {
+    const upperBeats = flattenNotesToBeats(m => m.upperNotes);
+    if (!score.grandStaff) return upperBeats;
+
+    const lowerBeats = flattenNotesToBeats(m => m.lowerNotes);
+    return upperBeats.map((u, i) => {
+        const l = lowerBeats[i];
+        const upperPitches = (u.isFirst && u.note && !u.note.rest && u.note.pitches) ? u.note.pitches : [];
+        const lowerPitches = (l.isFirst && l.note && !l.note.rest && l.note.pitches) ? l.note.pitches : [];
+        const pitches = [...upperPitches, ...lowerPitches];
+        return {
+            measureIndex: u.measureIndex,
+            note: pitches.length ? { pitches, rest: false } : { rest: true },
+            isFirst: true
+        };
+    });
 }
 
 // 中間層3枠（センサー中心を(0,0)としたローカル座標、斜め隣接は使用しない）への
@@ -1153,13 +1222,15 @@ function updateCountsBar() {
 
     const countMap = {};
     score.measures.forEach(measure => {
-        measure.notes.forEach(note => {
-            if (!note.rest && note.pitches) {
-                note.pitches.forEach(pitch => {
-                    const group = PITCH_TO_GROUP[pitch];
-                    if (group) countMap[group] = (countMap[group] || 0) + 1;
-                });
-            }
+        [measure.upperNotes, measure.lowerNotes].forEach(notes => {
+            notes.forEach(note => {
+                if (!note.rest && note.pitches) {
+                    note.pitches.forEach(pitch => {
+                        const group = PITCH_TO_GROUP[pitch];
+                        if (group) countMap[group] = (countMap[group] || 0) + 1;
+                    });
+                }
+            });
         });
     });
 
@@ -1249,6 +1320,7 @@ function undo() {
     selectedMeasures.clear();
     updateTimeSignatureButtons();
     updateKeySignatureUI();
+    updateChordMaxUI();
     updateStaffLayoutButtons();
     renderScore();
     setupDeleteButtons();
@@ -1264,6 +1336,7 @@ function redo() {
     selectedMeasures.clear();
     updateTimeSignatureButtons();
     updateKeySignatureUI();
+    updateChordMaxUI();
     updateStaffLayoutButtons();
     renderScore();
     setupDeleteButtons();
@@ -1358,33 +1431,65 @@ function getMeasuresInDragRange(x1, y1, x2, y2) {
     return result;
 }
 
-// あるピッチが上段（グランドスタッフの上側、C5以上）に属するかどうか
+// 【旧JSON形式の移行専用】あるピッチが上段（グランドスタッフの上側、C5以上）に属するかどうか。
+// 現在のライブ編集・描画では段はデータ構造（upperNotes/lowerNotes）で決まるため使われず、
+// migrateMeasuresToStaffArraysが旧形式のupperPitches欠損時のフォールバックとしてのみ使う
 function isUpperStaffPitch(pitch) {
     return pitchToSemitone(pitch) >= GRAND_STAFF_SPLIT_SEMITONE;
 }
 
-// どのピッチが上段/下段どちらに属するかは、ピッチの高さではなく「入力した時にどちらの段を
-// クリックしたか」で個別に決まる。note.upperPitches（そのnoteのpitchesのうち上段に属するものだけを
-// 列挙した配列。JSON保存のためSetではなく配列で持つ）に明示的に記録し、そこに無いピッチは下段扱いにする。
-// note.upperPitchesが無い（1段→2段変換前の古いデータ等）場合のみ、ピッチの高さ（C5基準）による
-// 従来ルールにフォールバックする
+// 【旧JSON形式の移行専用】旧形式のnote.upperPitches（無ければピッチの高さ）から、
+// そのピッチが上段に属していたかどうかを判定する。migrateMeasuresToStaffArrays専用
 function pitchBelongsToUpperStaff(pitch, note) {
     if (note.upperPitches) return note.upperPitches.includes(pitch);
     return isUpperStaffPitch(pitch);
 }
 
+// 旧JSON形式（小節ごとにmeasure.notesという単一の音符列を持ち、和音の各ピッチが
+// upperPitchesで段を判定していた形式）から、現在の形式（measure.upperNotes/lowerNotesという
+// 完全に独立した2つの音符列）へ変換する。既に新形式（upperNotes/lowerNotesを持つ）小節は
+// そのまま返す。beatsPerMeasureは変換時点のscore.timeSignatureに基づく1小節分の拍数
+function migrateMeasuresToStaffArrays(measures, wasGrandStaff, beatsPerMeasure) {
+    return measures.map(measure => {
+        if (measure.upperNotes || measure.lowerNotes) return measure; // 既に新形式
+
+        if (!wasGrandStaff) {
+            // 旧・単一譜表：全音符をそのまま上段へ、下段は同じ拍数分の休符で埋める
+            return {
+                upperNotes: measure.notes,
+                lowerNotes: beatsToRests(beatsPerMeasure)
+            };
+        }
+
+        // 旧・グランドスタッフ：upperPitches（無ければピッチの高さ）で1音ずつ上段/下段に振り分け、
+        // 同じ位置・同じ音価のまま2つの音符列にする（どちらかにピッチが無ければ同じ音価の休符にする）
+        const upperNotes = [];
+        const lowerNotes = [];
+        measure.notes.forEach(note => {
+            if (note.rest) {
+                upperNotes.push({ ...note });
+                lowerNotes.push({ ...note });
+                return;
+            }
+            const upperPitches = note.pitches.filter(p => pitchBelongsToUpperStaff(p, note));
+            const lowerPitches = note.pitches.filter(p => !pitchBelongsToUpperStaff(p, note));
+            const base = { duration: note.duration, ...(note.dotted ? { dotted: true } : {}) };
+            upperNotes.push(upperPitches.length ? { ...base, pitches: upperPitches } : { ...base, rest: true });
+            lowerNotes.push(lowerPitches.length ? { ...base, pitches: lowerPitches } : { ...base, rest: true });
+        });
+        return { upperNotes, lowerNotes };
+    });
+}
+
 // 1段分（グランドスタッフの上段/下段、または1段譜表の唯一の段）のStaveNote配列を構築する。
-// renderNoteData/origIndexMapは小節全体（プレビュー込み）のデータ列で、複数の段がある場合は共通のものを渡す。
-// belongsToStaff(pitch, note)は、そのピッチをこの段に描画すべきかどうかを返す関数
-// （1段譜表なら常にtrueを返す関数を渡す）。note.forceUpperは、1段→2段への変換時に
-// 既存の音符へ一律付与されるフラグで、ピッチによる自動振り分けを上書きして常に上段に固定する
-// 和音はこの段に属するピッチだけを抜き出して描画し、このタイミングでこの段に何も無い場合は
-// 同じ長さの休符で埋める（実データが休符の場合は元々全段に同じ休符を表示する）。
+// renderNoteData/origIndexMapはその段専用の音符列（プレビュー込み）。上段・下段は完全に独立した
+// 配列なので、以前あった「ピッチがこの段に属するかのフィルタリング」「この段に何も無ければ休符で埋める」
+// 処理は不要（配列に入っている音符/休符がそのままこの段の内容になる）。
 // 戻り値: { notes, meta }。meta[i]はnotes[i]に対応するクリック判定用の情報
 //   { realNoteIndex, isRest, dataPitchIndices }
-//   dataPitchIndicesは実データ(measure.notes[realNoteIndex].pitches)内でのインデックスの配列
-//  （和音追加プレビューで混ぜたピッチの位置はnullになる。このスタッフに実データが無い場合は空配列）
-function buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap, belongsToStaff, hoveredPos) {
+//   dataPitchIndicesは実データ(notesArray[realNoteIndex].pitches)内でのインデックスの配列
+//  （和音追加プレビューで混ぜたピッチの位置はnullになる）
+function buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap, hoveredPos, staff) {
     const previewColor = "rgba(74, 144, 226, 0.45)";
     const hoverColor = "rgba(220, 50, 50, 0.7)";
     const unsupportedColor = "#e08000";
@@ -1396,6 +1501,7 @@ function buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap, be
         const realNoteIndex = origIndexMap[renderIdx];
         const isHovered = realNoteIndex !== null && hoveredPos &&
             hoveredPos.measureIndex === measureIndex &&
+            hoveredPos.staff === staff &&
             hoveredPos.hitNoteIndex === realNoteIndex &&
             hoveredPos.directHit === true;
 
@@ -1426,34 +1532,7 @@ function buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap, be
             previewPitchIndex = pitches.indexOf(preview.pitch);
         }
 
-        // pitches配列のうち、この段に属するインデックスだけ抜き出す。
-        // 和音追加プレビュー中のピッチ（previewPitchIndex）は、まだnote.upperPitchesに
-        // 記録されていないため、note側の判定ではなく現在ホバーしている段（preview.isUpper）を使う
-        const staffLocalIndices = [];
-        pitches.forEach((p, i) => {
-            const belongs = i === previewPitchIndex && preview.isUpper !== undefined
-                ? preview.isUpper
-                : belongsToStaff(p, note);
-            if (belongs) staffLocalIndices.push(i);
-        });
-
-        if (staffLocalIndices.length === 0) {
-            // この段にはこのタイミングで何も無い→同じ長さの休符で埋める
-            const restNote = new VF.StaveNote({
-                keys: ["b/4"],
-                duration: note.duration + "r",
-                ...(note.dotted ? { dots: 1 } : {})
-            });
-            if (note.dotted) {
-                VF.Dot.buildAndAttach([restNote], { all: true });
-            }
-            notes.push(restNote);
-            meta.push({ realNoteIndex, isRest: true, dataPitchIndices: [] });
-            return;
-        }
-
-        const staffPitches = staffLocalIndices.map(i => pitches[i]);
-        const keys = staffPitches.map(p => pitchToKey(p).key);
+        const keys = pitches.map(p => pitchToKey(p).key);
         const staveNote = new VF.StaveNote({
             keys,
             duration: note.duration,
@@ -1469,11 +1548,11 @@ function buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap, be
             staveNote.setStemStyle({ fillStyle: "rgba(0,0,0,0)", strokeStyle: "rgba(0,0,0,0)" });
             staveNote.setFlagStyle({ fillStyle: "rgba(0,0,0,0)", strokeStyle: "rgba(0,0,0,0)" });
         } else {
-            staffLocalIndices.forEach((origI, localI) => {
-                if (origI === previewPitchIndex) {
-                    staveNote.setKeyStyle(localI, { fillStyle: previewColor, strokeStyle: previewColor });
-                } else if (!PITCH_TO_FILE[toCanonicalPitch(pitches[origI])]) {
-                    staveNote.setKeyStyle(localI, { fillStyle: unsupportedColor, strokeStyle: unsupportedColor });
+            pitches.forEach((p, i) => {
+                if (i === previewPitchIndex) {
+                    staveNote.setKeyStyle(i, { fillStyle: previewColor, strokeStyle: previewColor });
+                } else if (!PITCH_TO_FILE[toCanonicalPitch(p)]) {
+                    staveNote.setKeyStyle(i, { fillStyle: unsupportedColor, strokeStyle: unsupportedColor });
                 }
             });
             if (isHovered) {
@@ -1481,12 +1560,8 @@ function buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap, be
             }
         }
 
-        // dataPitchIndices: 実データ(note.pitches)内でのインデックスに変換
-        // （プレビューで混ぜたピッチ自身の位置はnullにする）
-        const dataPitchIndices = staffLocalIndices.map(i => {
-            if (i === previewPitchIndex) return null;
-            return note.pitches.indexOf(pitches[i]);
-        });
+        // dataPitchIndices: 実データ(note.pitches)内でのインデックス（プレビューで混ぜたピッチはnull）
+        const dataPitchIndices = pitches.map((p, i) => i === previewPitchIndex ? null : note.pitches.indexOf(p));
 
         notes.push(staveNote);
         meta.push({ realNoteIndex, isRest: false, dataPitchIndices });
@@ -1495,13 +1570,14 @@ function buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap, be
     return { notes, meta };
 }
 
-// buildStaffNotesの結果（1段分）について、notePositions（クリック判定用）を記録する
-function recordNotePositionsForStaff(measure, measureIndex, rowIndex, rowDiv, staffResult, centerShiftPx) {
+// buildStaffNotesの結果（1段分）について、notePositions（クリック判定用）を記録する。
+// staffは"upper"|"lower"のタグで、編集操作がどちらの配列を書き換えるべきか判定するのに使う
+function recordNotePositionsForStaff(notesArray, measureIndex, rowIndex, rowDiv, staffResult, centerShiftPx, staff) {
     staffResult.notes.forEach((staveNote, renderIdx) => {
         const m = staffResult.meta[renderIdx];
         if (m.realNoteIndex === null) return; // プレビュー用のダミーはクリック判定に含めない
         const noteIndex = m.realNoteIndex;
-        const noteData = measure.notes[noteIndex];
+        const noteData = notesArray[noteIndex];
         const bb = staveNote.getBoundingBox();
         const nx = staveNote.getAbsoluteX() * scale + centerShiftPx;
         const nxLeft = bb ? (bb.getX() * scale + centerShiftPx) : nx - 6 * scale;
@@ -1509,15 +1585,11 @@ function recordNotePositionsForStaff(measure, measureIndex, rowIndex, rowDiv, st
         const svgOffsetTop = rowDiv.offsetTop;
 
         if (m.isRest) {
-            // 実データが休符の場合のみ記録する（和音の一部がこの段に無いために休符化した場合は、
-            // 実データ側の段でクリック判定を記録済みなのでここでは記録しない）
-            if (noteData.rest) {
-                const ny = staveNote.getYs()[0] * scale + svgOffsetTop;
-                notePositions.push({
-                    x: nx, xLeft: nxLeft, xRight: nxRight, y: ny,
-                    pitch: null, rest: true, measureIndex, noteIndex, pitchIndex: 0, rowIndex
-                });
-            }
+            const ny = staveNote.getYs()[0] * scale + svgOffsetTop;
+            notePositions.push({
+                x: nx, xLeft: nxLeft, xRight: nxRight, y: ny,
+                pitch: null, rest: true, measureIndex, noteIndex, pitchIndex: 0, rowIndex, staff
+            });
             return;
         }
 
@@ -1542,7 +1614,8 @@ function recordNotePositionsForStaff(measure, measureIndex, rowIndex, rowDiv, st
                 measureIndex,
                 noteIndex,
                 pitchIndex: dataIndex,
-                rowIndex
+                rowIndex,
+                staff
             });
         });
     });
@@ -1574,17 +1647,24 @@ function centerSoleRestOnStave(context, stave, note) {
 // 通常の描画には出てこない側を、対象グループの中央に半透明で重ね描きする
 function drawOverlayGhost(context, stave, notesArray, overlayGhost, color) {
     try {
-        const groupNotes = notesArray.slice(overlayGhost.groupStart, overlayGhost.groupStart + overlayGhost.groupLength);
-        let ghostMinX = Infinity, ghostMaxX = -Infinity;
-        groupNotes.forEach(sn => {
-            const bb = sn.getBoundingBox();
-            if (bb) {
-                ghostMinX = Math.min(ghostMinX, bb.getX());
-                ghostMaxX = Math.max(ghostMaxX, bb.getX() + bb.getW());
-            }
-        });
-        if (ghostMinX >= ghostMaxX) return;
-        const ghostCenterX = (ghostMinX + ghostMaxX) / 2;
+        let ghostCenterX;
+        if (overlayGhost.forceCenterX !== undefined) {
+            // ゴーストが表す休符が小節全体を1つで占める場合、実際に置かれる音符の位置を
+            // 追わず、休符自身の中央寄せ位置（音符エリア中央）に独立して表示する
+            ghostCenterX = overlayGhost.forceCenterX;
+        } else {
+            const groupNotes = notesArray.slice(overlayGhost.groupStart, overlayGhost.groupStart + overlayGhost.groupLength);
+            let ghostMinX = Infinity, ghostMaxX = -Infinity;
+            groupNotes.forEach(sn => {
+                const bb = sn.getBoundingBox();
+                if (bb) {
+                    ghostMinX = Math.min(ghostMinX, bb.getX());
+                    ghostMaxX = Math.max(ghostMaxX, bb.getX() + bb.getW());
+                }
+            });
+            if (ghostMinX >= ghostMaxX) return;
+            ghostCenterX = (ghostMinX + ghostMaxX) / 2;
+        }
         const ghostNote = new VF.StaveNote({
             keys: ["b/4"],
             duration: overlayGhost.duration + "r",
@@ -1709,94 +1789,92 @@ function renderScore() {
             );
             context.restore();
 
-            // このコマでのホバープレビュー内容を先に計算する（新規音符/休符の挿入 or 和音への音追加）
-            const preview = computeHoverPreview(measureIndex, measure);
-
-            // 実際にレンダリングする音符データ列（プレビュー用のダミーを含む場合がある）。
-            // origIndexMap[i] は renderNoteData[i] に対応する measure.notes 側の実インデックス（プレビューはnull）
-            const renderNoteData = [...(measure.notes || [])];
-            const origIndexMap = renderNoteData.map((_, i) => i);
-            // 上書きプレビュー時、「元々あったもの」と「新しく置かれるもの」の
-            // どちらか一方は通常のレンダリングでは表示されなくなるため、そちらを半透明の
-            // 追加オーバーレイとして後から重ね描きする（overlayGhostに情報を残す）
-            let overlayGhost = null;
-            if (preview && (preview.type === "splitNote" || preview.type === "splitRest")) {
-                const leading = beatsToRests(preview.leadingBeats);
-                const trailing = beatsToRests(preview.trailingBeats);
-                const center = preview.type === "splitRest"
-                    ? { rest: true, duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}), __preview: true }
-                    : {
-                        pitches: [preview.pitch], duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}), __preview: true,
-                        ...(score.grandStaff ? { upperPitches: preview.isUpper ? [preview.pitch] : [] } : {})
-                    };
-                const replacement = [...leading, center, ...trailing];
-                const original = measure.notes[preview.targetIndex];
-                // 新しい配置（分割後）は通常通り描画されるので、元の休符（分割前）をグループの中央に重ね描きする。
-                // 元は休符（両段に共通表示）なので、上段・下段両方に重ね描きする
-                overlayGhost = {
-                    style: "before",
-                    duration: original.duration,
-                    dotted: !!original.dotted,
-                    groupStart: preview.targetIndex,
-                    groupLength: replacement.length,
-                    showOnUpper: true,
-                    showOnLower: true
-                };
-                renderNoteData.splice(preview.targetIndex, 1, ...replacement);
-                origIndexMap.splice(preview.targetIndex, 1, ...replacement.map(() => null));
-            } else if (preview && preview.type === "overwriteWithRest") {
-                // 休符モードで既存音符の上にホバー：音符データ自体は変更せず通常通り描画し、
-                // 上書き後（休符）のプレビューを同じ位置に重ね描きする。
-                // 元の音符が上段/下段どちらにあったかに応じて、重ね描き先を決める
-                const originalNote = measure.notes[preview.existingNoteIndex];
-                const showOnUpper = !score.grandStaff || originalNote.pitches.some(p => pitchBelongsToUpperStaff(p, originalNote));
-                const showOnLower = score.grandStaff && originalNote.pitches.some(p => !pitchBelongsToUpperStaff(p, originalNote));
-                overlayGhost = {
-                    style: "after",
-                    duration: preview.duration,
-                    dotted: preview.dotted,
-                    groupStart: preview.existingNoteIndex,
-                    groupLength: 1,
-                    showOnUpper,
-                    showOnLower
-                };
-            }
-
-            if (renderNoteData.length === 0) {
+            if (measure.upperNotes.length === 0) {
                 return;
             }
 
             const previewColor = "rgba(74, 144, 226, 0.45)";
-
-            const upperResult = buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap,
-                score.grandStaff ? pitchBelongsToUpperStaff : () => true,
-                hoveredPos);
-            const lowerResult = score.grandStaff
-                ? buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap,
-                    (p, note) => !pitchBelongsToUpperStaff(p, note), hoveredPos)
-                : null;
-
-            const totalBeats = renderNoteData.reduce((sum, n) => sum + noteBeats(n), 0);
-            const remainingBeats = getBeatsPerMeasure() - totalBeats;
-            const upperDummies = makeDummyNotes(Math.max(0, remainingBeats));
-            const upperAllNotes = [...upperResult.notes, ...upperDummies];
-
             const [tsNum, tsDen] = score.timeSignature.split("/").map(Number);
-            const upperVoice = new VF.Voice({ num_beats: tsNum, beat_value: tsDen });
-            upperVoice.setStrict(false);
-            upperVoice.addTickables(upperAllNotes);
-            let lowerVoice = null;
-            if (lowerResult) {
-                const lowerDummies = makeDummyNotes(Math.max(0, remainingBeats));
-                const lowerAllNotes = [...lowerResult.notes, ...lowerDummies];
-                lowerVoice = new VF.Voice({ num_beats: tsNum, beat_value: tsDen });
-                lowerVoice.setStrict(false);
-                lowerVoice.addTickables(lowerAllNotes);
+
+            // 1段分（上段または下段）の、ホバープレビュー計算・プレビューダミーの差し込み・
+            // StaveNote構築・ダミー休符埋め・Voice構築をまとめて行う。上段・下段は完全に独立した
+            // 音符列なので、リズム（音価の並び）が異なっていてもそれぞれ独立に処理できる
+            function prepareStaff(notesArray, staff) {
+                const preview = computeHoverPreview(measureIndex, notesArray, staff);
+
+                const renderNoteData = [...notesArray];
+                const origIndexMap = renderNoteData.map((_, i) => i);
+                // 上書きプレビュー時、「元々あったもの」と「新しく置かれるもの」の
+                // どちらか一方は通常のレンダリングでは表示されなくなるため、そちらを半透明の
+                // 追加オーバーレイとして後から重ね描きする（overlayGhostに情報を残す）
+                let overlayGhost = null;
+                if (preview && (preview.type === "splitNote" || preview.type === "splitRest")) {
+                    const leading = beatsToRests(preview.leadingBeats);
+                    const trailing = beatsToRests(preview.trailingBeats);
+                    const center = preview.type === "splitRest"
+                        ? { rest: true, duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}), __preview: true }
+                        : { pitches: [preview.pitch], duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}), __preview: true };
+                    const replacement = [...leading, center, ...trailing];
+                    const original = notesArray[preview.targetIndex];
+                    // 新しい配置（分割後）は通常通り描画されるので、元の休符（分割前）をグループの中央に重ね描きする
+                    overlayGhost = {
+                        style: "before",
+                        duration: original.duration,
+                        dotted: !!original.dotted,
+                        groupStart: preview.targetIndex,
+                        groupLength: replacement.length
+                    };
+                    renderNoteData.splice(preview.targetIndex, 1, ...replacement);
+                    origIndexMap.splice(preview.targetIndex, 1, ...replacement.map(() => null));
+                } else if (preview && preview.type === "overwriteWithRest") {
+                    // 休符モードで既存音符の上にホバー：音符データ自体は変更せず通常通り描画し、
+                    // 上書き後（休符）のプレビューを同じ位置に重ね描きする
+                    overlayGhost = {
+                        style: "after",
+                        duration: preview.duration,
+                        dotted: preview.dotted,
+                        groupStart: preview.existingNoteIndex,
+                        groupLength: 1
+                    };
+                }
+
+                const result = buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap, hoveredPos, staff);
+
+                const totalBeats = renderNoteData.reduce((sum, n) => sum + noteBeats(n), 0);
+                const remainingBeats = getBeatsPerMeasure() - totalBeats;
+                const dummies = makeDummyNotes(Math.max(0, remainingBeats));
+                const allNotes = [...result.notes, ...dummies];
+
+                const voice = new VF.Voice({ num_beats: tsNum, beat_value: tsDen });
+                voice.setStrict(false);
+                voice.addTickables(allNotes);
+
+                // 小節の中身が休符1つだけ（例: 全休符）の場合、そのまま描画すると音符エリアの先頭に
+                // 寄って見えるため、後で音符エリアの中央に来るよう見た目上シフトする（上段・下段で独立に判定）。
+                // 音符は（プレビュー中の音符も含め）左寄りのままでよい（休符だけが中央寄せの対象）
+                const soloRestCase = renderNoteData.length === 1 && renderNoteData[0].rest;
+
+                // オーバーレイゴーストが休符を表しており、かつそのゴーストが小節全体を1つで
+                // 占める（＝もし実際に休符のままだったらsoloRestCase扱いになる）場合、
+                // ゴーストは実際に置かれる音符の位置を追わず、休符と同じ「音符エリア中央」に
+                // 独立して表示する（音符は左寄り・休符は中央寄り、という見た目の使い分けのため）
+                if (overlayGhost) {
+                    const wouldBeSoloRest = overlayGhost.groupStart === 0 && overlayGhost.groupLength === renderNoteData.length;
+                    if (wouldBeSoloRest) {
+                        const stave = staff === "upper" ? upperStave : lowerStave;
+                        overlayGhost.forceCenterX = (stave.getNoteStartX() + stave.getNoteEndX()) / 2;
+                    }
+                }
+
+                return { result, voice, overlayGhost, soloRestCase, preview };
             }
 
+            const upperPrep = prepareStaff(measure.upperNotes, "upper");
+            const lowerPrep = score.grandStaff ? prepareStaff(measure.lowerNotes, "lower") : null;
+
             // 調号に基づき、必要な音符にのみ♯/♭/ナチュラルを自動付与する（段ごと・小節ごとにリセット）
-            VF.Accidental.applyAccidentals([upperVoice], score.keySignature || "C");
-            if (lowerVoice) VF.Accidental.applyAccidentals([lowerVoice], score.keySignature || "C");
+            VF.Accidental.applyAccidentals([upperPrep.voice], score.keySignature || "C");
+            if (lowerPrep) VF.Accidental.applyAccidentals([lowerPrep.voice], score.keySignature || "C");
 
             // クレフ・調号・拍子記号が実際に消費した幅を差し引いた、音符が使える実際の幅を使う
             // （固定オフセットだと調号の♯/♭の数によって幅が変わることに対応できないため）。
@@ -1804,19 +1882,19 @@ function renderScore() {
             const formatWidth = upperStave.getNoteEndX() - upperStave.getNoteStartX() - MEASURE_END_PADDING;
 
             const formatter = new VF.Formatter();
-            formatter.joinVoices([upperVoice]);
-            if (lowerVoice) {
-                formatter.joinVoices([lowerVoice]);
-                formatter.format([upperVoice, lowerVoice], formatWidth);
+            formatter.joinVoices([upperPrep.voice]);
+            if (lowerPrep) {
+                formatter.joinVoices([lowerPrep.voice]);
+                formatter.format([upperPrep.voice, lowerPrep.voice], formatWidth);
             } else {
-                formatter.format([upperVoice], formatWidth);
+                formatter.format([upperPrep.voice], formatWidth);
             }
 
             const upperBeams = VF.Beam.generateBeams(
-                upperResult.notes.filter((_, i) => !upperResult.meta[i].isRest)
+                upperPrep.result.notes.filter((_, i) => !upperPrep.result.meta[i].isRest)
             );
-            const lowerBeams = lowerResult
-                ? VF.Beam.generateBeams(lowerResult.notes.filter((_, i) => !lowerResult.meta[i].isRest))
+            const lowerBeams = lowerPrep
+                ? VF.Beam.generateBeams(lowerPrep.result.notes.filter((_, i) => !lowerPrep.result.meta[i].isRest))
                 : [];
 
             [...upperBeams, ...lowerBeams].forEach(beam => {
@@ -1828,23 +1906,20 @@ function renderScore() {
                 });
             });
 
-            upperVoice.draw(context, upperStave);
+            upperPrep.voice.draw(context, upperStave);
 
-            // 小節の中身が休符1つだけ（例: 全休符）の場合、そのまま描画すると音符エリアの先頭に
-            // 寄って見えるため、音符エリアの中央に来るよう見た目上シフトする。
             // （StaveNoteのgetBoundingBox/getAbsoluteXはdraw前・setXShiftとの組み合わせでは信頼できないため、
             // 実際に描画されたDOM要素の位置を測ってからtransformで補正する）
-            const soloRestCase = renderNoteData.length === 1 && renderNoteData[0].rest;
             let upperCenterShift = 0;
-            if (soloRestCase) {
-                upperCenterShift = centerSoleRestOnStave(context, upperStave, upperResult.notes[0]);
+            if (upperPrep.soloRestCase) {
+                upperCenterShift = centerSoleRestOnStave(context, upperStave, upperPrep.result.notes[0]);
             }
 
             let lowerCenterShift = 0;
-            if (lowerVoice) {
-                lowerVoice.draw(context, lowerStave);
-                if (soloRestCase) {
-                    lowerCenterShift = centerSoleRestOnStave(context, lowerStave, lowerResult.notes[0]);
+            if (lowerPrep) {
+                lowerPrep.voice.draw(context, lowerStave);
+                if (lowerPrep.soloRestCase) {
+                    lowerCenterShift = centerSoleRestOnStave(context, lowerStave, lowerPrep.result.notes[0]);
                 }
             }
 
@@ -1853,21 +1928,27 @@ function renderScore() {
 
             // 上書きプレビュー：「元々あったもの」または「新しく置かれるもの」のうち、
             // 通常の描画には出てこない側を、対象グループの中央に半透明で重ね描きする
-            if (overlayGhost) {
-                const ghostColor = overlayGhost.style === "before"
-                    ? "rgba(120, 120, 120, 0.5)"
-                    : previewColor;
-                if (overlayGhost.showOnUpper) {
-                    drawOverlayGhost(context, upperStave, upperResult.notes, overlayGhost, ghostColor);
-                }
-                if (overlayGhost.showOnLower && lowerResult) {
-                    drawOverlayGhost(context, lowerStave, lowerResult.notes, overlayGhost, ghostColor);
-                }
+            if (upperPrep.overlayGhost) {
+                const ghostColor = upperPrep.overlayGhost.style === "before" ? "rgba(120, 120, 120, 0.5)" : previewColor;
+                drawOverlayGhost(context, upperStave, upperPrep.result.notes, upperPrep.overlayGhost, ghostColor);
+            }
+            if (lowerPrep && lowerPrep.overlayGhost) {
+                const ghostColor = lowerPrep.overlayGhost.style === "before" ? "rgba(120, 120, 120, 0.5)" : previewColor;
+                drawOverlayGhost(context, lowerStave, lowerPrep.result.notes, lowerPrep.overlayGhost, ghostColor);
             }
 
-            recordNotePositionsForStaff(measure, measureIndex, rowIndex, rowDiv, upperResult, upperCenterShift * scale);
-            if (lowerResult) {
-                recordNotePositionsForStaff(measure, measureIndex, rowIndex, rowDiv, lowerResult, lowerCenterShift * scale);
+            recordNotePositionsForStaff(measure.upperNotes, measureIndex, rowIndex, rowDiv, upperPrep.result, upperCenterShift * scale, "upper");
+            if (lowerPrep) {
+                recordNotePositionsForStaff(measure.lowerNotes, measureIndex, rowIndex, rowDiv, lowerPrep.result, lowerCenterShift * scale, "lower");
+            }
+
+            // プレビューが乗っていない（休符/音符が差し替えられていない）段だけ、
+            // stableNotePositionsのキャッシュを最新の実測値で更新する
+            if (!upperPrep.preview) {
+                stableNotePositions.set(`${measureIndex}:upper`, notePositions.filter(p => p.measureIndex === measureIndex && p.staff === "upper"));
+            }
+            if (lowerPrep && !lowerPrep.preview) {
+                stableNotePositions.set(`${measureIndex}:lower`, notePositions.filter(p => p.measureIndex === measureIndex && p.staff === "lower"));
             }
         });
     });
@@ -2046,10 +2127,17 @@ function findNoteAt(measureIndex, clickX, clickY, looseness = 1) {
     // Y方向の許容量はDIATONIC_STEP_PX（隣接する自然音同士の間隔）の半分にする。
     // これより広いと、隣り合う段（五線譜上の位置）の音符同士で判定範囲が重なってしまい、
     // クリックしたつもりの音符と別の音符を誤って拾ってしまうことがあった
+    // X方向には1pxの余白を持たせる（実際のマウスイベントのclientX/Yは整数にまるめられるため、
+    // xLeftがちょうど小数点以下を持つ場合に、見た目上は音符のど真ん中をクリックしていても
+    // 丸め誤差でxLeftをわずかに下回り判定から漏れることがあった）。
+    // xLeft/xRightは既にscale適用後（画面ピクセル）の値で、丸め誤差も画面ピクセル単位で
+    // 発生するため、この余白にはscaleを掛けない（zoom率が低いとscaleを掛けた分だけ
+    // 余白が縮んでしまい、丸め誤差を吸収しきれなくなる）
+    const EDGE_TOLERANCE_PX = 1;
     const hit = notePositions.find(pos =>
         pos.measureIndex === measureIndex &&
-        clickX >= pos.xLeft &&
-        clickX < pos.xRight &&
+        clickX >= pos.xLeft - EDGE_TOLERANCE_PX &&
+        clickX < pos.xRight + EDGE_TOLERANCE_PX &&
         Math.abs(pos.y - clickY) <= (DIATONIC_STEP_PX / 2) * scale * looseness
     );
     return hit || null;
@@ -2066,13 +2154,13 @@ function xToBeatPosition(measureIndex, clickX) {
     return (clickX - left) / (right - left) * totalBeats;
 }
 
-// clickXが小節内のどの音符/休符（measure.notesのインデックス）にあたるかを、拍位置から探す。
-// 見つかった場合 { index, segStart, segBeats } を返す（segStartはその要素の開始拍位置）
-function findSegmentAtBeatPosition(measure, beatPos) {
+// clickXが指定した音符列（上段/下段どちらかの独立した配列）のどのインデックスにあたるかを、
+// 拍位置から探す。見つかった場合 { index, segStart, segBeats } を返す（segStartはその要素の開始拍位置）
+function findSegmentAtBeatPosition(notesArray, beatPos) {
     if (beatPos === null) return null;
     let cursor = 0;
-    for (let i = 0; i < measure.notes.length; i++) {
-        const segBeats = noteBeats(measure.notes[i]);
+    for (let i = 0; i < notesArray.length; i++) {
+        const segBeats = noteBeats(notesArray[i]);
         const segStart = cursor;
         const segEnd = cursor + segBeats;
         cursor = segEnd;
@@ -2081,6 +2169,54 @@ function findSegmentAtBeatPosition(measure, beatPos) {
         }
     }
     return null;
+}
+
+// clickXが前回の「素の」描画時の実測位置（stableNotePositions）上でどの要素（noteIndex）の
+// 担当範囲にあたるかを、要素同士の実際のアンカー位置（VexFlowが割り当てたtick位置）を
+// 境界にして探す。休符の描画グリフ自体は非常に細いことが多く、その次の要素が始まるまでの
+// 空白もその休符の担当範囲として扱わないと（グリフ自身のbboxだけで判定すると）、休符の
+// 右側の空白をクリックしたときに対象が見つからなくなってしまう。
+// notePositions（毎回の描画で作り直される）ではなくstableNotePositionsを使うのは、
+// プレビュー中はその対象自身の実測位置が一時的に消えてしまい、次のホバー判定の材料に
+// できなくなるため（プレビューが乗っていない、素の状態のスナップショットだけを使う）
+function findMeasuredSegment(measureIndex, staff, clickX) {
+    const seen = new Set();
+    const entries = [];
+    const cached = stableNotePositions.get(`${measureIndex}:${staff}`) || [];
+    cached.forEach(pos => {
+        if (seen.has(pos.noteIndex)) return;
+        seen.add(pos.noteIndex);
+        entries.push({ noteIndex: pos.noteIndex, x: pos.x });
+    });
+    const range = measureNoteAreaRanges[measureIndex];
+    if (entries.length === 0 || !range) return null;
+    entries.sort((a, b) => a.noteIndex - b.noteIndex);
+    for (let i = 0; i < entries.length; i++) {
+        const segLeft = i === 0 ? range.left : entries[i].x;
+        const segRight = i === entries.length - 1 ? range.right : entries[i + 1].x;
+        if (clickX >= segLeft && clickX < segRight) {
+            return { noteIndex: entries[i].noteIndex, xLeft: segLeft, xRight: segRight };
+        }
+    }
+    return null;
+}
+
+// clickXがnotesArray内のどの要素（インデックス）の、どの拍位置にあたるかを求める。
+// 実測位置（findMeasuredSegment）が使える場合はそちらを優先し（音価混在時の精度のため）、
+// 無ければ拍数按分の近似（xToBeatPosition/findSegmentAtBeatPosition）にフォールバックする。
+// ホバープレビュー（computeHoverPreview）と実クリック（handleNoteEdit）で全く同じ結果に
+// なるよう、判定ロジックをこの1箇所に共通化している
+function resolveSegmentAndBeatPos(measureIndex, notesArray, staff, clickX) {
+    const measured = findMeasuredSegment(measureIndex, staff, clickX);
+    if (measured && measured.noteIndex < notesArray.length && measured.xRight > measured.xLeft) {
+        let cursor = 0;
+        for (let i = 0; i < measured.noteIndex; i++) cursor += noteBeats(notesArray[i]);
+        const segBeats = noteBeats(notesArray[measured.noteIndex]);
+        const frac = Math.max(0, Math.min(1, (clickX - measured.xLeft) / (measured.xRight - measured.xLeft)));
+        return { segment: { index: measured.noteIndex, segStart: cursor, segBeats }, beatPos: cursor + frac * segBeats };
+    }
+    const beatPos = xToBeatPosition(measureIndex, clickX);
+    return { segment: findSegmentAtBeatPosition(notesArray, beatPos), beatPos };
 }
 
 // 休符（1つ分）を、選択中の音価のスロット単位で分割する位置を計算する。
@@ -2095,22 +2231,101 @@ function computeSplitForSegment(segStart, segBeats, hoverBeatPos, wantedBeats) {
     return { leadingBeats, trailingBeats };
 }
 
-// ホバー中に「クリックしたら実際にどうなるか」を計算する。
-// 小節は常に音符/休符で埋まっている前提なので、対象は必ずxToBeatPosition/findSegmentAtBeatPositionで
-// measure.notesから直接特定する（notePositionsは前回描画のスナップショットで、プレビュー自体が
-// 対象を差し替えて描画することがあるため、次のクリック判定の材料としては使わない）。
-// 戻り値: { type: "splitNote"|"splitRest"|"chordAdd"|"overwriteWithRest", ... } または null
-function computeHoverPreview(measureIndex, measure) {
+// 休符を選択中の音価のスロット単位で分割する際、スロット候補が複数ある場合は、それぞれを
+// 実際にVexFlowで仮フォーマットしてみて、結果の音符の位置（getAbsoluteX）がclickXに
+// 一番近い候補を選ぶ。VexFlowは休符→音符のように内容が変わると必要な幅も変わり、拍数に
+// 単純比例した幅配分にはならないため、拍数按分の近似（computeSplitForSegment）だけでは
+// 実際の見た目と大きくズレることがある（特に音価の異なる要素が混在する小節で顕著）。
+// measureNoteAreaRangesが無い（未描画）場合はcomputeSplitForSegmentにフォールバックする
+function pickBestSlotByTrialFormat(measureIndex, notesArray, segment, wantedBeats, clickX, isRestMode) {
+    const nSlots = Math.floor(segment.segBeats / wantedBeats + BEAT_EPSILON);
+    if (nSlots <= 1) {
+        return nSlots < 1 ? null : { leadingBeats: 0, trailingBeats: segment.segBeats - wantedBeats };
+    }
+
+    const range = measureNoteAreaRanges[measureIndex];
+    if (!range || scale <= 0) {
+        return computeSplitForSegment(segment.segStart, segment.segBeats, xToBeatPosition(measureIndex, clickX), wantedBeats);
+    }
+
+    const rawLeft = range.left / scale;
+    const rawRight = range.right / scale;
+    const trialStave = new VF.Stave(rawLeft, 0, rawRight - rawLeft);
+    trialStave.setNoteStartX(rawLeft);
+    const formatWidth = trialStave.getNoteEndX() - trialStave.getNoteStartX() - MEASURE_END_PADDING;
+
+    const [tsNum, tsDen] = score.timeSignature.split("/").map(Number);
+    const buildTrialNote = (n) => {
+        if (n.rest) {
+            const rn = new VF.StaveNote({ keys: ["b/4"], duration: n.duration + "r", ...(n.dotted ? { dots: 1 } : {}) });
+            if (n.dotted) VF.Dot.buildAndAttach([rn], { all: true });
+            return rn;
+        }
+        const sn = new VF.StaveNote({ keys: n.pitches.map(p => pitchToKey(p).key), duration: n.duration, auto_stem: true, ...(n.dotted ? { dots: 1 } : {}) });
+        if (n.dotted) VF.Dot.buildAndAttach([sn], { all: true });
+        return sn;
+    };
+
+    let bestSlot = 0, bestDist = Infinity;
+    for (let slotIndex = 0; slotIndex < nSlots; slotIndex++) {
+        const leadingBeats = slotIndex * wantedBeats;
+        const trailingBeats = segment.segBeats - leadingBeats - wantedBeats;
+        const centerEntry = isRestMode
+            ? { rest: true, duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}) }
+            : { pitches: ["B4"], duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}) };
+        const leading = beatsToRests(leadingBeats);
+        const trailing = beatsToRests(trailingBeats);
+        const trialData = [...notesArray];
+        trialData.splice(segment.index, 1, ...leading, centerEntry, ...trailing);
+        const centerIdx = segment.index + leading.length;
+
+        try {
+            const trialNotes = trialData.map(buildTrialNote);
+            trialNotes.forEach(n => n.setStave(trialStave));
+            const totalBeats = trialData.reduce((s, n) => s + noteBeats(n), 0);
+            const remainingBeats = getBeatsPerMeasure() - totalBeats;
+            const dummies = makeDummyNotes(Math.max(0, remainingBeats));
+            dummies.forEach(n => n.setStave(trialStave));
+            const allNotes = [...trialNotes, ...dummies];
+
+            const voice = new VF.Voice({ num_beats: tsNum, beat_value: tsDen });
+            voice.setStrict(false);
+            voice.addTickables(allNotes);
+            new VF.Formatter().joinVoices([voice]).format([voice], formatWidth);
+
+            const candidateX = trialNotes[centerIdx].getAbsoluteX() * scale;
+            const dist = Math.abs(candidateX - clickX);
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestSlot = slotIndex;
+            }
+        } catch (e) {
+            // このスロット候補の仮フォーマットに失敗した場合はスキップする
+        }
+    }
+    const leadingBeats = bestSlot * wantedBeats;
+    return { leadingBeats, trailingBeats: segment.segBeats - leadingBeats - wantedBeats };
+}
+
+// ホバー中に「クリックしたら実際にどうなるか」を計算する。notesArrayは対象の段
+// （measure.upperNotes/lowerNotes）の音符列で、staffはその段のタグ（"upper"|"lower"）。
+// hoveredPos.staffが一致する場合のみプレビューを返す（別の段をホバー中は何も返さない）。
+// 対象の要素（音符/休符）自体は必ずnotesArrayから直接特定する（notePositionsは前回描画の
+// スナップショットで、プレビュー自体が対象を差し替えて描画することがあるため、要素の中身の
+// 判定材料としては使わない）。ただし「clickXがどの要素の上にあるか」というジオメトリ判定だけは、
+// 音価が混在する小節ではxToBeatPositionの拍数按分近似が実際の見た目と大きくズレるため、
+// 前回描画の実測位置（findMeasuredSegment）が使える場合はそちらを優先する
+function computeHoverPreview(measureIndex, notesArray, staff) {
     if (editMode !== "note") return null;
     if (!hoveredPos || hoveredPos.measureIndex !== measureIndex || !hoveredPos.pitch) return null;
+    if (hoveredPos.staff !== staff) return null;
 
     const invert = k => (k === "note" ? "rest" : "note");
     const effectiveKind = isCtrlHeldForRestPreview ? invert(selectedKind) : selectedKind;
 
-    const beatPos = xToBeatPosition(measureIndex, hoveredPos.x);
-    const segment = findSegmentAtBeatPosition(measure, beatPos);
+    const { segment } = resolveSegmentAndBeatPos(measureIndex, notesArray, staff, hoveredPos.x);
     if (!segment) return null;
-    const target = measure.notes[segment.index];
+    const target = notesArray[segment.index];
 
     if (!target.rest) {
         // 既存音符：休符モードならその音符を丸ごと休符で上書き、音符モードなら和音への音追加
@@ -2123,15 +2338,15 @@ function computeHoverPreview(measureIndex, measure) {
             };
         }
         if (!target.pitches) return null;
-        if (target.pitches.includes(hoveredPos.pitch) || target.pitches.length >= 3) return null;
-        return { type: "chordAdd", existingNoteIndex: segment.index, pitch: hoveredPos.pitch, isUpper: hoveredPos.isUpper };
+        if (target.pitches.includes(hoveredPos.pitch) || target.pitches.length >= getChordMax()) return null;
+        return { type: "chordAdd", existingNoteIndex: segment.index, pitch: hoveredPos.pitch };
     }
 
     // 休符：選択中の音価のスロット単位で分割して新規に置く
     const wantedBeats = selectedNoteBeats();
     if (wantedBeats <= 0) return null;
 
-    const split = computeSplitForSegment(segment.segStart, segment.segBeats, beatPos, wantedBeats);
+    const split = pickBestSlotByTrialFormat(measureIndex, notesArray, segment, wantedBeats, hoveredPos.x, effectiveKind === "rest");
     if (!split) return null;
 
     return {
@@ -2140,7 +2355,6 @@ function computeHoverPreview(measureIndex, measure) {
         leadingBeats: split.leadingBeats,
         trailingBeats: split.trailingBeats,
         pitch: effectiveKind === "rest" ? null : hoveredPos.pitch,
-        isUpper: hoveredPos.isUpper,
     };
 }
 
@@ -2218,7 +2432,8 @@ function handleNoteEdit(e, svg, rowDiv) {
                 .sort((a, b) => Math.abs(a.y - clickY) - Math.abs(b.y - clickY))[0] || null;
 
             if (shiftHit) {
-                const note = measure.notes[shiftHit.noteIndex];
+                const shiftNotes = shiftHit.staff === "upper" ? measure.upperNotes : measure.lowerNotes;
+                const note = shiftNotes[shiftHit.noteIndex];
                 const pitch = note.pitches[shiftHit.pitchIndex];
                 const match = pitch.match(/^([A-G])([#b]?)(-?\d+)$/);
                 if (match) {
@@ -2252,15 +2467,20 @@ function handleNoteEdit(e, svg, rowDiv) {
 
             if (!isValidX) return;
 
-            const beatPos = xToBeatPosition(measureIndex, clickX);
-            const segment = findSegmentAtBeatPosition(measure, beatPos);
+            // どちらの段（上段/下段）を編集するかは、クリックした位置だけで決まる
+            const staff = staffForClick(clickYLocal);
+            const targetArray = staff === "upper" ? measure.upperNotes : measure.lowerNotes;
+
+            // ホバープレビューと全く同じ判定にするため、実測位置（findMeasuredSegment）が
+            // 使える場合はそちらを優先する（computeHoverPreviewと同じロジック）
+            const { segment } = resolveSegmentAndBeatPos(measureIndex, targetArray, staff, clickX);
             if (!segment) return;
-            const target = measure.notes[segment.index];
+            const target = targetArray[segment.index];
 
             if (!target.rest) {
                 if (effectiveKind === "rest") {
                     // 休符モードで既存音符の上に置くと、その音符を同じ長さの休符で上書きする
-                    measure.notes[segment.index] = {
+                    targetArray[segment.index] = {
                         rest: true,
                         duration: target.duration,
                         ...(target.dotted ? { dotted: true } : {})
@@ -2268,15 +2488,11 @@ function handleNoteEdit(e, svg, rowDiv) {
                     saveHistory();
                     renderScore();
                 } else {
-                    // 既存の和音への音追加。どちらの段に属するかはクリックした位置で決まる
+                    // 既存の和音への音追加（この段の音符自体に追加するだけ、他の段とは無関係）
                     const pitch = yToPitch(clickYLocal, false);
-                    if (pitch && !target.pitches.includes(pitch) && target.pitches.length < 3) {
+                    if (pitch && !target.pitches.includes(pitch) && target.pitches.length < getChordMax()) {
                         target.pitches.push(pitch);
                         target.pitches.sort((a, b) => pitchToSemitone(a) - pitchToSemitone(b));
-                        if (score.grandStaff) {
-                            if (!target.upperPitches) target.upperPitches = [];
-                            if (isUpperFrameForClick(clickYLocal)) target.upperPitches.push(pitch);
-                        }
                         saveHistory();
                         renderScore();
                     }
@@ -2286,7 +2502,7 @@ function handleNoteEdit(e, svg, rowDiv) {
                 const wantedBeats = selectedNoteBeats();
                 if (wantedBeats <= 0) return;
 
-                const split = computeSplitForSegment(segment.segStart, segment.segBeats, beatPos, wantedBeats);
+                const split = pickBestSlotByTrialFormat(measureIndex, targetArray, segment, wantedBeats, clickX, effectiveKind === "rest");
                 if (!split) return; // 選択中の音価がこの休符に収まらない
 
                 let centerEntry;
@@ -2295,11 +2511,7 @@ function handleNoteEdit(e, svg, rowDiv) {
                 } else {
                     const pitch = yToPitch(clickYLocal, false);
                     if (!pitch) return;
-                    // どちらの段に置くかはクリックした位置で決まる
-                    centerEntry = {
-                        pitches: [pitch], duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}),
-                        ...(score.grandStaff ? { upperPitches: isUpperFrameForClick(clickYLocal) ? [pitch] : [] } : {})
-                    };
+                    centerEntry = { pitches: [pitch], duration: selectedDuration, ...(dottedSelected ? { dotted: true } : {}) };
                 }
 
                 const replacement = [
@@ -2307,7 +2519,7 @@ function handleNoteEdit(e, svg, rowDiv) {
                     centerEntry,
                     ...beatsToRests(split.trailingBeats)
                 ];
-                measure.notes.splice(segment.index, 1, ...replacement);
+                targetArray.splice(segment.index, 1, ...replacement);
                 saveHistory();
                 renderScore();
             }
@@ -2317,11 +2529,12 @@ function handleNoteEdit(e, svg, rowDiv) {
         // 右クリック = 削除。小節は常に音符/休符で埋まっている前提なので、
         // 休符は削除できず（既に「空いている」状態のため）、単音は同じ長さの休符に置き換える
         if (hit) {
-            const note = measure.notes[hit.noteIndex];
+            const hitNotes = hit.staff === "upper" ? measure.upperNotes : measure.lowerNotes;
+            const note = hitNotes[hit.noteIndex];
             if (note.rest) {
                 // 何もしない
             } else if (note.pitches.length === 1) {
-                measure.notes[hit.noteIndex] = {
+                hitNotes[hit.noteIndex] = {
                     rest: true,
                     duration: note.duration,
                     ...(note.dotted ? { dotted: true } : {})
@@ -2370,12 +2583,12 @@ function setupSVGEvents() {
             }
 
             const pitch = yToPitch(e.clientY - rect.top, false);
-            const isUpper = isUpperFrameForClick(e.clientY - rect.top);
+            const staff = staffForClick(e.clientY - rect.top);
             const hitNote = findNoteAt(measureIndex, mouseX, mouseY);
             const hitNoteX = findNoteAtX(measureIndex, mouseX);
 
             const newHovered = pitch
-                ? { measureIndex, x: mouseX, y: mouseY, pitch, isUpper, hitNoteIndex: hitNote ? hitNote.noteIndex : (hitNoteX ? hitNoteX.noteIndex : null), directHit: !!hitNote }
+                ? { measureIndex, x: mouseX, y: mouseY, pitch, staff, hitNoteIndex: hitNote ? hitNote.noteIndex : (hitNoteX ? hitNoteX.noteIndex : null), directHit: !!hitNote }
                 : null;
 
             const changed = JSON.stringify(newHovered) !== JSON.stringify(hoveredPos);
@@ -2439,6 +2652,11 @@ function updateTimeSignatureButtons() {
 function updateKeySignatureUI() {
     const select = document.getElementById("keySignatureSelect");
     if (select) select.value = score.keySignature || "C";
+}
+
+function updateChordMaxUI() {
+    const select = document.getElementById("chordMaxSelect");
+    if (select) select.value = String(getChordMax());
 }
 
 function updateStaffLayoutButtons() {
@@ -2711,7 +2929,15 @@ async function main() {
 
     const response = await fetch("sample_score.json");
     const data = await response.json();
-    score = { timeSignature: data.timeSignature, keySignature: data.keySignature || "C", grandStaff: !!data.grandStaff, measures: data.measures };
+    const [tsNumSample, tsDenSample] = (data.timeSignature || "4/4").split("/").map(Number);
+    const beatsPerMeasureSample = tsNumSample * 4 / tsDenSample;
+    score = {
+        timeSignature: data.timeSignature,
+        keySignature: data.keySignature || "C",
+        grandStaff: !!data.grandStaff,
+        chordMax: data.chordMax || 3,
+        measures: migrateMeasuresToStaffArrays(data.measures, !!data.grandStaff, beatsPerMeasureSample)
+    };
 
     // サンプルJSONに表題・テンポ・コンパス・ズーム・マップ設定があれば復元する
     if (data.title != null) {
@@ -2821,6 +3047,16 @@ async function main() {
             renderScore();
         });
 
+    // 和音上限セレクトの初期状態を反映
+    updateChordMaxUI();
+
+    document.getElementById("chordMaxSelect")
+        .addEventListener("change", (e) => {
+            score.chordMax = parseInt(e.target.value, 10) || 3;
+            saveHistory();
+            renderScore();
+        });
+
     // 譜表レイアウト（1段／グランドスタッフ）切り替え
     updateStaffLayoutButtons();
     document.getElementById("staffLayoutSingle")
@@ -2836,16 +3072,8 @@ async function main() {
     document.getElementById("staffLayoutGrand")
         .addEventListener("click", () => {
             if (score.grandStaff) return;
-            // 1段から2段への変換時点では、既存の音符は音高によらず全て上段に集約する。
-            // 「その時点で存在したピッチ」だけをnote.upperPitchesに記録する（note単位のフラグに
-            // すると、後から同じ和音に追加した新しいピッチまで上段に固定されてしまうため、
-            // ピッチ単位で個別に記録する）。2段化した後にユーザーが新しく追加する音符・
-            // 和音への追加分は、クリックした位置（上段/下段）でそのつど決まる
-            score.measures.forEach(m => {
-                (m.notes || []).forEach(n => {
-                    if (!n.rest) n.upperPitches = [...n.pitches];
-                });
-            });
+            // 上段・下段は常にそれぞれ独立したデータとして存在しているため、
+            // 変換処理は不要。単純に下段を表示するだけでよい
             score.grandStaff = true;
             updateStaffLayoutButtons();
             saveHistory();
@@ -3115,7 +3343,15 @@ async function main() {
             reader.onload = (event) => {
                 try {
                     const data = JSON.parse(event.target.result);
-                    score = { timeSignature: data.timeSignature, keySignature: data.keySignature || "C", grandStaff: !!data.grandStaff, measures: data.measures };
+                    const [tsNumLoad, tsDenLoad] = (data.timeSignature || "4/4").split("/").map(Number);
+                    const beatsPerMeasureLoad = tsNumLoad * 4 / tsDenLoad;
+                    score = {
+                        timeSignature: data.timeSignature,
+                        keySignature: data.keySignature || "C",
+                        grandStaff: !!data.grandStaff,
+                        chordMax: data.chordMax || 3,
+                        measures: migrateMeasuresToStaffArrays(data.measures, !!data.grandStaff, beatsPerMeasureLoad)
+                    };
 
                     if (data.title != null) {
                         document.getElementById("scoreTitleInput").value = data.title;
@@ -3138,6 +3374,7 @@ async function main() {
                     }
                     updateTimeSignatureButtons();
                     updateKeySignatureUI();
+                    updateChordMaxUI();
                     updateStaffLayoutButtons();
 
                     history = [];
