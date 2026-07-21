@@ -662,9 +662,9 @@ function getBeatsPerMeasure() {
     return num * 4 / den;
 }
 
-// 和音として同時に鳴らせるピッチ数の上限（デフォルト3、UIで1〜11に変更可能）
+// 和音として同時に鳴らせるピッチ数の上限（固定11、UIでの変更は廃止済み）
 function getChordMax() {
-    return score.chordMax || 3;
+    return 11;
 }
 
 // 小節1つ分をまるごと休ませる休符（現在の拍子に合う音価）を1つ返す
@@ -783,6 +783,13 @@ function makeDummyNotes(remainingBeats) {
     return dummies;
 }
 
+// タブ（五線譜/マップ）ごとの表示切り替え対象ツールバー。
+// ここに無いツールバー（ファイル操作・再生/BPM/音量・ズーム）は両方のタブで常時表示する
+const SCORE_ONLY_TOOLBAR_IDS = [
+    "toolbarEditMode", "toolbarDuration", "toolbarClipboard", "toolbarKeySig", "toolbarTranspose"
+];
+const MAP_ONLY_TOOLBAR_IDS = ["toolbarCompass"];
+
 function applyTabVisibility() {
     const isScore = activeTab === "score";
     const isMap   = activeTab === "map";
@@ -790,16 +797,28 @@ function applyTabVisibility() {
     // 五線譜エリア
     document.getElementById("scoreWrapper").style.display = isScore ? "" : "none";
 
-    // パネルカウント（音符マット数・レール数・センサー数）は全タブで表示
-    document.getElementById("panelCount").style.display = "flex";
+    // パネルカウント（音符マット数・レール数・センサー数）はマップタブのみ表示
+    document.getElementById("panelCount").style.display = isMap ? "flex" : "none";
 
-    // マップエリア
-    const mapArea = document.getElementById("mapArea");
-    if (mapArea) mapArea.style.display = isMap ? "" : "none";
+    // マップエリア（リサイズハンドルも含むラッパーごと表示切替）
+    const mapAreaWrapper = document.getElementById("mapAreaWrapper");
+    if (mapAreaWrapper) mapAreaWrapper.style.display = isMap ? "" : "none";
 
     // マップ専用ツールバー
     const mapToolbar = document.getElementById("mapToolbar");
     if (mapToolbar) mapToolbar.style.display = isMap ? "flex" : "none";
+
+    // 五線譜タブのみで使うツールバー
+    SCORE_ONLY_TOOLBAR_IDS.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = isScore ? "flex" : "none";
+    });
+
+    // マップタブのみで使うツールバー
+    MAP_ONLY_TOOLBAR_IDS.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = isMap ? "flex" : "none";
+    });
 
     // ヘルプは五線譜タブのみ表示
     const info = document.getElementById("info");
@@ -832,19 +851,16 @@ let mapSettings = {
     railDirection: "vertical",   // "vertical" | "horizontal"
     startCorner: "top-left",     // "top-left" | "top-right" | "bottom-left" | "bottom-right"
     sideFirst: "left",           // "left" | "right" （どちら側のセンサーを先にするか）
-    wrapByCount: true,           // true=センサー数指定, false=マス数指定
-    wrapValue: 10,               // 折り返し値
-    turnLength: 6,               // 段と段の間（見た目上の空きマス数）。誤作動防止のため最小6
+    wrapValue: 10,               // 折り返し値（一列あたりのセンサー数。レール1マス=センサー1個のためマス数と同義）
     hideUnusedSensors: false,    // true=周りに音符マットがないセンサーを配置しない（カウントにも含めない）
 };
 
-// 段と段の間の見た目上の空きマス数（ユーザーが実際にグリッド上で数える空きマス数と
-// 一致させるため、レール同士の実際の間隔＝この値+1として扱う）。
-// センサーは「隣接（レールから1マス）」「遠め（レールから2マス）」の2種類があり、
-// 和音パネルはそこからさらに1マス外側まで伸びうる（最大でレールから3マス）ため、
-// 隣の段と衝突しない最小値（6）を下限とする。
+// 段と段の間隔は固定値（ユーザー調整UIは廃止済み）。レールを中心に-3〜+3（センサーの
+// 「隣接(1マス)」「遠め(2マス)」＋和音パネルがさらに1マス外側まで伸びうる分）で1セット
+// （7マス幅）となる。さらにその間に区切りの空きマスを1マス挟むため、レール同士の間隔は
+// 8マス必要（=空きマス7+レール1）
 function getTurnLength() {
-    return Math.max(6, Math.round(mapSettings.turnLength) || 6);
+    return 7;
 }
 
 // マップ設定をlocalStorageから復元
@@ -924,7 +940,7 @@ function calcPanelPositionsCore(pitches, forwardVec, awayVec) {
 }
 
 function updateMapToolbarUI() {
-    const { railDirection, startCorner, sideFirst, wrapByCount, wrapValue, turnLength, hideUnusedSensors } = mapSettings;
+    const { railDirection, startCorner, sideFirst, wrapValue, hideUnusedSensors } = mapSettings;
 
     const setActive = (id, active) => {
         const el = document.getElementById(id);
@@ -941,21 +957,16 @@ function updateMapToolbarUI() {
     setActive("mapCorner-bottom-right", startCorner === "bottom-right");
     setActive("mapSideLeft",  sideFirst === "left");
     setActive("mapSideRight", sideFirst === "right");
-    setActive("mapWrapByCount", wrapByCount);
-    setActive("mapWrapByMass",  !wrapByCount);
     setActive("mapHideUnusedSensors", hideUnusedSensors);
 
     const wrapInput = document.getElementById("mapWrapValue");
     if (wrapInput) wrapInput.value = wrapValue;
-
-    const turnLengthInput = document.getElementById("mapTurnLength");
-    if (turnLengthInput) turnLengthInput.value = turnLength;
 }
 
 // マップのグリッドデータ（レール・センサー・音符マットの配置）を計算する
 // DOM描画には依存しないので、描画不要なカウント表示（レール数・センサー数）からも呼べる
 function buildMapGrid() {
-    const { railDirection, startCorner, sideFirst, wrapByCount, wrapValue } = mapSettings;
+    const { railDirection, startCorner, sideFirst, wrapValue } = mapSettings;
     const turnLength = getTurnLength();
 
     // 全ビートを取得
@@ -988,6 +999,55 @@ function buildMapGrid() {
     const setCell = (x, y, z, data) => {
         grid.set(`${x},${y},${z}`, data);
     };
+
+    // 段と段の間の区切り用空きマスの座標（折り返し軸方向、isVerticalならX・そうでなければY）。
+    // レールの1セット（±3=7マス幅）同士の間に、getTurnLength()で決まる間隔のうち
+    // 実際に何も配置されない分（turnLength-6マス）だけ区切りとして扱う。
+    // レンダリング側（renderMap）でこの座標に該当するマスをグリッド線無しの背景色にする
+    const separatorCoords = new Set();
+    const gapSize = turnLength - 6;
+    if (gapSize > 0 && wrapSensors > 0) {
+        const maxColIdx = Math.ceil(totalBeats / wrapSensors) - 1;
+        for (let colIdx = 0; colIdx < maxColIdx; colIdx++) {
+            const base = wrapSign * colIdx * (turnLength + 1);
+            for (let g = 0; g < gapSize; g++) {
+                separatorCoords.add(base + wrapSign * (4 + g));
+            }
+        }
+    }
+
+    // 表示範囲（bounding box）は、実際に配置されたセルだけでなく「未使用センサー非表示」設定に
+    // 関わらず常に同じ位置を占めるセンサーのマス目も含めて計算する。そうしないと、非表示にした
+    // ことで範囲の端にあったセンサーが無くなり、bounding boxが縮んで原点がズレ、レール自体の
+    // 論理座標は変わっていないのに描画位置（見た目の位置）だけがズレて見えてしまう
+    let extentMinX = Infinity, extentMaxX = -Infinity, extentMinY = Infinity, extentMaxY = -Infinity;
+    const markExtent = (x, y) => {
+        extentMinX = Math.min(extentMinX, x);
+        extentMaxX = Math.max(extentMaxX, x);
+        extentMinY = Math.min(extentMinY, y);
+        extentMaxY = Math.max(extentMaxY, y);
+    };
+
+    // 各段（レール1本分）の理論上の最大フットプリント（レール中心から折り返し軸方向に±3）を
+    // 事前にbounding boxへ含めておく。実際にどちら側のセンサー/パネルが使われるかは
+    // sideFirst（隣接/遠めの左右どちらが先か）や曲の総拍数（最後の段が4マス周期の途中で
+    // 終わるかどうか）によって変わるため、実際に配置されたセルだけを見てbounding boxを
+    // 決めると、sideFirstを切り替えただけで範囲が微妙に変わり、レールの論理座標は同じなのに
+    // 描画位置だけズレて見えるバグになる
+    if (wrapSensors > 0) {
+        const maxColIdxInclusive = Math.ceil(totalBeats / wrapSensors) - 1;
+        for (let colIdx = 0; colIdx <= maxColIdxInclusive; colIdx++) {
+            const bandWrapOffset = wrapSign * colIdx * (turnLength + 1);
+            const travelEnd = travelSign * (wrapSensors - 1);
+            [0, travelEnd].forEach(tp => {
+                [-3, 3].forEach(lateral => {
+                    const bx = isVertical ? bandWrapOffset + lateral : tp;
+                    const by = isVertical ? tp : bandWrapOffset + lateral;
+                    markExtent(bx, by);
+                });
+            });
+        }
+    }
 
     for (let beatIdx = 0; beatIdx < totalBeats; beatIdx++) {
         const beat = beats[beatIdx];
@@ -1023,10 +1083,14 @@ function buildMapGrid() {
                 direction: railDirection,
                 railStep: beatIdx * 3 + posInTriplet,
             });
+            markExtent(rx, ry);
         });
 
         // このビートに音符マットが伴うか（音符の先頭スロットのみ）
         const hasPanel = beat.isFirst && beat.note && !beat.note.rest && beat.note.pitches;
+
+        // センサーの位置は「未使用センサー非表示」設定に関わらず常にbounding boxに含める
+        markExtent(sX, sY);
 
         // センサーセル（中間層）。周りに音符マットがないセンサーを隠す設定の場合はスキップする
         if (!mapSettings.hideUnusedSensors || hasPanel) {
@@ -1054,11 +1118,111 @@ function buildMapGrid() {
                     pitch,
                     direction: northDirection,
                 });
+                markExtent(px, py);
             });
         }
     }
 
-    return { grid, totalBeats };
+    const extent = extentMinX === Infinity
+        ? null
+        : { minX: extentMinX, maxX: extentMaxX, minY: extentMinY, maxY: extentMaxY };
+
+    return { grid, totalBeats, extent, separatorCoords, isVertical };
+}
+
+// マップグリッドの右端・下端・角の3箇所のハンドルをドラッグして、グリッド自体のマス数
+// （マス数/センサー数＝mapSettings.wrapValue）を変更できるようにする。段の間隔は
+// レール中心から-3〜+3の固定幅（getTurnLength()）で決まるため調整不要。
+// 実際に調整できる値はwrapValue1つだけだが、レールの向きに関わらずどの端からでも
+// 直感的に操作できるよう、右端（左右ドラッグ）・下端（上下ドラッグ）・角（斜めドラッグ、
+// 縦横どちらか大きく動いた方を採用）の3つのハンドルを常に用意し、どれもwrapValueを操作する。
+// 一定ピクセル動かすごとに1段階、mapSettingsを更新してrenderMap()し直す（ドラッグ中は
+// 実際に変化があったときだけ再描画し、細かすぎるピクセル移動では再描画しない）。
+// ハンドルは#mapAreaの外（兄弟要素）に置いているため、renderMap()のinnerHTML書き換えの
+// 影響を受けず、位置はrepositionMapResizeHandle()で毎回のrenderMap()後に追従させる
+const MAP_RESIZE_PX_PER_STEP = 18;
+
+// getDelta(dx, dy)で、そのハンドルが実際に使う移動量（px）を1つ返す
+function attachMapResizeHandle(handleId, getDelta) {
+    const handle = document.getElementById(handleId);
+    if (!handle) return;
+
+    let dragging = false;
+    let startX = 0, startY = 0;
+    let baseWrapValue = 0;
+    let appliedDelta = 0;
+
+    handle.addEventListener("mousedown", (e) => {
+        dragging = true;
+        startX = e.clientX;
+        startY = e.clientY;
+        baseWrapValue = mapSettings.wrapValue;
+        appliedDelta = 0;
+        e.preventDefault();
+    });
+
+    document.addEventListener("mousemove", (e) => {
+        if (!dragging) return;
+        const px = getDelta(e.clientX - startX, e.clientY - startY);
+        const delta = Math.round(px / MAP_RESIZE_PX_PER_STEP);
+        if (delta === appliedDelta) return;
+        appliedDelta = delta;
+        mapSettings.wrapValue = Math.max(1, baseWrapValue + delta);
+        updateMapToolbarUI();
+        renderMap();
+    });
+
+    document.addEventListener("mouseup", () => {
+        if (dragging) {
+            dragging = false;
+            saveMapSettings();
+        }
+    });
+}
+
+// wrapValueが見た目の幅(X)・高さ(Y)どちらに直接効くかはrailDirectionで決まる
+// （進行軸=wrapValueに比例して直接伸びる／折り返し軸=段数(totalBeats/wrapValue)が
+// 減ることで逆に縮む）。右ハンドルは常に「幅を伸ばす」、下ハンドルは常に
+// 「高さを伸ばす」という見た目の直感に合わせるため、wrapValueが効く軸が
+// ハンドルの意図する軸と逆（折り返し軸）の場合は、ドラッグ量の符号を反転させる
+function setupMapResizeHandle() {
+    const widthIsDirectAxis = () => mapSettings.railDirection === "horizontal";
+    const heightIsDirectAxis = () => mapSettings.railDirection === "vertical";
+
+    attachMapResizeHandle("mapResizeHandleRight", (dx) => (widthIsDirectAxis() ? dx : -dx));
+    attachMapResizeHandle("mapResizeHandleBottom", (dx, dy) => (heightIsDirectAxis() ? dy : -dy));
+    // 角は縦横どちらか絶対値の大きい方を採用し、その軸の符号ルールをそのまま使う
+    attachMapResizeHandle("mapResizeHandleCorner", (dx, dy) => {
+        if (Math.abs(dx) >= Math.abs(dy)) return widthIsDirectAxis() ? dx : -dx;
+        return heightIsDirectAxis() ? dy : -dy;
+    });
+}
+
+// グリッドの実際の右端・下端・角にそれぞれのハンドルを追従させる
+function repositionMapResizeHandle(gridDiv) {
+    const wrapper = document.getElementById("mapAreaWrapper");
+    const right = document.getElementById("mapResizeHandleRight");
+    const bottom = document.getElementById("mapResizeHandleBottom");
+    const corner = document.getElementById("mapResizeHandleCorner");
+    if (!wrapper || !gridDiv || !right || !bottom || !corner) return;
+    const gridRect = gridDiv.getBoundingClientRect();
+    const wrapperRect = wrapper.getBoundingClientRect();
+    const gLeft = gridRect.left - wrapperRect.left;
+    const gRight = gridRect.right - wrapperRect.left;
+    const gTop = gridRect.top - wrapperRect.top;
+    const gBottom = gridRect.bottom - wrapperRect.top;
+
+    // 右端・下端のハンドルは、エリアのどこをドラッグしても反応するよう帯全体を当たり判定にする
+    right.style.left = `${gRight - right.offsetWidth}px`;
+    right.style.top = `${gTop}px`;
+    right.style.height = `${gBottom - gTop}px`;
+
+    bottom.style.left = `${gLeft}px`;
+    bottom.style.top = `${gBottom - bottom.offsetHeight}px`;
+    bottom.style.width = `${gRight - gLeft}px`;
+
+    corner.style.left = `${gRight - corner.offsetWidth}px`;
+    corner.style.top = `${gBottom - corner.offsetHeight}px`;
 }
 
 function renderMap() {
@@ -1069,27 +1233,32 @@ function renderMap() {
     const cellSize = Math.round(42 * scale * 0.5);
     const imageSize = cellSize;
 
-    const { grid } = buildMapGrid();
+    const { grid, extent, separatorCoords, isVertical } = buildMapGrid();
 
-    // グリッドの範囲を計算
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    grid.forEach((_, key) => {
-        const [x, y] = key.split(",").map(Number);
-        minX = Math.min(minX, x);
-        maxX = Math.max(maxX, x);
-        minY = Math.min(minY, y);
-        maxY = Math.max(maxY, y);
-    });
-
-    if (minX === Infinity) {
+    if (!extent) {
         mapArea.innerHTML = "<p style='color:#aaa;padding:16px;'>音符がありません</p>";
+        ["mapResizeHandleRight", "mapResizeHandleBottom", "mapResizeHandleCorner"].forEach((id) => {
+            const handle = document.getElementById(id);
+            if (handle) handle.style.display = "none";
+        });
         updateCountsBar();
         return;
     }
 
-    // 端のセルが枠に密着して見えないよう、表示範囲の周囲に1マス分の余白を持たせる
-    minX -= 1; maxX += 1;
-    minY -= 1; maxY += 1;
+    // グリッドの範囲は、実際に配置されたセルではなく（「未使用センサー非表示」設定の有無で
+    // 変わらない）extentを使う。これにより、この設定を切り替えてもレールの描画位置がズレない
+    let { minX, maxX, minY, maxY } = extent;
+
+    // 端のセルが枠に密着して見えないよう、表示範囲の周囲に1マス分の余白を持たせる。
+    // ただし折り返し軸方向（isVerticalならX、そうでなければY）は、既にbuildMapGrid側で
+    // レール中心から±3の理論上の最大フットプリントを常に含めているため、そちらに
+    // さらに1マス足すと「±3に収まらない不要な余白の列/行」が生まれてしまう。
+    // 進行軸方向（実際のビート数ぶんの実測範囲そのまま）にだけ余白を追加する
+    if (isVertical) {
+        minY -= 1; maxY += 1;
+    } else {
+        minX -= 1; maxX += 1;
+    }
 
     const gridW = maxX - minX + 1;
     const gridH = maxY - minY + 1;
@@ -1097,16 +1266,23 @@ function renderMap() {
     // 層の概念は廃止（グリッドは1つだけ）
     const z = 0;
 
+    // グリッド線はcontainerのgapではなく、セル1つ1つが右端・下端の罫線を自分で持つ方式にする
+    // （段の区切りマスだけ罫線を消して背景になじませたいが、gap方式だと特定セルだけ線を
+    // 消すことができない＝ネガティブマージンで隙間を塗りつぶす方式を試したところ見た目が
+    // ボコついてしまったため、この罫線持ち回し方式に変更した）
     const gridDiv = document.createElement("div");
     gridDiv.style.cssText = `
         display: grid;
         grid-template-columns: repeat(${gridW}, ${cellSize}px);
         grid-template-rows: repeat(${gridH}, ${cellSize}px);
-        gap: 1px;
-        background: #e0e0e0;
-        border: 1px solid #e0e0e0;
+        background: #fff;
+        border-top: 1px solid #e0e0e0;
+        border-left: 1px solid #e0e0e0;
         width: fit-content;
     `;
+
+    // 折り返し軸方向の座標が区切りマスかどうか
+    const isSepCoord = (c) => separatorCoords.has(c);
 
     for (let gy = 0; gy < gridH; gy++) {
         for (let gx = 0; gx < gridW; gx++) {
@@ -1115,11 +1291,29 @@ function renderMap() {
             const key = `${ax},${ay},${z}`;
             const data = grid.get(key);
 
+            const ownWrapCoord = isVertical ? ax : ay;
+            const isSeparator = isSepCoord(ownWrapCoord);
+            // 区切りマスは、折り返し軸と同じ向きの罫線（内部を細切れに見せてしまう側）だけを消す。
+            // 折り返し軸と垂直な向きの罫線（区切りの手前・奥どちらの境界か）は区切りかどうかに
+            // 関わらず常に描く。これにより区切り自体は内部の線が無い1本の帯として見えつつ、
+            // 前後どちらの本物のコンテンツ行/列との境界線も消えずに残る
+            const skipRightBorder = isVertical ? false : isSeparator;
+            const skipBottomBorder = isVertical ? isSeparator : false;
+
             const cell = document.createElement("div");
-            cell.style.cssText = `
+            cell.style.cssText = isSeparator ? `
                 width: ${cellSize}px;
                 height: ${cellSize}px;
                 background: #fff;
+                border-right: ${skipRightBorder ? "none" : "1px solid #e0e0e0"};
+                border-bottom: ${skipBottomBorder ? "none" : "1px solid #e0e0e0"};
+                box-sizing: border-box;
+            ` : `
+                width: ${cellSize}px;
+                height: ${cellSize}px;
+                background: #fff;
+                border-right: ${skipRightBorder ? "none" : "1px solid #e0e0e0"};
+                border-bottom: ${skipBottomBorder ? "none" : "1px solid #e0e0e0"};
                 display: flex;
                 align-items: center;
                 justify-content: center;
@@ -1129,7 +1323,7 @@ function renderMap() {
                 overflow: hidden;
             `;
 
-            if (data) {
+            if (!isSeparator && data) {
                 if (data.type === "rail") {
                     cell.style.background = "#555";
                     // 向きに応じた線を描画（将来画像に置き換え予定）
@@ -1181,6 +1375,11 @@ function renderMap() {
     }
 
     mapArea.appendChild(gridDiv);
+    ["mapResizeHandleRight", "mapResizeHandleBottom", "mapResizeHandleCorner"].forEach((id) => {
+        const handle = document.getElementById(id);
+        if (handle) handle.style.display = "";
+    });
+    repositionMapResizeHandle(gridDiv);
     updateCountsBar();
 
     // 再生中/一時停止中にグリッドが再構築された場合、現在位置のハイライトを再適用する
@@ -1318,10 +1517,7 @@ function undo() {
     historyIndex--;
     score = JSON.parse(history[historyIndex]);
     selectedMeasures.clear();
-    updateTimeSignatureButtons();
     updateKeySignatureUI();
-    updateChordMaxUI();
-    updateStaffLayoutButtons();
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
@@ -1334,10 +1530,7 @@ function redo() {
     historyIndex++;
     score = JSON.parse(history[historyIndex]);
     selectedMeasures.clear();
-    updateTimeSignatureButtons();
     updateKeySignatureUI();
-    updateChordMaxUI();
-    updateStaffLayoutButtons();
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
@@ -1346,7 +1539,12 @@ function redo() {
 }
 
 function getMeasuresPerRow() {
-    const wrapper = document.getElementById("scoreWrapper");
+    // #scoreWrapperはマップタブ表示中はdisplay:noneになりclientWidthが0になるため、
+    // 常に表示されている#main（タブ切替では中身の表示/非表示しか変えない）の幅を基準にする。
+    // これを使わないと、マップタブで再生開始した場合に1行1小節と誤って計算され、
+    // noteTimeMapのrowIndexが実際の行数と食い違い、五線譜タブに戻したときに再生位置の
+    // 縦線が描画されなくなるバグになる
+    const wrapper = document.getElementById("main");
     const availableWidth = wrapper.clientWidth - 40;
     const firstRowWidth = FIRST_MEASURE_EXTRA + STAVE_WIDTH_BASE;
     if (availableWidth < firstRowWidth * scale) return 1;
@@ -1958,6 +2156,12 @@ function renderScore() {
     setupSVGEvents();
     drawSelectionRect();
     window.scrollTo(0, scrollY);
+
+    // 再生中/一時停止中にタブ切り替えなどでスコアが再構築された場合、
+    // 現在位置のハイライト（枠線）を再適用する（マップ側のrenderMap()と同じパターン）
+    if (playState !== "stopped" && currentHighlightMeasure >= 0) {
+        highlightMeasure(currentHighlightMeasure);
+    }
 }
 
 // 選択中（確定 + ドラッグ中の暫定）の小節にDIVオーバーレイでハイライトを重ねる
@@ -2617,6 +2821,9 @@ function updateEditModeButtons() {
     selectBtn.style.color = editMode === "select" ? "#222" : "#aaa";
     noteBtn.style.background = editMode === "note" ? "#f0f0f0" : "";
     selectBtn.style.background = editMode === "select" ? "#f0f0f0" : "";
+    // コピー/切り取り/貼り付けは選択モードでの小節選択が前提のため、
+    // 音符モードでは操作できないことが分かるようグレーアウトする
+    updateClipboardButtons();
 }
 
 // 音価ボタン（音符/休符アイコン・付点版含む）の選択状態を反映する
@@ -2635,42 +2842,52 @@ function updateDurationButtons() {
     });
 }
 
-function updateTimeSignatureButtons() {
-    const ts = score.timeSignature || "4/4";
-    const btn44 = document.getElementById("timeSig44");
-    const btn34 = document.getElementById("timeSig34");
-    if (btn44) {
-        btn44.style.color = ts === "4/4" ? "#222" : "#aaa";
-        btn44.style.background = ts === "4/4" ? "#f0f0f0" : "";
-    }
-    if (btn34) {
-        btn34.style.color = ts === "3/4" ? "#222" : "#aaa";
-        btn34.style.background = ts === "3/4" ? "#f0f0f0" : "";
-    }
-}
-
 function updateKeySignatureUI() {
     const select = document.getElementById("keySignatureSelect");
     if (select) select.value = score.keySignature || "C";
 }
 
-function updateChordMaxUI() {
-    const select = document.getElementById("chordMaxSelect");
-    if (select) select.value = String(getChordMax());
+// 新規作成ダイアログで選択中（まだscoreには反映していない）拍子・譜表。
+// 完了ボタンを押すまでscoreは一切変更しないので、キャンセル時は何もせず閉じるだけでよい
+let newScorePendingTimeSig = "4/4";
+let newScorePendingGrandStaff = false;
+
+function updateNewScoreModalButtons() {
+    const ts44 = document.getElementById("newScoreTimeSig44");
+    const ts34 = document.getElementById("newScoreTimeSig34");
+    if (ts44) {
+        ts44.style.color = newScorePendingTimeSig === "4/4" ? "#222" : "#aaa";
+        ts44.style.background = newScorePendingTimeSig === "4/4" ? "#f0f0f0" : "";
+    }
+    if (ts34) {
+        ts34.style.color = newScorePendingTimeSig === "3/4" ? "#222" : "#aaa";
+        ts34.style.background = newScorePendingTimeSig === "3/4" ? "#f0f0f0" : "";
+    }
+
+    const single = document.getElementById("newScoreStaffSingle");
+    const grand = document.getElementById("newScoreStaffGrand");
+    if (single) {
+        single.style.color = !newScorePendingGrandStaff ? "#222" : "#aaa";
+        single.style.background = !newScorePendingGrandStaff ? "#f0f0f0" : "";
+    }
+    if (grand) {
+        grand.style.color = newScorePendingGrandStaff ? "#222" : "#aaa";
+        grand.style.background = newScorePendingGrandStaff ? "#f0f0f0" : "";
+    }
 }
 
-function updateStaffLayoutButtons() {
-    const isGrand = !!score.grandStaff;
-    const btnSingle = document.getElementById("staffLayoutSingle");
-    const btnGrand = document.getElementById("staffLayoutGrand");
-    if (btnSingle) {
-        btnSingle.style.color = !isGrand ? "#222" : "#aaa";
-        btnSingle.style.background = !isGrand ? "#f0f0f0" : "";
-    }
-    if (btnGrand) {
-        btnGrand.style.color = isGrand ? "#222" : "#aaa";
-        btnGrand.style.background = isGrand ? "#f0f0f0" : "";
-    }
+function openNewScoreModal() {
+    // ダイアログを開く時点の現在の設定を初期値にする
+    newScorePendingTimeSig = score.timeSignature || "4/4";
+    newScorePendingGrandStaff = !!score.grandStaff;
+    updateNewScoreModalButtons();
+    const overlay = document.getElementById("newScoreModalOverlay");
+    if (overlay) overlay.style.display = "flex";
+}
+
+function closeNewScoreModal() {
+    const overlay = document.getElementById("newScoreModalOverlay");
+    if (overlay) overlay.style.display = "none";
 }
 
 function setEditMode(mode) {
@@ -2897,11 +3114,25 @@ function pasteSelectedMeasures() {
     rescheduleFromCurrentPosition();
 }
 
+// コピー/切り取り/貼り付けは、選択モードで小節を選択している状態が前提の操作のため、
+// 音符モードでは（貼り付け先/対象が無いため実際にも無効な）グレーアウト表示にする
 function updateClipboardButtons() {
+    const copyBtn = document.getElementById("copyBtn");
+    const cutBtn = document.getElementById("cutBtn");
     const pasteBtn = document.getElementById("pasteBtn");
+    const canUseClipboardOps = editMode === "select";
+    if (copyBtn) {
+        copyBtn.style.opacity = canUseClipboardOps ? "1" : "0.4";
+        copyBtn.disabled = !canUseClipboardOps;
+    }
+    if (cutBtn) {
+        cutBtn.style.opacity = canUseClipboardOps ? "1" : "0.4";
+        cutBtn.disabled = !canUseClipboardOps;
+    }
     if (pasteBtn) {
-        pasteBtn.style.opacity = clipboardMeasures.length > 0 ? "1" : "0.4";
-        pasteBtn.disabled = clipboardMeasures.length === 0;
+        const canPaste = canUseClipboardOps && clipboardMeasures.length > 0;
+        pasteBtn.style.opacity = canPaste ? "1" : "0.4";
+        pasteBtn.disabled = !canPaste;
     }
 }
 
@@ -2935,7 +3166,6 @@ async function main() {
         timeSignature: data.timeSignature,
         keySignature: data.keySignature || "C",
         grandStaff: !!data.grandStaff,
-        chordMax: data.chordMax || 3,
         measures: migrateMeasuresToStaffArrays(data.measures, !!data.grandStaff, beatsPerMeasureSample)
     };
 
@@ -2979,6 +3209,7 @@ async function main() {
     // localStorageに保存されたタブが「五線譜」以外の場合、そのタブの中身も初期描画する
     if (activeTab === "map") renderMap();
     setupGlobalEvents(); // document/wrapperイベントは一度だけ登録
+    setupMapResizeHandle();
 
     // モード切替ボタンの初期状態を反映
     updateEditModeButtons();
@@ -3017,26 +3248,6 @@ async function main() {
         }
     });
 
-    // 拍子切り替えボタンの初期状態を反映
-    updateTimeSignatureButtons();
-
-    document.getElementById("timeSig44")
-        .addEventListener("click", () => {
-            if (score.timeSignature === "4/4") return;
-            score.timeSignature = "4/4";
-            updateTimeSignatureButtons();
-            saveHistory();
-            renderScore();
-        });
-    document.getElementById("timeSig34")
-        .addEventListener("click", () => {
-            if (score.timeSignature === "3/4") return;
-            score.timeSignature = "3/4";
-            updateTimeSignatureButtons();
-            saveHistory();
-            renderScore();
-        });
-
     // 調号セレクトの初期状態を反映
     updateKeySignatureUI();
 
@@ -3045,41 +3256,6 @@ async function main() {
             score.keySignature = e.target.value;
             saveHistory();
             renderScore();
-        });
-
-    // 和音上限セレクトの初期状態を反映
-    updateChordMaxUI();
-
-    document.getElementById("chordMaxSelect")
-        .addEventListener("change", (e) => {
-            score.chordMax = parseInt(e.target.value, 10) || 3;
-            saveHistory();
-            renderScore();
-        });
-
-    // 譜表レイアウト（1段／グランドスタッフ）切り替え
-    updateStaffLayoutButtons();
-    document.getElementById("staffLayoutSingle")
-        .addEventListener("click", () => {
-            if (!score.grandStaff) return;
-            score.grandStaff = false;
-            updateStaffLayoutButtons();
-            saveHistory();
-            renderScore();
-            setupDeleteButtons();
-            setupInsertButtons();
-        });
-    document.getElementById("staffLayoutGrand")
-        .addEventListener("click", () => {
-            if (score.grandStaff) return;
-            // 上段・下段は常にそれぞれ独立したデータとして存在しているため、
-            // 変換処理は不要。単純に下段を表示するだけでよい
-            score.grandStaff = true;
-            updateStaffLayoutButtons();
-            saveHistory();
-            renderScore();
-            setupDeleteButtons();
-            setupInsertButtons();
         });
 
     document.getElementById("transposeUp")
@@ -3133,15 +3309,6 @@ async function main() {
         mapSettings.sideFirst = "right";
         saveMapSettings(); updateMapToolbarUI(); renderMap();
     });
-    document.getElementById("mapWrapByCount")?.addEventListener("click", () => {
-        // レール1マスにつきセンサー1個のため、センサー数とマス数は同じ値でよい
-        mapSettings.wrapByCount = true;
-        saveMapSettings(); updateMapToolbarUI(); renderMap();
-    });
-    document.getElementById("mapWrapByMass")?.addEventListener("click", () => {
-        mapSettings.wrapByCount = false;
-        saveMapSettings(); updateMapToolbarUI(); renderMap();
-    });
     document.getElementById("mapWrapValue")?.addEventListener("change", e => {
         mapSettings.wrapValue = Math.max(1, parseInt(e.target.value) || 1);
         saveMapSettings(); renderMap();
@@ -3157,10 +3324,6 @@ async function main() {
         const el = document.getElementById("mapWrapValue");
         if (el) el.value = mapSettings.wrapValue;
         saveMapSettings(); renderMap();
-    });
-    document.getElementById("mapTurnLength")?.addEventListener("change", e => {
-        mapSettings.turnLength = Math.max(6, parseInt(e.target.value) || 6);
-        saveMapSettings(); updateMapToolbarUI(); renderMap();
     });
     document.getElementById("mapHideUnusedSensors")?.addEventListener("click", () => {
         mapSettings.hideUnusedSensors = !mapSettings.hideUnusedSensors;
@@ -3263,9 +3426,37 @@ async function main() {
             if (activeTab === "map") renderMap();
         });
 
-    document.getElementById("clearBtn")
+    document.getElementById("newScoreBtn")
+        .addEventListener("click", () => openNewScoreModal());
+
+    document.getElementById("newScoreTimeSig44")
         .addEventListener("click", () => {
-            if (!confirm("全クリアしますか？")) return;
+            newScorePendingTimeSig = "4/4";
+            updateNewScoreModalButtons();
+        });
+    document.getElementById("newScoreTimeSig34")
+        .addEventListener("click", () => {
+            newScorePendingTimeSig = "3/4";
+            updateNewScoreModalButtons();
+        });
+    document.getElementById("newScoreStaffSingle")
+        .addEventListener("click", () => {
+            newScorePendingGrandStaff = false;
+            updateNewScoreModalButtons();
+        });
+    document.getElementById("newScoreStaffGrand")
+        .addEventListener("click", () => {
+            newScorePendingGrandStaff = true;
+            updateNewScoreModalButtons();
+        });
+
+    document.getElementById("newScoreCancelBtn")
+        .addEventListener("click", () => closeNewScoreModal());
+
+    document.getElementById("newScoreConfirmBtn")
+        .addEventListener("click", () => {
+            score.timeSignature = newScorePendingTimeSig;
+            score.grandStaff = newScorePendingGrandStaff;
             score.measures = [makeEmptyMeasure()];
             document.getElementById("scoreTitleInput").value = "NewScore";
             selectedMeasures.clear();
@@ -3273,6 +3464,8 @@ async function main() {
             renderScore();
             setupDeleteButtons();
             setupInsertButtons();
+            if (activeTab === "map") renderMap();
+            closeNewScoreModal();
         });
 
     document.getElementById("undoBtn")
@@ -3349,7 +3542,6 @@ async function main() {
                         timeSignature: data.timeSignature,
                         keySignature: data.keySignature || "C",
                         grandStaff: !!data.grandStaff,
-                        chordMax: data.chordMax || 3,
                         measures: migrateMeasuresToStaffArrays(data.measures, !!data.grandStaff, beatsPerMeasureLoad)
                     };
 
@@ -3372,10 +3564,7 @@ async function main() {
                         saveMapSettings();
                         updateMapToolbarUI();
                     }
-                    updateTimeSignatureButtons();
                     updateKeySignatureUI();
-                    updateChordMaxUI();
-                    updateStaffLayoutButtons();
 
                     history = [];
                     historyIndex = -1;

@@ -26,10 +26,10 @@
         header {
             background: #111;
             color: #fff;
-            padding: 16px 24px;
+            padding: 8px 20px;
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 8px;
         }
 
         #stickyHeader {
@@ -41,29 +41,37 @@
         }
 
         #stickyHeader .sticky-toolbars-inner {
-            padding: 24px 24px 0 24px;
+            padding: 8px 16px 0 16px;
+        }
+
+        .tab-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 6px;
         }
 
         header h1 {
-            font-size: 18px;
+            font-size: 13px;
             font-weight: 600;
             letter-spacing: 0.05em;
         }
 
         header i {
-            font-size: 20px;
+            font-size: 14px;
             color: #aaa;
         }
 
         #main {
-            padding: 24px;
+            padding: 8px 16px;
         }
 
         #toolbars {
             display: flex;
             align-items: center;
-            gap: 8px;
-            margin-bottom: 20px;
+            gap: 6px;
+            margin-bottom: 10px;
             flex-wrap: wrap;
         }
 
@@ -73,8 +81,9 @@
             gap: 4px;
             background: #fff;
             border: 1px solid #ddd;
-            border-radius: 8px;
-            padding: 10px 16px;
+            border-radius: 6px;
+            padding: 6px 10px;
+            min-height: 46px;
         }
 
         .toolbar button, .toolbar label {
@@ -116,7 +125,49 @@
             border: 1px solid #ddd;
             border-radius: 8px;
             overflow: visible;
-            padding: 8px 0;
+            padding: 4px 0;
+        }
+
+        #mapAreaWrapper {
+            position: relative;
+        }
+
+        #mapArea {
+            background: #fff;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            width: fit-content;
+            padding: 4px;
+        }
+
+        .map-resize-handle {
+            position: absolute;
+            z-index: 10;
+        }
+
+        #mapResizeHandleRight {
+            width: 10px;
+            cursor: ew-resize;
+            background-image: linear-gradient(90deg, transparent 0 30%, #bbb 30% 40%, transparent 40% 60%, #bbb 60% 70%, transparent 70% 100%);
+            background-repeat: no-repeat;
+            background-position: center;
+            background-size: 10px 28px;
+        }
+
+        #mapResizeHandleBottom {
+            height: 10px;
+            cursor: ns-resize;
+            background-image: linear-gradient(0deg, transparent 0 30%, #bbb 30% 40%, transparent 40% 60%, #bbb 60% 70%, transparent 70% 100%);
+            background-repeat: no-repeat;
+            background-position: center;
+            background-size: 28px 10px;
+        }
+
+        #mapResizeHandleCorner {
+            width: 16px;
+            height: 16px;
+            cursor: nwse-resize;
+            background-image: linear-gradient(135deg, transparent 0 40%, #bbb 40% 46%, transparent 46% 60%, #bbb 60% 66%, transparent 66% 80%, #bbb 80% 86%, transparent 86%);
         }
 
         #score {
@@ -148,16 +199,15 @@
 
         .tab-container {
             display: flex;
-            gap: 4px;
-            margin-bottom: 12px;
+            gap: 2px;
         }
 
         .tab-btn {
             background: none;
             border: none;
             border-bottom: 2px solid transparent;
-            padding: 6px 16px;
-            font-size: 14px;
+            padding: 3px 10px;
+            font-size: 12px;
             color: #aaa;
             cursor: pointer;
             font-family: inherit;
@@ -221,12 +271,12 @@
         }
 
         #info {
-            margin-top: 32px;
+            margin-top: 16px;
             font-size: 12px;
             color: #aaa;
             line-height: 1.8;
             border-top: 1px solid #ddd;
-            padding-top: 16px;
+            padding-top: 12px;
         }
 
         #info span {
@@ -239,23 +289,89 @@
         }
 
         #scoreTitle {
-            margin-bottom: 8px;
+            margin-bottom: 6px;
         }
 
         #scoreTitleInput {
             border: none;
             border-bottom: 1px solid #ddd;
-            font-size: 16px;
+            font-size: 14px;
             color: #222;
             outline: none;
             background: transparent;
-            padding: 4px 0;
+            padding: 2px 0;
             width: 300px;
             user-select: text;
         }
 
         #scoreTitleInput:focus {
             border-bottom: 1px solid #222;
+        }
+
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.4);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .modal-box {
+            background: #fff;
+            border-radius: 10px;
+            padding: 20px 24px;
+            width: 320px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+        }
+
+        .modal-box h2 {
+            font-size: 15px;
+            font-weight: 600;
+            margin-bottom: 16px;
+        }
+
+        .modal-field {
+            margin-bottom: 14px;
+        }
+
+        .modal-field:last-of-type {
+            margin-bottom: 0;
+        }
+
+        .modal-label {
+            display: block;
+            font-size: 11px;
+            color: #aaa;
+            margin-bottom: 6px;
+        }
+
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            margin-top: 20px;
+        }
+
+        .modal-btn-primary, .modal-btn-secondary {
+            border-radius: 6px;
+            padding: 6px 16px;
+            font-size: 13px;
+            cursor: pointer;
+            font-family: inherit;
+        }
+
+        .modal-btn-primary {
+            background: #222;
+            color: #fff;
+            border: none;
+        }
+
+        .modal-btn-secondary {
+            background: none;
+            border: 1px solid #ddd;
+            color: #444;
         }
 
     </style>
@@ -269,20 +385,41 @@
     </header>
 
     <div class="sticky-toolbars-inner">
-        <div id="tabContainer" class="tab-container"></div>
+        <div class="tab-row">
+            <div id="tabContainer" class="tab-container"></div>
+            <div class="toolbar" id="toolbarPlayback">
+                <button id="playBtn" tabindex="-1" title="再生/一時停止"><i class="fa-solid fa-play"></i></button>
+                <button id="stopBtn" tabindex="-1" title="停止" style="opacity:0.4;" disabled><i class="fa-solid fa-stop"></i></button>
+                <button id="loopBtn" tabindex="-1" title="ループ再生"><i class="fa-solid fa-repeat" style="color:#ccc;"></i></button>
+                <input type="number" id="bpmInput" value="120" min="40" max="240" step="1" style="width:52px; border:none; border-bottom:1px solid #ddd; font-size:14px; text-align:center; background:transparent; outline:none;" title="BPM">
+                <span style="font-size:11px; color:#aaa;">BPM</span>
+                <i class="fa-solid fa-volume-high" style="font-size:14px; color:#aaa; margin-left:8px;"></i>
+                <input type="range" id="volumeSlider" min="0" max="1" step="0.01" value="0.8" title="音量" style="width:80px; accent-color:#222;">
+            </div>
+        </div>
         <div id="toolbars">
             <div class="toolbar">
+                <button id="newScoreBtn" tabindex="-1" title="新規作成"><i class="fa-solid fa-file"></i></button>
                 <label id="loadBtn" tabindex="-1" title="開く"><i class="fa-solid fa-folder-open"></i><input type="file" id="loadFile" accept=".json" style="display:none"></label>
                 <button id="saveBtn" tabindex="-1" title="保存"><i class="fa-solid fa-floppy-disk"></i></button>
-                <button id="clearBtn" tabindex="-1" title="全クリア"><i class="fa-solid fa-trash"></i></button>
                 <button id="undoBtn" tabindex="-1" title="アンドゥ"><i class="fa-solid fa-rotate-left"></i></button>
                 <button id="redoBtn" tabindex="-1" title="リドゥ"><i class="fa-solid fa-rotate-right"></i></button>
             </div>
-            <div class="toolbar">
+            <div class="toolbar" id="toolbarZoom">
+                <button id="zoomOut" tabindex="-1" title="縮小"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
+                <input type="range" id="zoomSlider" min="0.25" max="1.75" step="0.01" value="1">
+                <button id="zoomIn" tabindex="-1" title="拡大"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
+            </div>
+            <div class="toolbar" id="toolbarEditMode">
                 <button id="editModeNote" tabindex="-1" title="音符モード"><i class="fa-solid fa-pencil"></i></button>
                 <button id="editModeSelect" tabindex="-1" title="選択モード"><i class="fa-solid fa-arrow-pointer"></i></button>
             </div>
-            <div class="toolbar">
+            <div class="toolbar" id="toolbarClipboard">
+                <button id="copyBtn" tabindex="-1" title="コピー (Ctrl+C)"><i class="fa-solid fa-copy"></i></button>
+                <button id="cutBtn" tabindex="-1" title="切り取り (Ctrl+X)"><i class="fa-solid fa-scissors"></i></button>
+                <button id="pasteBtn" tabindex="-1" title="貼り付け (Ctrl+V)" style="opacity:0.4;" disabled><i class="fa-solid fa-paste"></i></button>
+            </div>
+            <div class="toolbar" id="toolbarDuration">
                 <button id="durNote16" class="text-btn" data-duration="16" data-kind="note" tabindex="-1" title="16分音符" style="font-size:28px;">𝅘𝅥𝅯</button>
                 <button id="durNote8" class="text-btn" data-duration="8" data-kind="note" tabindex="-1" title="8分音符" style="font-size:28px;">𝅘𝅥𝅮</button>
                 <button id="durNoteQ" class="text-btn" data-duration="q" data-kind="note" tabindex="-1" title="4分音符" style="font-size:28px;">𝅘𝅥</button>
@@ -305,22 +442,7 @@
                 <button id="durRestHDot" class="text-btn" data-duration="h" data-kind="rest" data-dotted="true" tabindex="-1" title="付点2分休符" style="font-size:28px;">𝄼.</button>
                 <button id="durRestWDot" class="text-btn" data-duration="w" data-kind="rest" data-dotted="true" tabindex="-1" title="付点全休符" style="font-size:28px;">𝄻.</button>
             </div>
-            <div class="toolbar">
-                <button id="copyBtn" tabindex="-1" title="コピー (Ctrl+C)"><i class="fa-solid fa-copy"></i></button>
-                <button id="cutBtn" tabindex="-1" title="切り取り (Ctrl+X)"><i class="fa-solid fa-scissors"></i></button>
-                <button id="pasteBtn" tabindex="-1" title="貼り付け (Ctrl+V)" style="opacity:0.4;" disabled><i class="fa-solid fa-paste"></i></button>
-            </div>
-            <div class="toolbar">
-                <span style="font-size:11px;color:#aaa;">拍子</span>
-                <button id="timeSig44" class="text-btn" tabindex="-1" title="4/4拍子">4/4</button>
-                <button id="timeSig34" class="text-btn" tabindex="-1" title="3/4拍子（ワルツ）">3/4</button>
-            </div>
-            <div class="toolbar">
-                <span style="font-size:11px;color:#aaa;">譜表</span>
-                <button id="staffLayoutSingle" class="text-btn" tabindex="-1" title="1段（単一譜表）">1段</button>
-                <button id="staffLayoutGrand" class="text-btn" tabindex="-1" title="グランドスタッフ（2段）">2段</button>
-            </div>
-            <div class="toolbar">
+            <div class="toolbar" id="toolbarKeySig">
                 <span style="font-size:11px;color:#aaa;">調号</span>
                 <select id="keySignatureSelect" tabindex="-1" style="font-size:13px;border:none;background:transparent;outline:none;">
                     <option value="C">ハ長調</option>
@@ -340,49 +462,19 @@
                     <option value="Cb">変ハ長調</option>
                 </select>
             </div>
-            <div class="toolbar">
-                <span style="font-size:11px;color:#aaa;">和音上限</span>
-                <select id="chordMaxSelect" tabindex="-1" style="font-size:13px;border:none;background:transparent;outline:none;">
-                    <option value="1">1</option>
-                    <option value="2">2</option>
-                    <option value="3">3</option>
-                    <option value="4">4</option>
-                    <option value="5">5</option>
-                    <option value="6">6</option>
-                    <option value="7">7</option>
-                    <option value="8">8</option>
-                    <option value="9">9</option>
-                    <option value="10">10</option>
-                    <option value="11">11</option>
-                </select>
-            </div>
-            <div class="toolbar">
+            <div class="toolbar" id="toolbarTranspose">
                 <span style="font-size:11px;color:#aaa;">移調</span>
                 <button id="transposeDown" tabindex="-1" title="半音下げる">▼</button>
                 <button id="transposeUp" tabindex="-1" title="半音上げる">▲</button>
             </div>
-            <div class="toolbar">
-                <button id="playBtn" tabindex="-1" title="再生/一時停止"><i class="fa-solid fa-play"></i></button>
-                <button id="stopBtn" tabindex="-1" title="停止" style="opacity:0.4;" disabled><i class="fa-solid fa-stop"></i></button>
-                <button id="loopBtn" tabindex="-1" title="ループ再生"><i class="fa-solid fa-repeat" style="color:#ccc;"></i></button>
-                <input type="number" id="bpmInput" value="120" min="40" max="240" step="1" style="width:52px; border:none; border-bottom:1px solid #ddd; font-size:14px; text-align:center; background:transparent; outline:none;" title="BPM">
-                <span style="font-size:11px; color:#aaa;">BPM</span>
-                <i class="fa-solid fa-volume-high" style="font-size:14px; color:#aaa; margin-left:8px;"></i>
-                <input type="range" id="volumeSlider" min="0" max="1" step="0.01" value="0.8" title="音量" style="width:80px; accent-color:#222;">
-            </div>
-            <div class="toolbar">
-                <button id="zoomOut" tabindex="-1" title="縮小"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
-                <input type="range" id="zoomSlider" min="0.25" max="1.75" step="0.01" value="1">
-                <button id="zoomIn" tabindex="-1" title="拡大"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
-            </div>
-            <div class="toolbar">
+            <div class="toolbar" id="toolbarCompass">
                 <button id="compassBtn" tabindex="-1" title="北の向きを変える">
                     <i class="fa-solid fa-compass"></i>
                     <span id="compassLabel" style="font-size:10px; margin-left:2px;">N↑</span>
                 </button>
             </div>
             <div id="panelCount" class="toolbar" style="display:none; flex-wrap:wrap;"></div>
-            <div id="mapToolbar" style="display:none; margin-top:12px; flex-wrap:wrap; gap:8px; align-items:center;">
+            <div id="mapToolbar" style="display:none; flex-wrap:wrap; gap:6px; align-items:center;">
                 <div class="toolbar">
                     <span style="font-size:11px;color:#aaa;">レール方向</span>
                     <button id="mapRailVertical" class="text-btn" tabindex="-1" title="縦向き">縦</button>
@@ -401,15 +493,10 @@
                     <button id="mapSideRight" class="text-btn" tabindex="-1" title="右先行">右</button>
                 </div>
                 <div class="toolbar">
-                    <button id="mapWrapByCount" class="text-btn" tabindex="-1" title="センサー数で折り返し">センサー数</button>
-                    <button id="mapWrapByMass" class="text-btn" tabindex="-1" title="マス数で折り返し">マス数</button>
+                    <span style="font-size:11px;color:#aaa;">一列の最大センサー数</span>
                     <button id="mapWrapDown" tabindex="-1">▼</button>
                     <input type="number" id="mapWrapValue" value="10" min="1" style="width:44px;border:none;border-bottom:1px solid #ddd;font-size:14px;text-align:center;background:transparent;outline:none;">
                     <button id="mapWrapUp" tabindex="-1">▲</button>
-                </div>
-                <div class="toolbar">
-                    <span style="font-size:11px;color:#aaa;">段の間隔</span>
-                    <input type="number" id="mapTurnLength" value="6" min="6" style="width:44px;border:none;border-bottom:1px solid #ddd;font-size:14px;text-align:center;background:transparent;outline:none;">
                 </div>
                 <div class="toolbar">
                     <button id="mapHideUnusedSensors" class="text-btn" tabindex="-1" title="周りに音符マットがないセンサーを非表示にする（カウントにも含めない）">未使用センサー非表示</button>
@@ -429,7 +516,12 @@
         <button id="addMeasureBtn"><i class="fa-solid fa-circle-plus"></i></button>
     </div>
 
-    <div id="mapArea" style="display:none; margin-top:24px;"></div>
+    <div id="mapAreaWrapper" style="display:none; margin-top:12px;">
+        <div id="mapArea"></div>
+        <div id="mapResizeHandleRight" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
+        <div id="mapResizeHandleBottom" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
+        <div id="mapResizeHandleCorner" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
+    </div>
 
     <div id="info">
         <span><i class="fa-solid fa-arrow-pointer"></i> 左クリック</span> 音符追加（ツールバーで選んだ音価） &nbsp;
@@ -439,6 +531,30 @@
         <span><i class="fa-solid fa-keyboard"></i> Ctrl + 左クリック</span> 休符追加（ツールバーで選んだ音価）
     </div>
 
+</div>
+
+<div id="newScoreModalOverlay" class="modal-overlay" style="display:none;">
+    <div class="modal-box">
+        <h2>新規作成</h2>
+        <div class="modal-field">
+            <span class="modal-label">拍子</span>
+            <div class="toolbar">
+                <button id="newScoreTimeSig44" class="text-btn" tabindex="-1" title="4/4拍子">4/4</button>
+                <button id="newScoreTimeSig34" class="text-btn" tabindex="-1" title="3/4拍子（ワルツ）">3/4</button>
+            </div>
+        </div>
+        <div class="modal-field">
+            <span class="modal-label">譜表</span>
+            <div class="toolbar">
+                <button id="newScoreStaffSingle" class="text-btn" tabindex="-1" title="1段（単一譜表）">1段</button>
+                <button id="newScoreStaffGrand" class="text-btn" tabindex="-1" title="グランドスタッフ（2段）">2段</button>
+            </div>
+        </div>
+        <div class="modal-actions">
+            <button id="newScoreCancelBtn" class="modal-btn-secondary" tabindex="-1">キャンセル</button>
+            <button id="newScoreConfirmBtn" class="modal-btn-primary" tabindex="-1">完了</button>
+        </div>
+    </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/vexflow@5.0.0/build/cjs/vexflow.js"></script>
