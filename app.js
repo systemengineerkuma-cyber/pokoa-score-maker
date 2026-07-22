@@ -60,8 +60,8 @@ let isCtrlHeldForRestPreview = false;
 
 // タブ定義（将来タブを追加する場合はここに追記する）
 const TABS = [
-    { id: "score",  label: "五線譜" },
-    { id: "map",    label: "マップ" },
+    { id: "score",  label: "五線譜", icon: "fa-music" },
+    { id: "map",    label: "マップ", icon: "fa-map" },
 ];
 let activeTab = localStorage.getItem("activeTab") || "score";
 // 廃止済みタブ（例: 旧パネル楽譜タブ）がlocalStorageに残っていた場合のフォールバック
@@ -188,7 +188,13 @@ function playScore() {
     lowerNoteBoundarySchedule = [];
     activeSourceNodes = [];
 
-    scheduleMeasuresFrom(0, { noteIndex: 0, time: playStartTime }, { noteIndex: 0, time: playStartTime }, 0, null);
+    // 選択モードで小節が選択されていれば、その先頭の小節から再生する（無ければ従来通り曲頭から）。
+    // マップのセンサー番号（beatIndex）は曲頭からの絶対番号なので、開始小節分のビート数を
+    // オフセットとして渡し、途中から再生してもセンサーのハイライトがずれないようにする
+    const startMeasureIndex = selectedMeasures.size > 0 ? Math.min(...selectedMeasures) : 0;
+    const beatIndexOffset = startMeasureIndex * getBeatsPerMeasure() * 4;
+
+    scheduleMeasuresFrom(startMeasureIndex, { noteIndex: 0, time: playStartTime }, { noteIndex: 0, time: playStartTime }, beatIndexOffset, null);
 
     updatePlaybackButtons();
     trackPlayback();
@@ -470,6 +476,11 @@ function highlightMeasure(measureIndex) {
     });
 }
 
+// マップのセルに立体感を出すための共通グラデーション/影（フラットな単色より質感を出すため）
+const RAIL_GRADIENT_IDLE = "linear-gradient(135deg, #6b6b6b, #4a4a4a)";
+const RAIL_GRADIENT_ACTIVE = "linear-gradient(135deg, #6aa8ea, #3a7bc8)";
+const CELL_INSET_SHADOW = "inset 0 1px 1px rgba(255,255,255,0.15), inset 0 -1px 2px rgba(0,0,0,0.2)";
+
 // マップ上で現在再生中のセンサーを強調表示する（beatIndexは0始まり、-1で解除）
 function highlightMapSensor(beatIndex) {
     const beatNum = beatIndex + 1;
@@ -487,7 +498,7 @@ function highlightRailStep(railStep) {
     const rounded = railStep == null ? null : Math.round(railStep);
     document.querySelectorAll('#mapArea [data-cell-type="rail"]').forEach(cell => {
         const isActive = rounded !== null && parseInt(cell.dataset.railStep, 10) === rounded;
-        cell.style.background = isActive ? "#4a90e2" : "#555";
+        cell.style.background = isActive ? RAIL_GRADIENT_ACTIVE : RAIL_GRADIENT_IDLE;
     });
 }
 
@@ -844,6 +855,16 @@ function switchTab(tabId) {
     } else if (activeTab === "map") {
         renderMap();
     }
+    playTabSwitchAnimation();
+}
+
+// タブ切替時、新しく表示された中身をふわっとフェードイン（+わずかに下からスライド）させる
+function playTabSwitchAnimation() {
+    const main = document.getElementById("main");
+    if (!main) return;
+    main.classList.remove("tab-content-fade");
+    void main.offsetWidth; // reflowを強制してアニメーションを最初からやり直させる
+    main.classList.add("tab-content-fade");
 }
 
 // マップ設定
@@ -851,7 +872,7 @@ let mapSettings = {
     railDirection: "vertical",   // "vertical" | "horizontal"
     startCorner: "top-left",     // "top-left" | "top-right" | "bottom-left" | "bottom-right"
     sideFirst: "left",           // "left" | "right" （どちら側のセンサーを先にするか）
-    wrapValue: 10,               // 折り返し値（一列あたりのセンサー数。レール1マス=センサー1個のためマス数と同義）
+    wrapValue: 50,               // 折り返し値（一列あたりのセンサー数。レール1マス=センサー1個のためマス数と同義）
     hideUnusedSensors: false,    // true=周りに音符マットがないセンサーを配置しない（カウントにも含めない）
 };
 
@@ -1180,6 +1201,163 @@ function attachMapResizeHandle(handleId, getDelta) {
     });
 }
 
+// 音符/休符グループ（#toolbarDuration）は、デフォルトでは#toolbars内の#toolbarTransposeの
+// 直後にドッキングされた通常のツールバーとして表示される。左端のグリップハンドルをドラッグすると
+// 切り離されてposition:fixedのフローティングパネルになり、画面上の任意の位置に配置できる。
+// フローティング中にツールバー領域付近までドラッグして離すと、再びドッキングされる。
+// 位置・ドッキング状態はセッション内でのみ保持し、ページ再読み込み（F5）のたびに
+// 必ず初期位置（ドッキング状態）へ戻す（永続化はあえてしない）
+const NOTE_TOOLBAR_UNDOCK_THRESHOLD_PX = 20;
+const NOTE_TOOLBAR_DOCK_ZONE_MARGIN_PX = 40;
+let noteToolbarDocked = true;
+
+function clampNoteToolbarPos(x, y) {
+    const el = document.getElementById("toolbarDuration");
+    const w = el.offsetWidth || 200;
+    const h = el.offsetHeight || 40;
+    const maxX = Math.max(0, window.innerWidth - w);
+    const maxY = Math.max(0, window.innerHeight - h);
+    return { x: Math.min(Math.max(0, x), maxX), y: Math.min(Math.max(0, y), maxY) };
+}
+
+function applyNoteToolbarPos(x, y) {
+    const el = document.getElementById("toolbarDuration");
+    if (!el) return;
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+}
+
+// #toolbarTransposeの直後に、透明なラッパー（#toolbarDurationRow、flex-basis:100%）で
+// 包んで戻す。ラッパー自身は次の行を単独で占有するが中身は自身のコンテンツ幅のままなので、
+// #toolbarDuration自体にflex-basis:100%を持たせる場合と違って余分な空白の箱ができない。
+// ラッパーはドッキング中だけ存在し、フローティング時は完全に取り除く（残っていると
+// 中身が空でも常に1行分を占有してしまい、後続要素との縦間隔がズレるため）
+function dockNoteToolbar() {
+    const el = document.getElementById("toolbarDuration");
+    const anchor = document.getElementById("toolbarTranspose");
+    if (!el || !anchor) return;
+    el.classList.remove("floating", "snapping");
+    el.style.left = "";
+    el.style.top = "";
+    let wrapper = document.getElementById("toolbarDurationRow");
+    if (!wrapper) {
+        wrapper = document.createElement("div");
+        wrapper.id = "toolbarDurationRow";
+        wrapper.style.cssText = "flex-basis:100%; display:flex;";
+    }
+    anchor.insertAdjacentElement("afterend", wrapper);
+    wrapper.appendChild(el);
+    noteToolbarDocked = true;
+}
+
+// ドッキング判定に使う領域（#toolbars）に十分近いかどうか
+function isNearNoteToolbarDockZone(rect) {
+    const toolbarsEl = document.getElementById("toolbars");
+    if (!toolbarsEl) return false;
+    const dockZone = toolbarsEl.getBoundingClientRect();
+    return rect.top < dockZone.bottom + NOTE_TOOLBAR_DOCK_ZONE_MARGIN_PX;
+}
+
+// ドッキングした場合に実際に収まる位置（#toolbarTransposeの直後・次の行の先頭）を概算する。
+// ドラッグ中にこの位置へ「吸い付いて」見せることで、離せばここにドッキングされることを予告する
+function computeNoteToolbarDockSnapPos() {
+    const toolbarsEl = document.getElementById("toolbars");
+    const anchor = document.getElementById("toolbarTranspose");
+    if (!toolbarsEl || !anchor) return null;
+    const toolbarsRect = toolbarsEl.getBoundingClientRect();
+    const anchorRect = anchor.getBoundingClientRect();
+    return { x: toolbarsRect.left, y: anchorRect.bottom + 4 };
+}
+
+// #toolbars内のフローから切り離し、body直下でposition:fixedのフローティングパネルにする
+function undockNoteToolbar(x, y) {
+    const el = document.getElementById("toolbarDuration");
+    if (!el) return;
+    document.body.appendChild(el);
+    const wrapper = document.getElementById("toolbarDurationRow");
+    if (wrapper) wrapper.remove();
+    el.classList.add("floating");
+    noteToolbarDocked = false;
+    const clamped = clampNoteToolbarPos(x, y);
+    applyNoteToolbarPos(clamped.x, clamped.y);
+}
+
+function setupNoteToolbarDrag() {
+    const el = document.getElementById("toolbarDuration");
+    const handle = document.getElementById("toolbarDurationHandle");
+    if (!el || !handle) return;
+
+    dockNoteToolbar(); // 常にドッキング状態から開始する
+
+    let dragging = false;
+    // このドラッグ操作で実際にフローティングパネルとして位置更新が行われたか
+    // （＝ドッキング中なら閾値を超えて切り離された後、フローティング中なら常にtrue）。
+    // falseのまま終わった場合は単なるクリック（ボタン誤反応防止のため何もしない）
+    let hasMoved = false;
+    let startX = 0, startY = 0, baseX = 0, baseY = 0;
+
+    handle.addEventListener("mousedown", (e) => {
+        dragging = true;
+        hasMoved = !noteToolbarDocked; // 既にフローティング中なら最初から追従対象
+        startX = e.clientX;
+        startY = e.clientY;
+        const rect = el.getBoundingClientRect();
+        baseX = rect.left;
+        baseY = rect.top;
+        e.preventDefault();
+    });
+
+    document.addEventListener("mousemove", (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+
+        if (!hasMoved) {
+            // ドッキング中は、単なるクリックと区別するため一定量動かすまでは何もしない。
+            // 閾値を超えた瞬間、現在の見た目位置を維持したまま切り離す（位置が飛ばないように）
+            if (Math.hypot(dx, dy) < NOTE_TOOLBAR_UNDOCK_THRESHOLD_PX) return;
+            const rect = el.getBoundingClientRect();
+            undockNoteToolbar(rect.left, rect.top);
+            baseX = rect.left;
+            baseY = rect.top;
+            hasMoved = true;
+        }
+
+        const { x, y } = clampNoteToolbarPos(baseX + dx, baseY + dy);
+        const freeRect = { top: y, left: x, bottom: y + (el.offsetHeight || 40) };
+        if (isNearNoteToolbarDockZone(freeRect)) {
+            // ドックゾーン内: 実際にドッキングした場合の位置へ吸い付かせ、予告の枠線を表示する
+            const snap = computeNoteToolbarDockSnapPos();
+            el.classList.add("snapping");
+            if (snap) applyNoteToolbarPos(snap.x, snap.y);
+            else applyNoteToolbarPos(x, y);
+        } else {
+            el.classList.remove("snapping");
+            applyNoteToolbarPos(x, y);
+        }
+    });
+
+    document.addEventListener("mouseup", () => {
+        if (!dragging) return;
+        dragging = false;
+        if (!hasMoved) return; // 閾値未満のまま終わった＝ただのクリック、何もしない
+
+        el.classList.remove("snapping");
+        const rect = el.getBoundingClientRect();
+        if (isNearNoteToolbarDockZone(rect)) {
+            dockNoteToolbar();
+        }
+    });
+
+    // ウィンドウリサイズで画面外にはみ出さないよう追従させる（フローティング時のみ）
+    window.addEventListener("resize", () => {
+        if (noteToolbarDocked) return;
+        const rect = el.getBoundingClientRect();
+        const { x, y } = clampNoteToolbarPos(rect.left, rect.top);
+        applyNoteToolbarPos(x, y);
+    });
+}
+
 // wrapValueが見た目の幅(X)・高さ(Y)どちらに直接効くかはrailDirectionで決まる
 // （進行軸=wrapValueに比例して直接伸びる／折り返し軸=段数(totalBeats/wrapValue)が
 // 減ることで逆に縮む）。右ハンドルは常に「幅を伸ばす」、下ハンドルは常に
@@ -1317,7 +1495,7 @@ function renderMap() {
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                font-size: ${Math.max(8, cellSize * 0.25)}px;
+                font-size: ${cellSize * 0.25}px;
                 color: #555;
                 box-sizing: border-box;
                 overflow: hidden;
@@ -1325,15 +1503,17 @@ function renderMap() {
 
             if (!isSeparator && data) {
                 if (data.type === "rail") {
-                    cell.style.background = "#555";
+                    cell.style.background = RAIL_GRADIENT_IDLE;
+                    cell.style.boxShadow = CELL_INSET_SHADOW;
                     // 向きに応じた線を描画（将来画像に置き換え予定）
                     const line = document.createElement("div");
                     const isVert = data.direction === "vertical";
                     line.style.cssText = `
                         width: ${isVert ? "30%" : "100%"};
                         height: ${isVert ? "100%" : "30%"};
-                        background: #888;
+                        background: #999;
                         border-radius: 2px;
+                        box-shadow: 0 1px 1px rgba(0,0,0,0.3);
                     `;
                     // data-direction属性で向きを保持（将来の画像置換用）
                     cell.dataset.direction = data.direction;
@@ -1341,7 +1521,8 @@ function renderMap() {
                     cell.dataset.railStep = data.railStep;
                     cell.appendChild(line);
                 } else if (data.type === "sensor") {
-                    cell.style.background = "#e05555";
+                    cell.style.background = "linear-gradient(135deg, #ea6b6b, #d03f3f)";
+                    cell.style.boxShadow = CELL_INSET_SHADOW;
                     cell.style.color = "#fff";
                     // data-direction属性で向きを保持（将来の画像置換用）
                     cell.dataset.direction = data.direction;
@@ -1353,6 +1534,8 @@ function renderMap() {
                 } else if (data.type === "panel") {
                     const file = PITCH_TO_FILE[toCanonicalPitch(data.pitch)];
                     if (file) {
+                        cell.style.background = "radial-gradient(circle, #fbfbfb, #e8e8e8)";
+                        cell.style.boxShadow = "inset 0 1px 2px rgba(0,0,0,0.12)";
                         const img = document.createElement("img");
                         img.src = `img/${file}`;
                         img.alt = data.pitch;
@@ -1360,6 +1543,7 @@ function renderMap() {
                             width: ${imageSize}px;
                             height: ${imageSize}px;
                             object-fit: contain;
+                            filter: drop-shadow(0 1px 1px rgba(0,0,0,0.25));
                         `;
                         // コンパス方向を反映（将来の画像置換用）
                         img.style.transform = `rotate(${northDirection * 90}deg)`;
@@ -2203,7 +2387,11 @@ function drawSelectionRect() {
             top: ${top}px;
             width: ${right - left}px;
             height: ${height}px;
-            background: rgba(74, 144, 226, 0.12);
+            background: rgba(74, 144, 226, 0.14);
+            border: 2px solid rgba(74, 144, 226, 0.55);
+            border-radius: 6px;
+            box-shadow: 0 0 0 3px rgba(74, 144, 226, 0.08);
+            box-sizing: border-box;
             pointer-events: none;
             z-index: 5;
         `;
@@ -3195,7 +3383,7 @@ async function main() {
         const btn = document.createElement("button");
         btn.id = `tab-${tab.id}`;
         btn.className = "tab-btn";
-        btn.textContent = tab.label;
+        btn.innerHTML = `<i class="fa-solid ${tab.icon}"></i><span>${tab.label}</span>`;
         btn.addEventListener("click", () => switchTab(tab.id));
         tabContainer.appendChild(btn);
     });
@@ -3210,6 +3398,7 @@ async function main() {
     if (activeTab === "map") renderMap();
     setupGlobalEvents(); // document/wrapperイベントは一度だけ登録
     setupMapResizeHandle();
+    setupNoteToolbarDrag();
 
     // モード切替ボタンの初期状態を反映
     updateEditModeButtons();

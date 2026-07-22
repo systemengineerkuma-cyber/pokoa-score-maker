@@ -26,7 +26,7 @@
         header {
             background: #111;
             color: #fff;
-            padding: 8px 20px;
+            padding: 5px 14px;
             display: flex;
             align-items: center;
             gap: 8px;
@@ -41,19 +41,19 @@
         }
 
         #stickyHeader .sticky-toolbars-inner {
-            padding: 8px 16px 0 16px;
+            padding: 5px 12px 0 12px;
         }
 
         .tab-row {
             display: flex;
             align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-            margin-bottom: 6px;
+            justify-content: flex-start;
+            gap: 10px;
+            margin-bottom: 4px;
         }
 
         header h1 {
-            font-size: 13px;
+            font-size: 16px;
             font-weight: 600;
             letter-spacing: 0.05em;
         }
@@ -64,26 +64,36 @@
         }
 
         #main {
-            padding: 8px 16px;
+            padding: 5px 12px;
+        }
+
+        /* タブ切替時、新しい中身をふわっとフェードイン（+わずかに下からスライド）させる */
+        @keyframes tabContentFadeIn {
+            from { opacity: 0; transform: translateY(6px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        #main.tab-content-fade {
+            animation: tabContentFadeIn 0.18s ease-out;
         }
 
         #toolbars {
             display: flex;
             align-items: center;
-            gap: 6px;
-            margin-bottom: 10px;
+            gap: 4px;
+            margin-bottom: 6px;
             flex-wrap: wrap;
         }
 
         .toolbar {
             display: flex;
             align-items: center;
-            gap: 4px;
+            gap: 3px;
             background: #fff;
             border: 1px solid #ddd;
             border-radius: 6px;
-            padding: 6px 10px;
-            min-height: 46px;
+            padding: 4px 8px;
+            min-height: 40px;
         }
 
         .toolbar button, .toolbar label {
@@ -92,26 +102,90 @@
             cursor: pointer;
             color: #444;
             font-size: 16px;
-            width: 32px;
-            height: 32px;
+            width: 30px;
+            height: 30px;
             border-radius: 6px;
             display: flex;
             align-items: center;
             justify-content: center;
-            transition: background 0.15s;
+            transition: background 0.15s, transform 0.1s, box-shadow 0.15s;
         }
 
         .toolbar button:hover, .toolbar label:hover {
             background: #f0f0f0;
+            transform: translateY(-1px);
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
         }
 
-        /* アイコン1文字用の固定32x32ではなく、文字ラベル用に幅・文字サイズを揃えたボタン */
+        .toolbar button:active, .toolbar label:active {
+            transform: translateY(0) scale(0.92);
+            background: #e6e6e6;
+            box-shadow: none;
+            transition: background 0.05s, transform 0.05s;
+        }
+
+        /* BPM・音量まわりを軽くグルーピングして視覚的にまとまりを持たせる */
+        .playback-chip {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            background: #f5f5f5;
+            border-radius: 14px;
+            padding: 3px 10px 3px 8px;
+        }
+
+        /* アイコン1文字用の固定サイズではなく、文字ラベル用に幅・文字サイズを揃えたボタン */
         .toolbar button.text-btn {
             width: auto;
-            min-width: 32px;
-            padding: 0 10px;
+            min-width: 30px;
+            padding: 0 8px;
             font-size: 12px;
             white-space: nowrap;
+        }
+
+        /* 音符/休符グループはデフォルトでツールバーにドッキングされているが、
+           グリップハンドルをドラッグして切り離す（フローティング化する）ことができる。
+           ドッキング中は#toolbarDurationRow（flex-basis:100%の透明なラッパー、幅だけ
+           次の行を占有し中身は自身のコンテンツ幅のまま）に包まれることで、余分な空白の
+           箱を作らずに常にツールバーの次の行から単独で始まるようにしている */
+        #toolbarDuration {
+            flex-wrap: wrap;
+        }
+
+        #toolbarDuration.floating {
+            position: fixed;
+            z-index: 90;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+            max-width: calc(100vw - 24px);
+        }
+
+        /* ツールバー付近までドラッグすると、離す前にドッキング後の位置へ吸い付いて見せる */
+        #toolbarDuration.floating.snapping {
+            transition: left 0.08s ease-out, top 0.08s ease-out;
+            outline: 3px solid #4a90e2;
+        }
+
+        .drag-handle {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 18px;
+            height: 30px;
+            color: #bbb;
+            cursor: grab;
+            font-size: 14px;
+        }
+
+        .drag-handle:active {
+            cursor: grabbing;
+        }
+
+        .dur-sep {
+            display: inline-block;
+            width: 1px;
+            height: 24px;
+            background: #ddd;
+            margin: 0 6px;
         }
 
         #zoomSlider {
@@ -199,29 +273,44 @@
 
         .tab-container {
             display: flex;
-            gap: 2px;
+            gap: 3px;
+            background: #e8e8e8;
+            padding: 3px;
+            border-radius: 9px;
         }
 
         .tab-btn {
+            display: flex;
+            align-items: center;
+            gap: 6px;
             background: none;
             border: none;
-            border-bottom: 2px solid transparent;
-            padding: 3px 10px;
+            border-radius: 7px;
+            padding: 5px 14px;
             font-size: 12px;
-            color: #aaa;
+            color: #999;
             cursor: pointer;
             font-family: inherit;
-            transition: color 0.15s, border-color 0.15s;
+            transition: background 0.15s, color 0.15s, box-shadow 0.15s;
+        }
+
+        .tab-btn i {
+            font-size: 11px;
         }
 
         .tab-btn:hover {
-            color: #222;
+            color: #333;
         }
 
         .tab-active {
-            color: #222;
-            border-bottom: 2px solid #222;
-            font-weight: 600;
+            background: #fff;
+            color: #111;
+            font-weight: 700;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+        }
+
+        .tab-active:hover {
+            color: #111;
         }
 
         .deleteMeasureBtn {
@@ -295,17 +384,27 @@
         #scoreTitleInput {
             border: none;
             border-bottom: 1px solid #ddd;
-            font-size: 14px;
+            font-size: 12px;
             color: #222;
             outline: none;
             background: transparent;
-            padding: 2px 0;
+            padding: 2px 0 2px 6px;
             width: 300px;
             user-select: text;
         }
 
         #scoreTitleInput:focus {
             border-bottom: 1px solid #222;
+        }
+
+        @keyframes modalOverlayFadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        @keyframes modalBoxScaleIn {
+            from { opacity: 0; transform: scale(0.94) translateY(8px); }
+            to { opacity: 1; transform: scale(1) translateY(0); }
         }
 
         .modal-overlay {
@@ -316,6 +415,7 @@
             align-items: center;
             justify-content: center;
             z-index: 1000;
+            animation: modalOverlayFadeIn 0.15s ease-out;
         }
 
         .modal-box {
@@ -324,6 +424,7 @@
             padding: 20px 24px;
             width: 320px;
             box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+            animation: modalBoxScaleIn 0.18s ease-out;
         }
 
         .modal-box h2 {
@@ -387,29 +488,34 @@
     <div class="sticky-toolbars-inner">
         <div class="tab-row">
             <div id="tabContainer" class="tab-container"></div>
-            <div class="toolbar" id="toolbarPlayback">
-                <button id="playBtn" tabindex="-1" title="再生/一時停止"><i class="fa-solid fa-play"></i></button>
-                <button id="stopBtn" tabindex="-1" title="停止" style="opacity:0.4;" disabled><i class="fa-solid fa-stop"></i></button>
-                <button id="loopBtn" tabindex="-1" title="ループ再生"><i class="fa-solid fa-repeat" style="color:#ccc;"></i></button>
-                <input type="number" id="bpmInput" value="120" min="40" max="240" step="1" style="width:52px; border:none; border-bottom:1px solid #ddd; font-size:14px; text-align:center; background:transparent; outline:none;" title="BPM">
-                <span style="font-size:11px; color:#aaa;">BPM</span>
-                <i class="fa-solid fa-volume-high" style="font-size:14px; color:#aaa; margin-left:8px;"></i>
-                <input type="range" id="volumeSlider" min="0" max="1" step="0.01" value="0.8" title="音量" style="width:80px; accent-color:#222;">
-            </div>
         </div>
         <div id="toolbars">
             <div class="toolbar">
                 <button id="newScoreBtn" tabindex="-1" title="新規作成"><i class="fa-solid fa-file"></i></button>
                 <label id="loadBtn" tabindex="-1" title="開く"><i class="fa-solid fa-folder-open"></i><input type="file" id="loadFile" accept=".json" style="display:none"></label>
                 <button id="saveBtn" tabindex="-1" title="保存"><i class="fa-solid fa-floppy-disk"></i></button>
-                <button id="undoBtn" tabindex="-1" title="アンドゥ"><i class="fa-solid fa-rotate-left"></i></button>
-                <button id="redoBtn" tabindex="-1" title="リドゥ"><i class="fa-solid fa-rotate-right"></i></button>
+                <button id="undoBtn" tabindex="-1" title="アンドゥ (Ctrl+Z)"><i class="fa-solid fa-rotate-left"></i></button>
+                <button id="redoBtn" tabindex="-1" title="リドゥ (Ctrl+Y)"><i class="fa-solid fa-rotate-right"></i></button>
             </div>
             <div class="toolbar" id="toolbarZoom">
                 <button id="zoomOut" tabindex="-1" title="縮小"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
                 <input type="range" id="zoomSlider" min="0.25" max="1.75" step="0.01" value="1">
                 <button id="zoomIn" tabindex="-1" title="拡大"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
             </div>
+            <div class="toolbar" id="toolbarPlayback">
+                <button id="playBtn" tabindex="-1" title="再生/一時停止"><i class="fa-solid fa-play"></i></button>
+                <button id="stopBtn" tabindex="-1" title="停止" style="opacity:0.4;" disabled><i class="fa-solid fa-stop"></i></button>
+                <button id="loopBtn" tabindex="-1" title="ループ再生"><i class="fa-solid fa-repeat" style="color:#ccc;"></i></button>
+                <span class="playback-chip">
+                    <input type="number" id="bpmInput" value="120" min="40" max="240" step="1" style="width:44px; border:none; font-size:14px; text-align:center; background:transparent; outline:none;" title="BPM">
+                    <span style="font-size:11px; color:#aaa;">BPM</span>
+                </span>
+                <span class="playback-chip">
+                    <i class="fa-solid fa-volume-high" style="font-size:14px; color:#aaa;"></i>
+                    <input type="range" id="volumeSlider" min="0" max="1" step="0.01" value="0.8" title="音量" style="width:80px; accent-color:#222;">
+                </span>
+            </div>
+            <div id="panelCount" class="toolbar" style="display:none; flex-wrap:wrap;"></div>
             <div class="toolbar" id="toolbarEditMode">
                 <button id="editModeNote" tabindex="-1" title="音符モード"><i class="fa-solid fa-pencil"></i></button>
                 <button id="editModeSelect" tabindex="-1" title="選択モード"><i class="fa-solid fa-arrow-pointer"></i></button>
@@ -418,29 +524,6 @@
                 <button id="copyBtn" tabindex="-1" title="コピー (Ctrl+C)"><i class="fa-solid fa-copy"></i></button>
                 <button id="cutBtn" tabindex="-1" title="切り取り (Ctrl+X)"><i class="fa-solid fa-scissors"></i></button>
                 <button id="pasteBtn" tabindex="-1" title="貼り付け (Ctrl+V)" style="opacity:0.4;" disabled><i class="fa-solid fa-paste"></i></button>
-            </div>
-            <div class="toolbar" id="toolbarDuration">
-                <button id="durNote16" class="text-btn" data-duration="16" data-kind="note" tabindex="-1" title="16分音符" style="font-size:28px;">𝅘𝅥𝅯</button>
-                <button id="durNote8" class="text-btn" data-duration="8" data-kind="note" tabindex="-1" title="8分音符" style="font-size:28px;">𝅘𝅥𝅮</button>
-                <button id="durNoteQ" class="text-btn" data-duration="q" data-kind="note" tabindex="-1" title="4分音符" style="font-size:28px;">𝅘𝅥</button>
-                <button id="durNoteH" class="text-btn" data-duration="h" data-kind="note" tabindex="-1" title="2分音符" style="font-size:28px;">𝅗𝅥</button>
-                <button id="durNoteW" class="text-btn" data-duration="w" data-kind="note" tabindex="-1" title="全音符" style="font-size:28px;">𝅝</button>
-                <span style="display:inline-block; width:1px; height:24px; background:#ddd; margin:0 6px;"></span>
-                <button id="durNote8Dot" class="text-btn" data-duration="8" data-kind="note" data-dotted="true" tabindex="-1" title="付点8分音符" style="font-size:28px;">𝅘𝅥𝅮.</button>
-                <button id="durNoteQDot" class="text-btn" data-duration="q" data-kind="note" data-dotted="true" tabindex="-1" title="付点4分音符" style="font-size:28px;">𝅘𝅥.</button>
-                <button id="durNoteHDot" class="text-btn" data-duration="h" data-kind="note" data-dotted="true" tabindex="-1" title="付点2分音符" style="font-size:28px;">𝅗𝅥.</button>
-                <button id="durNoteWDot" class="text-btn" data-duration="w" data-kind="note" data-dotted="true" tabindex="-1" title="付点全音符" style="font-size:28px;">𝅝.</button>
-                <span style="display:inline-block; width:1px; height:24px; background:#ddd; margin:0 6px;"></span>
-                <button id="durRest16" class="text-btn" data-duration="16" data-kind="rest" tabindex="-1" title="16分休符" style="font-size:28px;">𝄿</button>
-                <button id="durRest8" class="text-btn" data-duration="8" data-kind="rest" tabindex="-1" title="8分休符" style="font-size:28px;">𝄾</button>
-                <button id="durRestQ" class="text-btn" data-duration="q" data-kind="rest" tabindex="-1" title="4分休符" style="font-size:28px;">𝄽</button>
-                <button id="durRestH" class="text-btn" data-duration="h" data-kind="rest" tabindex="-1" title="2分休符" style="font-size:28px;">𝄼</button>
-                <button id="durRestW" class="text-btn" data-duration="w" data-kind="rest" tabindex="-1" title="全休符" style="font-size:28px;">𝄻</button>
-                <span style="display:inline-block; width:1px; height:24px; background:#ddd; margin:0 6px;"></span>
-                <button id="durRest8Dot" class="text-btn" data-duration="8" data-kind="rest" data-dotted="true" tabindex="-1" title="付点8分休符" style="font-size:28px;">𝄾.</button>
-                <button id="durRestQDot" class="text-btn" data-duration="q" data-kind="rest" data-dotted="true" tabindex="-1" title="付点4分休符" style="font-size:28px;">𝄽.</button>
-                <button id="durRestHDot" class="text-btn" data-duration="h" data-kind="rest" data-dotted="true" tabindex="-1" title="付点2分休符" style="font-size:28px;">𝄼.</button>
-                <button id="durRestWDot" class="text-btn" data-duration="w" data-kind="rest" data-dotted="true" tabindex="-1" title="付点全休符" style="font-size:28px;">𝄻.</button>
             </div>
             <div class="toolbar" id="toolbarKeySig">
                 <span style="font-size:11px;color:#aaa;">調号</span>
@@ -473,7 +556,6 @@
                     <span id="compassLabel" style="font-size:10px; margin-left:2px;">N↑</span>
                 </button>
             </div>
-            <div id="panelCount" class="toolbar" style="display:none; flex-wrap:wrap;"></div>
             <div id="mapToolbar" style="display:none; flex-wrap:wrap; gap:6px; align-items:center;">
                 <div class="toolbar">
                     <span style="font-size:11px;color:#aaa;">レール方向</span>
@@ -495,7 +577,7 @@
                 <div class="toolbar">
                     <span style="font-size:11px;color:#aaa;">一列の最大センサー数</span>
                     <button id="mapWrapDown" tabindex="-1">▼</button>
-                    <input type="number" id="mapWrapValue" value="10" min="1" style="width:44px;border:none;border-bottom:1px solid #ddd;font-size:14px;text-align:center;background:transparent;outline:none;">
+                    <input type="number" id="mapWrapValue" value="50" min="1" style="width:44px;border:none;border-bottom:1px solid #ddd;font-size:14px;text-align:center;background:transparent;outline:none;">
                     <button id="mapWrapUp" tabindex="-1">▲</button>
                 </div>
                 <div class="toolbar">
@@ -504,6 +586,29 @@
             </div>
         </div>
     </div>
+</div>
+
+<div class="toolbar" id="toolbarDuration">
+    <span id="toolbarDurationHandle" class="drag-handle" title="ドラッグして移動"><i class="fa-solid fa-grip-vertical"></i></span>
+    <button id="durNote16" class="text-btn" data-duration="16" data-kind="note" tabindex="-1" title="16分音符" style="font-size:28px;">𝅘𝅥𝅯</button>
+    <button id="durNote8" class="text-btn" data-duration="8" data-kind="note" tabindex="-1" title="8分音符" style="font-size:28px;">𝅘𝅥𝅮</button>
+    <button id="durNoteQ" class="text-btn" data-duration="q" data-kind="note" tabindex="-1" title="4分音符" style="font-size:28px;">𝅘𝅥</button>
+    <button id="durNoteH" class="text-btn" data-duration="h" data-kind="note" tabindex="-1" title="2分音符" style="font-size:28px;">𝅗𝅥</button>
+    <button id="durNoteW" class="text-btn" data-duration="w" data-kind="note" tabindex="-1" title="全音符" style="font-size:28px;">𝅝</button>
+    <span class="dur-sep"></span>
+    <button id="durNote8Dot" class="text-btn" data-duration="8" data-kind="note" data-dotted="true" tabindex="-1" title="付点8分音符" style="font-size:28px;">𝅘𝅥𝅮.</button>
+    <button id="durNoteQDot" class="text-btn" data-duration="q" data-kind="note" data-dotted="true" tabindex="-1" title="付点4分音符" style="font-size:28px;">𝅘𝅥.</button>
+    <button id="durNoteHDot" class="text-btn" data-duration="h" data-kind="note" data-dotted="true" tabindex="-1" title="付点2分音符" style="font-size:28px;">𝅗𝅥.</button>
+    <span class="dur-sep"></span>
+    <button id="durRest16" class="text-btn" data-duration="16" data-kind="rest" tabindex="-1" title="16分休符" style="font-size:28px;">𝄿</button>
+    <button id="durRest8" class="text-btn" data-duration="8" data-kind="rest" tabindex="-1" title="8分休符" style="font-size:28px;">𝄾</button>
+    <button id="durRestQ" class="text-btn" data-duration="q" data-kind="rest" tabindex="-1" title="4分休符" style="font-size:28px;">𝄽</button>
+    <button id="durRestH" class="text-btn" data-duration="h" data-kind="rest" tabindex="-1" title="2分休符" style="font-size:28px;">𝄼</button>
+    <button id="durRestW" class="text-btn" data-duration="w" data-kind="rest" tabindex="-1" title="全休符" style="font-size:28px;">𝄻</button>
+    <span class="dur-sep"></span>
+    <button id="durRest8Dot" class="text-btn" data-duration="8" data-kind="rest" data-dotted="true" tabindex="-1" title="付点8分休符" style="font-size:28px;">𝄾.</button>
+    <button id="durRestQDot" class="text-btn" data-duration="q" data-kind="rest" data-dotted="true" tabindex="-1" title="付点4分休符" style="font-size:28px;">𝄽.</button>
+    <button id="durRestHDot" class="text-btn" data-duration="h" data-kind="rest" data-dotted="true" tabindex="-1" title="付点2分休符" style="font-size:28px;">𝄼.</button>
 </div>
 
 <div id="main">
@@ -516,7 +621,7 @@
         <button id="addMeasureBtn"><i class="fa-solid fa-circle-plus"></i></button>
     </div>
 
-    <div id="mapAreaWrapper" style="display:none; margin-top:12px;">
+    <div id="mapAreaWrapper" style="display:none; margin-top:8px;">
         <div id="mapArea"></div>
         <div id="mapResizeHandleRight" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
         <div id="mapResizeHandleBottom" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
