@@ -156,6 +156,11 @@
             position: fixed;
             z-index: 90;
             box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+            /* position:fixed+leftのみ指定だとwidth:autoの場合、CSS仕様上「leftから
+               ビューポート右端までの残り幅」に収縮してしまい、右端付近では中身が
+               折り返される。fit-contentもこの「残り幅」を考慮する定義のため効果がなく、
+               残り幅を一切考慮しないmax-contentを使うことで常に本来の幅を維持する */
+            width: max-content;
             max-width: calc(100vw - 24px);
         }
 
@@ -563,7 +568,7 @@
                     <button id="mapRailHorizontal" class="text-btn" tabindex="-1" title="横向き">横</button>
                 </div>
                 <div class="toolbar">
-                    <span style="font-size:11px;color:#aaa;">開始地点</span>
+                    <span style="font-size:11px;color:#aaa;">トロッコ開始地点</span>
                     <button id="mapCorner-top-left" tabindex="-1" title="左上">↖</button>
                     <button id="mapCorner-top-right" tabindex="-1" title="右上">↗</button>
                     <button id="mapCorner-bottom-left" tabindex="-1" title="左下">↙</button>

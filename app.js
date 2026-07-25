@@ -825,6 +825,13 @@ function applyTabVisibility() {
         if (el) el.style.display = isScore ? "flex" : "none";
     });
 
+    // 音符/休符グループをドッキングしているラッパー（#toolbarDurationRow）は、中身の
+    // #toolbarDurationが五線譜タブのみ表示なのに対し、ラッパー自体は非表示連動していなかった。
+    // 中身が無くても高さ0のまま改行用の1行分を占有し続け、マップタブでの段間隔が広がる原因になるため、
+    // ラッパー自体もタブに応じて表示/非表示を切り替える（フローティング中は存在しないため無害）
+    const durationRow = document.getElementById("toolbarDurationRow");
+    if (durationRow) durationRow.style.display = isScore ? "flex" : "none";
+
     // マップタブのみで使うツールバー
     MAP_ONLY_TOOLBAR_IDS.forEach(id => {
         const el = document.getElementById(id);
@@ -1243,8 +1250,11 @@ function dockNoteToolbar() {
     if (!wrapper) {
         wrapper = document.createElement("div");
         wrapper.id = "toolbarDurationRow";
-        wrapper.style.cssText = "flex-basis:100%; display:flex;";
+        wrapper.style.cssText = "flex-basis:100%;";
     }
+    // 中身（#toolbarDuration）は五線譜タブのみ表示なので、ラッパー自体も合わせておく
+    // （マップタブ中に高さ0のまま1行分を占有してしまうのを防ぐため）
+    wrapper.style.display = activeTab === "score" ? "flex" : "none";
     anchor.insertAdjacentElement("afterend", wrapper);
     wrapper.appendChild(el);
     noteToolbarDocked = true;
