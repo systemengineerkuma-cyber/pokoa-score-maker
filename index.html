@@ -48,7 +48,7 @@
             display: flex;
             align-items: center;
             justify-content: flex-start;
-            gap: 10px;
+            gap: 4px;
             margin-bottom: 4px;
         }
 
@@ -67,14 +67,18 @@
             padding: 5px 12px;
         }
 
-        /* タブ切替時、新しい中身をふわっとフェードイン（+わずかに下からスライド）させる */
+        /* タブ切替時、新しい中身をふわっとフェードインさせる。
+           以前はtranslateY(8px→0)で「わずかに下からスライド」させる演出も
+           付けていたが、「並べて」タブでは五線譜/マップ2つの枠が並ぶため、transformで
+           #main全体が動く間に境界線（枠線）がちらつく（ずれて見える）との指摘があり、
+           位置がまったく動かないopacityのみのフェードに変更した */
         @keyframes tabContentFadeIn {
-            from { opacity: 0; transform: translateY(6px); }
-            to { opacity: 1; transform: translateY(0); }
+            from { opacity: 0; }
+            to { opacity: 1; }
         }
 
         #main.tab-content-fade {
-            animation: tabContentFadeIn 0.18s ease-out;
+            animation: tabContentFadeIn 0.22s ease-out;
         }
 
         #toolbars {
@@ -94,6 +98,38 @@
             border-radius: 6px;
             padding: 4px 8px;
             min-height: 40px;
+        }
+
+        /* タブバー（.tab-row）に同居するレイアウトボタンは、通常の.toolbar（min-height:40px、
+           ボタン30x30px）だとタブのピル（高さ約34px）より背が高くなり、「並べて」タブを
+           選んだ瞬間に.tab-row全体の高さが押し広げられてタブ列とツールバー列がわずかに
+           下にずれてしまっていた。タブのピルと高さが揃うようmin-heightを外し、ボタンも
+           一回り小さくする */
+        #toolbarBothLayout {
+            min-height: 0;
+            padding: 2px 6px;
+            margin-left: -2px; /* タブのすぐ右にもう少し寄せる */
+        }
+        #toolbarBothLayout button {
+            width: 28px;
+            height: 28px;
+            font-size: 14px;
+        }
+
+        /* レイアウト切り替えボタンは全タブで常に表示するが、「並べて」タブ以外では
+           操作対象が無いため非活性にする（クリック不可＋見た目を薄くする） */
+        .toolbar button:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+            pointer-events: none;
+        }
+
+        /* 音符マット/レール/センサー数（#panelCount）も、「並べて」タブの右（タブ行）に
+           表示するようになったため、#toolbarBothLayoutと同じ理由でmin-heightを外し、
+           タブのピルと高さを揃える */
+        #panelCount {
+            min-height: 0;
+            padding: 5px 8px;
         }
 
         .toolbar button, .toolbar label {
@@ -211,11 +247,83 @@
             position: relative;
         }
 
+        /* 「両方」タブ：五線譜とマップを同時表示する際のレイアウト。ボタンで左右2パターンを
+           ローテーション切り替えできる（DOM順は常にscoreWrapper→mapAreaWrapperのまま、
+           gridの列指定だけで並び順を入れ替える）。単体タブ表示時は.bothTabActiveが
+           付かないため、このgridレイアウトは適用されず、通常のブロック要素として振る舞う
+           （上下2パターンは2026-08-04にユーザーの依頼で廃止済み） */
+        #bothTabContainer.bothTabActive {
+            display: grid;
+            gap: 12px;
+        }
+
+        /* 左右入れ替えボタンのアイコンを、押すたびに左右反転させる
+           （左右2パターンをトグルしていることを視覚的に伝える。反転自体はJSがtransform
+           を都度書き換えて行う） */
+        #bothLayoutRotate i {
+            display: inline-block;
+            transition: transform 0.3s ease;
+        }
+
+        /* 左右2パターン: grid-template-columns: 1fr 1fr で幅をちょうど半分ずつに分ける。
+           grid-columnだけ指定してgrid-rowをautoのままにすると、ブラウザによっては
+           もう片方の要素が意図せず2段目（暗黙の行）に配置されてしまうことがあったため、
+           両方の子要素に明示的にgrid-row: 1を指定して1行に固定する。
+           このパターンでも#bothTabContainerの高さはJS側（updateBothTabContainerHeight）で
+           ブラウザ表示領域基準に計算・指定しており、五線譜側・マップ側それぞれが
+           下のoverflow:autoルールにより独立して縦スクロールできるようになっている */
+        #bothTabContainer.bothTabActive.layout-left-right,
+        #bothTabContainer.bothTabActive.layout-right-left {
+            grid-template-columns: 1fr 1fr;
+            grid-template-rows: 1fr;
+        }
+        #bothTabContainer.bothTabActive.layout-left-right > #scoreWrapper,
+        #bothTabContainer.bothTabActive.layout-left-right > #mapAreaWrapper,
+        #bothTabContainer.bothTabActive.layout-right-left > #scoreWrapper,
+        #bothTabContainer.bothTabActive.layout-right-left > #mapAreaWrapper {
+            grid-row: 1;
+        }
+        #bothTabContainer.bothTabActive.layout-right-left > #scoreWrapper { grid-column: 2; }
+        #bothTabContainer.bothTabActive.layout-right-left > #mapAreaWrapper { grid-column: 1; }
+
+        #bothTabContainer.bothTabActive > #scoreWrapper,
+        #bothTabContainer.bothTabActive > #mapAreaWrapper {
+            min-width: 0;
+            min-height: 0;
+            overflow: auto;
+        }
+
+        /* 「表示する層」ボタン（上位層/中間層/下位層）は、以前はマップ専用ツールバーの
+           一部として並んでいたが、「音符マットエリアにホバーしたい（＝マップの上に
+           浮かせて表示したい）」との要望を受け、#mapAreaWrapper（position:relative）を
+           基準にposition:absoluteで右上に重ねて表示するよう変更した。リサイズハンドル
+           （.map-resize-handle）と同じ「ラッパー基準の絶対配置」の仕組みを踏襲している。
+           その後「グリッドにかぶる」との指摘を受け、普段は薄く目立たせておき、マップ
+           エリアにマウスをホバーした時だけくっきり見えるようにした（トロッコ開始地点の
+           設定次第でどの角にも実データが来うるため、常に空くコーナーを確保する代わりに
+           この方式を採用した） */
+        #mapLayerOverlay {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            z-index: 10;
+            flex-direction: column;
+            opacity: 0.15;
+            transition: opacity 0.15s ease;
+        }
+        #mapAreaWrapper:hover #mapLayerOverlay {
+            opacity: 1;
+        }
+
         #mapArea {
             background: #fff;
             border: 1px solid #ddd;
             border-radius: 8px;
             width: fit-content;
+            /* 音符マットが少なくグリッドが狭い時でも、白背景はエリアの幅いっぱいに広がる
+               ようにする（グリッドがエリアより広い場合は従来通りwidth: fit-contentが
+               優先され、白背景がきっちり内容を囲む＝はみ出し分は外側のスクロールに任せる） */
+            min-width: 100%;
             padding: 4px;
         }
 
@@ -277,6 +385,7 @@
         }
 
         .tab-container {
+            position: relative;
             display: flex;
             gap: 3px;
             background: #e8e8e8;
@@ -284,7 +393,25 @@
             border-radius: 9px;
         }
 
+        /* アクティブなタブの背景（白い丸角ピル）。以前は.tab-active自身にbackgroundを
+           指定して瞬時に切り替えていたが、タブ切り替え時にも動きが欲しいとの要望を受け、
+           この専用要素をJS側（updateTabIndicator）でアクティブなボタンの位置/幅に
+           left/widthで追従させ、position:absoluteのtransitionでスッと横移動させる */
+        #tabActiveIndicator {
+            position: absolute;
+            top: 3px;
+            bottom: 3px;
+            border-radius: 7px;
+            background: #fff;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+            transition: left 0.2s ease, width 0.2s ease;
+            z-index: 0;
+            pointer-events: none;
+        }
+
         .tab-btn {
+            position: relative;
+            z-index: 1;
             display: flex;
             align-items: center;
             gap: 6px;
@@ -296,7 +423,7 @@
             color: #999;
             cursor: pointer;
             font-family: inherit;
-            transition: background 0.15s, color 0.15s, box-shadow 0.15s;
+            transition: color 0.15s;
         }
 
         .tab-btn i {
@@ -308,10 +435,8 @@
         }
 
         .tab-active {
-            background: #fff;
             color: #111;
             font-weight: 700;
-            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
         }
 
         .tab-active:hover {
@@ -492,7 +617,13 @@
 
     <div class="sticky-toolbars-inner">
         <div class="tab-row">
-            <div id="tabContainer" class="tab-container"></div>
+            <div id="tabContainer" class="tab-container">
+                <div id="tabActiveIndicator"></div>
+            </div>
+            <div class="toolbar" id="toolbarBothLayout" style="display:none;">
+                <button id="bothLayoutRotate" tabindex="-1" title="左右を入れ替え"><i class="fa-solid fa-right-left"></i></button>
+            </div>
+            <div id="panelCount" class="toolbar" style="display:none; flex-wrap:wrap;"></div>
         </div>
         <div id="toolbars">
             <div class="toolbar">
@@ -504,7 +635,7 @@
             </div>
             <div class="toolbar" id="toolbarZoom">
                 <button id="zoomOut" tabindex="-1" title="縮小"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
-                <input type="range" id="zoomSlider" min="0.25" max="1.75" step="0.01" value="1">
+                <input type="range" id="zoomSlider" min="0.25" max="1.75" step="0.01" value="0.75">
                 <button id="zoomIn" tabindex="-1" title="拡大"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
             </div>
             <div class="toolbar" id="toolbarPlayback">
@@ -520,9 +651,8 @@
                     <input type="range" id="volumeSlider" min="0" max="1" step="0.01" value="0.8" title="音量" style="width:80px; accent-color:#222;">
                 </span>
             </div>
-            <div id="panelCount" class="toolbar" style="display:none; flex-wrap:wrap;"></div>
             <div class="toolbar" id="toolbarEditMode">
-                <button id="editModeNote" tabindex="-1" title="音符モード"><i class="fa-solid fa-pencil"></i></button>
+                <button id="editModeNote" tabindex="-1" title="編集モード"><i class="fa-solid fa-pencil"></i></button>
                 <button id="editModeSelect" tabindex="-1" title="選択モード"><i class="fa-solid fa-arrow-pointer"></i></button>
             </div>
             <div class="toolbar" id="toolbarClipboard">
@@ -555,6 +685,11 @@
                 <button id="transposeDown" tabindex="-1" title="半音下げる">▼</button>
                 <button id="transposeUp" tabindex="-1" title="半音上げる">▲</button>
             </div>
+            <!-- コンパス以降（マップ専用グループ）を#toolbars内の2行目にまとめて折り返させる
+                 ための空アイテム。flex-wrap下でflex-basis:100%の要素は「残りの行幅を
+                 使い切る」ため、これ自身は見えないまま、後続のアイテムが強制的に次の行へ
+                 送られる（#toolbarDurationRowと同じ仕組み） -->
+            <div style="flex-basis:100%; height:0;"></div>
             <div class="toolbar" id="toolbarCompass">
                 <button id="compassBtn" tabindex="-1" title="北の向きを変える">
                     <i class="fa-solid fa-compass"></i>
@@ -621,16 +756,23 @@
     <div id="scoreTitle">
         <input type="text" id="scoreTitleInput" placeholder="楽譜の名前" value="NewScore">
     </div>
-    <div id="scoreWrapper">
-        <div id="score"></div>
-        <button id="addMeasureBtn"><i class="fa-solid fa-circle-plus"></i></button>
-    </div>
+    <div id="bothTabContainer" class="layout-left-right">
+        <div id="scoreWrapper">
+            <div id="score"></div>
+            <button id="addMeasureBtn"><i class="fa-solid fa-circle-plus"></i></button>
+        </div>
 
-    <div id="mapAreaWrapper" style="display:none; margin-top:8px;">
-        <div id="mapArea"></div>
-        <div id="mapResizeHandleRight" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
-        <div id="mapResizeHandleBottom" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
-        <div id="mapResizeHandleCorner" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
+        <div id="mapAreaWrapper" style="display:none;">
+            <div id="mapLayerOverlay" class="toolbar" style="display:none;">
+                <button id="mapLayerUpper" tabindex="-1" title="上位層"><i class="fa-solid fa-angles-up"></i></button>
+                <button id="mapLayerMiddle" tabindex="-1" title="中間層"><i class="fa-solid fa-equals"></i></button>
+                <button id="mapLayerLower" tabindex="-1" title="下位層"><i class="fa-solid fa-angles-down"></i></button>
+            </div>
+            <div id="mapArea"></div>
+            <div id="mapResizeHandleRight" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
+            <div id="mapResizeHandleBottom" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
+            <div id="mapResizeHandleCorner" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
+        </div>
     </div>
 
     <div id="info">

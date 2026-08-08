@@ -1,7 +1,7 @@
 const VF = VexFlow;
 
 let score = null;
-let scale = 1;
+let scale = 0.75; // デフォルトのズーム倍率（75%）
 let notePositions = [];
 // notePositionsは毎回の描画で作り直され、ホバー中のプレビューが対象を差し替えて
 // 描画するとその対象の実測位置が一時的に消えてしまう（プレビューされていない他の
@@ -62,10 +62,144 @@ let isCtrlHeldForRestPreview = false;
 const TABS = [
     { id: "score",  label: "五線譜", icon: "fa-music" },
     { id: "map",    label: "マップ", icon: "fa-map" },
+    { id: "both",   label: "並べて", icon: "fa-table-columns" },
 ];
 let activeTab = localStorage.getItem("activeTab") || "score";
 // 廃止済みタブ（例: 旧パネル楽譜タブ）がlocalStorageに残っていた場合のフォールバック
 if (!TABS.some(t => t.id === activeTab)) activeTab = "score";
+
+// 「両方」タブ（五線譜+マップ同時表示）のレイアウト。ボタンで左右2パターンをローテーション切替する
+// （上下2パターンは2026-08-04にユーザーの依頼で廃止済み。「レイアウトは左右だけでいいです」）
+const BOTH_TAB_LAYOUT_ORDER = ["left-right", "right-left"];
+let bothTabLayout = localStorage.getItem("bothTabLayout") || "left-right";
+if (!BOTH_TAB_LAYOUT_ORDER.includes(bothTabLayout)) bothTabLayout = "left-right";
+
+function applyBothTabLayout() {
+    const container = document.getElementById("bothTabContainer");
+    if (!container) return;
+    BOTH_TAB_LAYOUT_ORDER.forEach(l => container.classList.remove(`layout-${l}`));
+    container.classList.add(`layout-${bothTabLayout}`);
+    updateBothTabContainerHeight();
+    updateContentAreaMinHeights();
+}
+
+// 「並べて」タブの左右レイアウトを入れ替える（レイアウトボタンのクリック、および
+// 「並べて」タブをすでに表示中にもう一度タブを押した場合の、両方から呼ばれる共通処理）
+function rotateBothTabLayout() {
+    const i = BOTH_TAB_LAYOUT_ORDER.indexOf(bothTabLayout);
+    const nextIndex = (i + 1) % BOTH_TAB_LAYOUT_ORDER.length;
+    bothTabLayout = BOTH_TAB_LAYOUT_ORDER[nextIndex];
+    localStorage.setItem("bothTabLayout", bothTabLayout);
+
+    // ボタンのアイコンを左右反転させ、左右を入れ替えたことを視覚的に伝える
+    const icon = document.querySelector("#bothLayoutRotate i");
+    if (icon) icon.style.transform = nextIndex === 1 ? "scaleX(-1)" : "";
+
+    // FLIP（First-Last-Invert-Play）技法で、五線譜/マップ領域の入れ替わりを
+    // 「配置がガタッと切り替わる」のではなく「位置がスッと移動する」ように見せる。
+    // grid自体は行⇔列で構造が丸ごと変わるため滑らかに補間できないが、
+    // 切り替え前後で#scoreWrapper/#mapAreaWrapperの画面上の位置を測定しておき、
+    // 切り替え後に「切り替え前の位置にいるように見える」だけズレたtransformを
+    // 一旦transitionなしで当ててから、それを0へ戻すtransitionをかけることで、
+    // 実際の移動距離ぶんだけ滑らかにスライドしたように見せる
+    const flipEls = [document.getElementById("scoreWrapper"), document.getElementById("mapAreaWrapper")]
+        .filter(Boolean);
+    const firstRects = new Map(flipEls.map(el => [el, el.getBoundingClientRect()]));
+
+    applyBothTabLayout();
+    renderScore();
+    setupDeleteButtons();
+    setupInsertButtons();
+    renderMap();
+
+    flipEls.forEach(el => {
+        const first = firstRects.get(el);
+        const last = el.getBoundingClientRect();
+        const dx = first.left - last.left;
+        const dy = first.top - last.top;
+        if (!dx && !dy) return;
+
+        el.style.transition = "none";
+        el.style.transform = `translate(${dx}px, ${dy}px)`;
+        // 上記transformを一度実際に描画させてから（reflow強制）、本来の位置へ
+        // transitionで滑らかに戻す。強制reflowなしだと、直後のtransform変更が
+        // ブラウザによって1回のペイントにまとめられ、移動が瞬間的になってしまう
+        el.getBoundingClientRect();
+
+        requestAnimationFrame(() => {
+            el.style.transition = "transform 0.3s ease";
+            el.style.transform = "";
+            setTimeout(() => { el.style.transition = ""; }, 320);
+        });
+    });
+}
+
+// 「両方」タブでは、五線譜とマップをブラウザの表示領域のちょうど半分ずつで区切りたい
+// （上下2パターンは高さを、左右2パターンは幅を半分ずつに分ける）。加えて、左右パターンでは
+// 五線譜・マップそれぞれが自分のエリア内で独立して縦スクロールできるようにしたい。
+// #bothTabContainer自体には親から継承できる高さが無い（ページは通常のドキュメントフローで
+// スクロールする）ため、レイアウトの向きに関わらず、ブラウザの可視領域のうち
+// #bothTabContainerより上（タブ・ツールバー等）が占める分を引いた残り高さをJSで都度計算し、
+// 明示的な高さとして与える（CSS側は`grid-template-rows`/`grid-template-columns`の`1fr`で
+// 半分ずつに分け、各エリアの`overflow:auto`ではみ出した内容だけを個別にスクロールさせる）
+function updateBothTabContainerHeight() {
+    const container = document.getElementById("bothTabContainer");
+    if (!container) return;
+    if (activeTab !== "both") {
+        container.style.height = "";
+        return;
+    }
+    // 直前まで別タブでページがスクロールしていた場合、getBoundingClientRect().topがスクロール
+    // 位置の影響を受けて不正確になる。「両方」タブではページ全体がちょうど収まる高さになる
+    // 想定のため、先頭にスクロールしてから測定する
+    window.scrollTo(0, 0);
+    const top = container.getBoundingClientRect().top;
+    let available = window.innerHeight - top;
+    container.style.height = Math.max(available, 100) + "px";
+
+    // #main等コンテナの下側に残る余白（padding等）の影響で、上記だけではまだページ全体が
+    // わずかにはみ出すことがあるため、実際のはみ出し量を測って一度だけ補正する
+    const overflow = document.documentElement.scrollHeight - window.innerHeight;
+    if (overflow > 0) {
+        available = Math.max(available - overflow, 100);
+        container.style.height = available + "px";
+    }
+}
+
+// 五線譜・マップの背景（白い枠）は、小節数や音符マット数が少ないとその分だけ小さくなってしまい、
+// エリアの残りが素の背景色のまま余ってしまう。「楽譜や音符マットが少ししかなくても、エリア
+// いっぱいに背景の余白を拡げたい」という要望を受け、内容が少ない時でも少なくとも表示エリア分の
+// 高さは確保する（内容がそれより多ければ自然にそれを超えて伸びる、min-heightなので上限は無い）。
+// 五線譜側は背景を持つ#scoreWrapper自身に、マップ側は背景を持つ#mapArea（#mapAreaWrapperの
+// 子）に、それぞれmin-heightを設定する
+function updateContentAreaMinHeights() {
+    const container = document.getElementById("bothTabContainer");
+    const scoreWrapper = document.getElementById("scoreWrapper");
+    const mapAreaWrapper = document.getElementById("mapAreaWrapper");
+    const mapArea = document.getElementById("mapArea");
+    if (!container || !scoreWrapper || !mapArea) return;
+
+    if (activeTab === "both") {
+        // 「両方」タブでは、#scoreWrapper/#mapAreaWrapper自体がgridのalign-items:stretchで
+        // 既にトラック全体の高さになっている（updateBothTabContainerHeightが計算した
+        // #bothTabContainerの高さを、grid-template-rows/columnsの1frが半分ずつに分配する）。
+        // 五線譜側はそのままで背景が埋まるため追加指定は不要。マップ側は背景が1つ内側の
+        // #mapAreaにあるため、既に確定している親（#mapAreaWrapper）の高さをそのまま使う
+        scoreWrapper.style.minHeight = "";
+        mapArea.style.minHeight = mapAreaWrapper ? mapAreaWrapper.clientHeight + "px" : "";
+        return;
+    }
+
+    // 単体タブ（五線譜/マップ）: ここではページ自体は従来通り自由にスクロールできるままにしたい
+    // ため、コンテナの高さそのものは固定しない。「表示エリア（#bothTabContainerの位置から
+    // ブラウザ表示領域の下端まで）」の高さをmin-heightとして与えるだけに留める。
+    // getBoundingClientRect().top + window.scrollY で、現在のスクロール位置に関わらず
+    // 「ページ先頭から見た絶対位置」を求められるため、scrollTo(0,0)による強制スクロールは不要
+    const docTop = container.getBoundingClientRect().top + window.scrollY;
+    const available = Math.max(window.innerHeight - docTop, 100) + "px";
+    scoreWrapper.style.minHeight = activeTab === "score" ? available : "";
+    mapArea.style.minHeight = activeTab === "map" ? available : "";
+}
 
 function getAudioContext() {
     if (!audioCtx) {
@@ -175,6 +309,12 @@ function playNote(pitch, startTime, duration) {
     activeSourceNodes.push({ node: osc, startTime });
 }
 
+// 小節が選択されていれば、その末尾（最大index）を再生の終端とする（無ければ曲の最後）。
+// これにより、選択範囲がある場合は再生がその範囲の末尾で止まる/ループするようになる
+function getPlaybackEndMeasureIndex() {
+    return selectedMeasures.size > 0 ? Math.max(...selectedMeasures) : score.measures.length - 1;
+}
+
 function playScore() {
     if (playState !== "stopped") return;
     playState = "playing";
@@ -223,7 +363,11 @@ function scheduleMeasuresFrom(startMeasureIndex, upperResume, lowerResume, beatI
     let time = Math.min(upperResume.time, lowerResume.time);
     let beatIndex = beatIndexOffset;
 
-    for (let measureIndex = startMeasureIndex; measureIndex < score.measures.length; measureIndex++) {
+    // 小節が選択されていれば、その末尾でスケジューリングを打ち切る（曲の途中でも選択範囲の
+    // 終わりで再生が止まる/ループするようにするため）
+    const endMeasureIndex = getPlaybackEndMeasureIndex();
+
+    for (let measureIndex = startMeasureIndex; measureIndex <= endMeasureIndex; measureIndex++) {
         const isResumeMeasure = measureIndex === startMeasureIndex;
         const measureStartTime = (isResumeMeasure && resumeMeasureStartTimeOverride != null)
             ? resumeMeasureStartTimeOverride
@@ -275,7 +419,7 @@ function scheduleMeasuresFrom(startMeasureIndex, upperResume, lowerResume, beatI
         // 保証）なので、残りの音符を順に足していけば、再開小節の末尾でちょうど小節終了時刻に一致する。
         // そのため2小節目以降は特別な調整をせず、そのままtを引き継げばよい
         let t = resume.time;
-        for (let measureIndex = startMeasureIndex; measureIndex < score.measures.length; measureIndex++) {
+        for (let measureIndex = startMeasureIndex; measureIndex <= endMeasureIndex; measureIndex++) {
             const measure = score.measures[measureIndex];
             const notes = notesAccessor(measure);
             const isResumeMeasure = measureIndex === startMeasureIndex;
@@ -343,7 +487,7 @@ function rescheduleFromCurrentPosition() {
     upperNoteBoundarySchedule = upperNoteBoundarySchedule.filter(n => n.measureIndex < resumeMeasureIndex);
     lowerNoteBoundarySchedule = lowerNoteBoundarySchedule.filter(n => n.measureIndex < resumeMeasureIndex);
 
-    if (resumeMeasureIndex >= score.measures.length) {
+    if (resumeMeasureIndex >= score.measures.length || resumeMeasureIndex > getPlaybackEndMeasureIndex()) {
         playEndTime = earliestResumeTime;
         return;
     }
@@ -802,45 +946,70 @@ const SCORE_ONLY_TOOLBAR_IDS = [
 const MAP_ONLY_TOOLBAR_IDS = ["toolbarCompass"];
 
 function applyTabVisibility() {
-    const isScore = activeTab === "score";
-    const isMap   = activeTab === "map";
+    const isBoth    = activeTab === "both";
+    const showScore = activeTab === "score" || isBoth;
+    const showMap   = activeTab === "map"   || isBoth;
+
+    // 「両方」タブの時だけ、五線譜/マップを均等2分割するgridレイアウトを有効にするクラス。
+    // 単体タブ表示（子は1つだけ表示）にはこのレイアウトを適用しない
+    const bothTabContainer = document.getElementById("bothTabContainer");
+    if (bothTabContainer) bothTabContainer.classList.toggle("bothTabActive", isBoth);
 
     // 五線譜エリア
-    document.getElementById("scoreWrapper").style.display = isScore ? "" : "none";
+    document.getElementById("scoreWrapper").style.display = showScore ? "" : "none";
 
-    // パネルカウント（音符マット数・レール数・センサー数）はマップタブのみ表示
-    document.getElementById("panelCount").style.display = isMap ? "flex" : "none";
+    // パネルカウント（音符マット数・レール数・センサー数）は全タブ共通で常に表示する
+    document.getElementById("panelCount").style.display = "flex";
 
     // マップエリア（リサイズハンドルも含むラッパーごと表示切替）
     const mapAreaWrapper = document.getElementById("mapAreaWrapper");
-    if (mapAreaWrapper) mapAreaWrapper.style.display = isMap ? "" : "none";
+    if (mapAreaWrapper) {
+        mapAreaWrapper.style.display = showMap ? "" : "none";
+        // スコアタイトルとの間隔は#scoreTitleのmargin-bottomだけに任せる（0にする）。
+        // 以前はここに独自のmargin-topも足していたため、五線譜タブ（間隔6px）とマップタブ
+        // （6px+8px=14px）で余白の幅が異なって見えていた
+        mapAreaWrapper.style.marginTop = "0";
+    }
 
     // マップ専用ツールバー
     const mapToolbar = document.getElementById("mapToolbar");
-    if (mapToolbar) mapToolbar.style.display = isMap ? "flex" : "none";
+    if (mapToolbar) mapToolbar.style.display = showMap ? "flex" : "none";
+
+    // 「表示する層」ボタンは、マップ専用ツールバーではなく音符マットエリア上に
+    // 浮かせて表示する独立したオーバーレイなので、別途表示切替する
+    const mapLayerOverlay = document.getElementById("mapLayerOverlay");
+    if (mapLayerOverlay) mapLayerOverlay.style.display = showMap ? "flex" : "none";
 
     // 五線譜タブのみで使うツールバー
     SCORE_ONLY_TOOLBAR_IDS.forEach(id => {
         const el = document.getElementById(id);
-        if (el) el.style.display = isScore ? "flex" : "none";
+        if (el) el.style.display = showScore ? "flex" : "none";
     });
 
     // 音符/休符グループをドッキングしているラッパー（#toolbarDurationRow）は、中身の
-    // #toolbarDurationが五線譜タブのみ表示なのに対し、ラッパー自体は非表示連動していなかった。
+    // #toolbarDurationが五線譜表示中のみ表示なのに対し、ラッパー自体は非表示連動していなかった。
     // 中身が無くても高さ0のまま改行用の1行分を占有し続け、マップタブでの段間隔が広がる原因になるため、
     // ラッパー自体もタブに応じて表示/非表示を切り替える（フローティング中は存在しないため無害）
     const durationRow = document.getElementById("toolbarDurationRow");
-    if (durationRow) durationRow.style.display = isScore ? "flex" : "none";
+    if (durationRow) durationRow.style.display = showScore ? "flex" : "none";
 
     // マップタブのみで使うツールバー
     MAP_ONLY_TOOLBAR_IDS.forEach(id => {
         const el = document.getElementById(id);
-        if (el) el.style.display = isMap ? "flex" : "none";
+        if (el) el.style.display = showMap ? "flex" : "none";
     });
 
-    // ヘルプは五線譜タブのみ表示
+    // レイアウト切り替えツールバーは全タブ共通で常に表示するが、「並べて」タブ以外では
+    // 操作対象が無い（レイアウトという概念自体が存在しない）ため非活性にする
+    const toolbarBothLayout = document.getElementById("toolbarBothLayout");
+    if (toolbarBothLayout) toolbarBothLayout.style.display = "flex";
+    const bothLayoutRotateBtn = document.getElementById("bothLayoutRotate");
+    if (bothLayoutRotateBtn) bothLayoutRotateBtn.disabled = !isBoth;
+
+    // ヘルプは五線譜タブ単体でのみ表示（「両方」タブでは、この分だけ#bothTabContainerの下に
+    // はみ出してブラウザ表示領域のちょうど半分という前提が崩れるため非表示にする）
     const info = document.getElementById("info");
-    if (info) info.style.display = isScore ? "" : "none";
+    if (info) info.style.display = (showScore && !isBoth) ? "" : "none";
 
     // タブボタンのアクティブ状態を更新
     TABS.forEach(tab => {
@@ -848,18 +1017,49 @@ function applyTabVisibility() {
         if (!btn) return;
         btn.classList.toggle("tab-active", tab.id === activeTab);
     });
+    updateTabIndicator();
+}
+
+// アクティブなタブボタンの位置/幅に、タブ切替インジケーター（白いピル背景）を追従させる。
+// animate=falseの場合はtransitionを止めて瞬時に配置する（初回描画時、位置ズレした
+// 状態からスライドしてくるように見えるのを防ぐため）
+function updateTabIndicator(animate = true) {
+    const indicator = document.getElementById("tabActiveIndicator");
+    const activeBtn = document.getElementById(`tab-${activeTab}`);
+    if (!indicator || !activeBtn) return;
+
+    if (!animate) {
+        indicator.style.transition = "none";
+        indicator.style.left = `${activeBtn.offsetLeft}px`;
+        indicator.style.width = `${activeBtn.offsetWidth}px`;
+        void indicator.offsetWidth; // reflowを強制してから元のtransitionへ戻す
+        indicator.style.transition = "";
+        return;
+    }
+    indicator.style.left = `${activeBtn.offsetLeft}px`;
+    indicator.style.width = `${activeBtn.offsetWidth}px`;
 }
 
 function switchTab(tabId) {
-    if (activeTab === tabId) return;
+    if (activeTab === tabId) {
+        // 「並べて」タブをすでに表示中にもう一度押した場合は、タブ自体の切り替えは
+        // 何も起きないはずの操作だが、その代わりにレイアウトボタン（左右入れ替え）と
+        // 同じ効果を発生させる
+        if (tabId === "both") rotateBothTabLayout();
+        return;
+    }
     activeTab = tabId;
     localStorage.setItem("activeTab", activeTab);
     applyTabVisibility();
-    if (activeTab === "score") {
+    if (activeTab === "both") applyBothTabLayout();
+    updateBothTabContainerHeight(); // 他タブへ切り替えた場合、両方タブ用の高さ指定を解除する
+    updateContentAreaMinHeights();
+    if (activeTab === "score" || activeTab === "both") {
         renderScore();
         setupDeleteButtons();
         setupInsertButtons();
-    } else if (activeTab === "map") {
+    }
+    if (activeTab === "map" || activeTab === "both") {
         renderMap();
     }
     playTabSwitchAnimation();
@@ -881,7 +1081,12 @@ let mapSettings = {
     sideFirst: "left",           // "left" | "right" （どちら側のセンサーを先にするか）
     wrapValue: 50,               // 折り返し値（一列あたりのセンサー数。レール1マス=センサー1個のためマス数と同義）
     hideUnusedSensors: false,    // true=周りに音符マットがないセンサーを配置しない（カウントにも含めない）
+    activeLayer: "middle",       // "middle" | "upper" | "lower" （表示する層）
 };
+
+// 層名⇔グリッドのz座標の対応。中間層=0（センサーが存在するのはここだけ）、
+// 上位層=+1・下位層=-1（レールのみ中間層と同じ位置に複製表示する）
+const MAP_LAYER_Z = { middle: 0, upper: 1, lower: -1 };
 
 // 段と段の間隔は固定値（ユーザー調整UIは廃止済み）。レールを中心に-3〜+3（センサーの
 // 「隣接(1マス)」「遠め(2マス)」＋和音パネルがさらに1マス外側まで伸びうる分）で1セット
@@ -943,23 +1148,38 @@ function getAllBeats() {
     });
 }
 
-// 中間層3枠（センサー中心を(0,0)としたローカル座標、斜め隣接は使用しない）への
-// 音符マット割り当てを、進行方向ベクトル(forwardVec)・レールと反対方向ベクトル(awayVec)を
-// 使って実グリッドオフセットに変換する共通処理。
+// 中間層3枠+上位層4枠+下位層4枠（計11枠、センサー中心を(0,0)としたローカル座標、
+// 斜め隣接は使用しない）への音符マット割り当てを、進行方向ベクトル(forwardVec)・
+// レールと反対方向ベクトル(awayVec)を使って実グリッドオフセットに変換する共通処理。
 // forwardVec/awayVecはどちらも{dx,dy}が-1/0/1のいずれかの単位ベクトル。
 // 直線モードでは常に固定ベクトル、スネークモードでは経路上の位置ごとに変化するベクトルを渡す。
 function calcPanelPositionsCore(pitches, forwardVec, awayVec) {
-    // 音の優先順位（固定）: 遠い→横（レールと反対側）→近い
+    // 音の優先順位（固定）: 中間層(遠い→横→近い) → 上位層(遠い→横→近い→センサー直上) →
+    // 下位層(遠い→横→近い→センサー直下)。上位層/下位層の4つ目はセンサーそのものの
+    // 位置（lat:0,trav:0）に積む
     const midRank = [
         {lat: 0, trav: 1, z: 0},   // 遠い
         {lat: -1, trav: 0, z: 0},  // 横（レールと反対側）
         {lat: 0, trav: -1, z: 0},  // 近い
     ];
+    const upperRank = [
+        {lat: 0, trav: 1, z: 1},
+        {lat: -1, trav: 0, z: 1},
+        {lat: 0, trav: -1, z: 1},
+        {lat: 0, trav: 0, z: 1},   // センサー直上
+    ];
+    const lowerRank = [
+        {lat: 0, trav: 1, z: -1},
+        {lat: -1, trav: 0, z: -1},
+        {lat: 0, trav: -1, z: -1},
+        {lat: 0, trav: 0, z: -1},  // センサー直下
+    ];
+    const fullRank = [...midRank, ...upperRank, ...lowerRank]; // 3+4+4=11枠
 
     const positions = [];
     pitches.forEach((pitch, i) => {
-        if (i >= midRank.length) return;
-        const slot = midRank[i];
+        if (i >= fullRank.length) return;
+        const slot = fullRank[i];
         const dx = slot.trav * forwardVec.dx - slot.lat * awayVec.dx;
         const dy = slot.trav * forwardVec.dy - slot.lat * awayVec.dy;
         positions.push({ relX: dx, relY: dy, z: slot.z, pitch });
@@ -968,7 +1188,7 @@ function calcPanelPositionsCore(pitches, forwardVec, awayVec) {
 }
 
 function updateMapToolbarUI() {
-    const { railDirection, startCorner, sideFirst, wrapValue, hideUnusedSensors } = mapSettings;
+    const { railDirection, startCorner, sideFirst, wrapValue, hideUnusedSensors, activeLayer } = mapSettings;
 
     const setActive = (id, active) => {
         const el = document.getElementById(id);
@@ -976,6 +1196,10 @@ function updateMapToolbarUI() {
         el.style.color = active ? "#222" : "#aaa";
         el.style.background = active ? "#f0f0f0" : "";
     };
+
+    setActive("mapLayerUpper",  activeLayer === "upper");
+    setActive("mapLayerMiddle", activeLayer === "middle");
+    setActive("mapLayerLower",  activeLayer === "lower");
 
     setActive("mapRailVertical",   railDirection === "vertical");
     setActive("mapRailHorizontal", railDirection === "horizontal");
@@ -1062,6 +1286,14 @@ function buildMapGrid() {
     // 終わるかどうか）によって変わるため、実際に配置されたセルだけを見てbounding boxを
     // 決めると、sideFirstを切り替えただけで範囲が微妙に変わり、レールの論理座標は同じなのに
     // 描画位置だけズレて見えるバグになる
+    //
+    // ただし、この「理論上の最大フットプリント」は表示位置を安定させるためのbounding box
+    // 拡張であり、必ずしも「実際にその段の何らかの小節がそこまで存在する」ことは意味しない。
+    // 特に最後の段は、曲の総拍数がwrapSensorsで割り切れない場合、実際のビートが並ぶのは
+    // 途中までで、そこから先（wrapSensors分の理論上の幅の残り）は完全な空白になる。
+    // この「予約されているだけで実際には何も無い」座標をdeadZoneCoordsに記録しておき、
+    // renderMap()側でクリック/ドラッグ選択の対象外（見た目の余白と同様の扱い）にする
+    const deadZoneCoords = new Set();
     if (wrapSensors > 0) {
         const maxColIdxInclusive = Math.ceil(totalBeats / wrapSensors) - 1;
         for (let colIdx = 0; colIdx <= maxColIdxInclusive; colIdx++) {
@@ -1074,6 +1306,24 @@ function buildMapGrid() {
                     markExtent(bx, by);
                 });
             });
+
+            // この段に実際に存在するビート数（最後の段以外は必ずwrapSensors分フル）
+            const actualBeatsInBand = colIdx < maxColIdxInclusive
+                ? wrapSensors
+                : totalBeats - maxColIdxInclusive * wrapSensors;
+            // レールは1ビートにつき3マス（進行軸方向に-1,0,+1）の帯として描画される
+            // （トロッコの連続的な動きを表現するため）。そのため実際に存在する最後のビート
+            // （rowIdx=actualBeatsInBand-1）のレールは、次のビートが無くても+1マス分だけ
+            // 手前に食い込んで描画される。dead zoneはそこから始めないと、この「最後のビートの
+            // 実在するレールマス」まで誤って選択対象外にしてしまう
+            for (let rowIdx = actualBeatsInBand + 1; rowIdx < wrapSensors; rowIdx++) {
+                const tp = travelSign * rowIdx;
+                for (let lateral = -3; lateral <= 3; lateral++) {
+                    const bx = isVertical ? bandWrapOffset + lateral : tp;
+                    const by = isVertical ? tp : bandWrapOffset + lateral;
+                    deadZoneCoords.add(`${bx},${by}`);
+                }
+            }
         }
     }
 
@@ -1106,11 +1356,21 @@ function buildMapGrid() {
         dOrder.forEach((d, posInTriplet) => {
             const rx = isVertical ? wrapOffset : travelPos + d;
             const ry = isVertical ? travelPos + d : wrapOffset;
-            setCell(rx, ry, 0, {
+            const railData = {
                 type: "rail",
                 direction: railDirection,
                 railStep: beatIdx * 3 + posInTriplet,
-            });
+                measureIndex: beat.measureIndex,
+                // 折り返し（改行）をまたぐ小節では、レールが離れた場所に分かれて存在するため、
+                // 選択枠を計算する際にどの段（レール1本分）に属するかを区別できるようにしておく
+                band: colIdx,
+            };
+            // レールは中間層だけでなく、上位層・下位層にも同じ位置にそのまま複製表示する
+            // （センサーは中間層にしか無い。実際の物理レールが3層分あるわけではないが、
+            // 上位層/下位層を見たときにもレールの通り道が分かるよう表示だけ複製する）
+            setCell(rx, ry, 0, railData);
+            setCell(rx, ry, 1, railData);
+            setCell(rx, ry, -1, railData);
             markExtent(rx, ry);
         });
 
@@ -1126,6 +1386,7 @@ function buildMapGrid() {
                 type: "sensor",
                 beatNum: beatIdx + 1,
                 direction: railDirection,
+                measureIndex: beat.measureIndex,
             });
         }
 
@@ -1145,6 +1406,7 @@ function buildMapGrid() {
                     type: "panel",
                     pitch,
                     direction: northDirection,
+                    measureIndex: beat.measureIndex,
                 });
                 markExtent(px, py);
             });
@@ -1155,7 +1417,7 @@ function buildMapGrid() {
         ? null
         : { minX: extentMinX, maxX: extentMaxX, minY: extentMinY, maxY: extentMaxY };
 
-    return { grid, totalBeats, extent, separatorCoords, isVertical };
+    return { grid, totalBeats, extent, separatorCoords, isVertical, deadZoneCoords };
 }
 
 // マップグリッドの右端・下端・角の3箇所のハンドルをドラッグして、グリッド自体のマス数
@@ -1234,15 +1496,20 @@ function applyNoteToolbarPos(x, y) {
     el.style.top = `${y}px`;
 }
 
-// #toolbarTransposeの直後に、透明なラッパー（#toolbarDurationRow、flex-basis:100%）で
+// #toolbars最後の子として、透明なラッパー（#toolbarDurationRow、flex-basis:100%）で
 // 包んで戻す。ラッパー自身は次の行を単独で占有するが中身は自身のコンテンツ幅のままなので、
 // #toolbarDuration自体にflex-basis:100%を持たせる場合と違って余分な空白の箱ができない。
+// 「並べて」タブでは五線譜用・マップ用の全ツールバーグループが同時に並ぶため、以前のように
+// #toolbarTransposeの直後に挿入すると、その後に続くコンパス/マップ専用グループ群より
+// 上（＝ツールバーの途中）に来てしまっていた。「音符/休符グループは常に一番下に
+// 表示してほしい」との要望により、常に#toolbars内の最後の子として配置するようにした
+// （五線譜タブ単体では元々コンパス/マップ専用グループが非表示なので、見た目は変わらない）。
 // ラッパーはドッキング中だけ存在し、フローティング時は完全に取り除く（残っていると
 // 中身が空でも常に1行分を占有してしまい、後続要素との縦間隔がズレるため）
 function dockNoteToolbar() {
     const el = document.getElementById("toolbarDuration");
-    const anchor = document.getElementById("toolbarTranspose");
-    if (!el || !anchor) return;
+    const toolbarsEl = document.getElementById("toolbars");
+    if (!el || !toolbarsEl) return;
     el.classList.remove("floating", "snapping");
     el.style.left = "";
     el.style.top = "";
@@ -1252,10 +1519,10 @@ function dockNoteToolbar() {
         wrapper.id = "toolbarDurationRow";
         wrapper.style.cssText = "flex-basis:100%;";
     }
-    // 中身（#toolbarDuration）は五線譜タブのみ表示なので、ラッパー自体も合わせておく
-    // （マップタブ中に高さ0のまま1行分を占有してしまうのを防ぐため）
-    wrapper.style.display = activeTab === "score" ? "flex" : "none";
-    anchor.insertAdjacentElement("afterend", wrapper);
+    // 中身（#toolbarDuration）は五線譜表示中（五線譜タブ・「並べて」タブ）のみ表示なので、
+    // ラッパー自体も合わせておく（マップタブ単体中に高さ0のまま1行分を占有してしまうのを防ぐため）
+    wrapper.style.display = (activeTab === "score" || activeTab === "both") ? "flex" : "none";
+    toolbarsEl.appendChild(wrapper);
     wrapper.appendChild(el);
     noteToolbarDocked = true;
 }
@@ -1268,15 +1535,13 @@ function isNearNoteToolbarDockZone(rect) {
     return rect.top < dockZone.bottom + NOTE_TOOLBAR_DOCK_ZONE_MARGIN_PX;
 }
 
-// ドッキングした場合に実際に収まる位置（#toolbarTransposeの直後・次の行の先頭）を概算する。
+// ドッキングした場合に実際に収まる位置（#toolbars内の一番下・次の行の先頭）を概算する。
 // ドラッグ中にこの位置へ「吸い付いて」見せることで、離せばここにドッキングされることを予告する
 function computeNoteToolbarDockSnapPos() {
     const toolbarsEl = document.getElementById("toolbars");
-    const anchor = document.getElementById("toolbarTranspose");
-    if (!toolbarsEl || !anchor) return null;
+    if (!toolbarsEl) return null;
     const toolbarsRect = toolbarsEl.getBoundingClientRect();
-    const anchorRect = anchor.getBoundingClientRect();
-    return { x: toolbarsRect.left, y: anchorRect.bottom + 4 };
+    return { x: toolbarsRect.left, y: toolbarsRect.bottom + 4 };
 }
 
 // #toolbars内のフローから切り離し、body直下でposition:fixedのフローティングパネルにする
@@ -1421,7 +1686,7 @@ function renderMap() {
     const cellSize = Math.round(42 * scale * 0.5);
     const imageSize = cellSize;
 
-    const { grid, extent, separatorCoords, isVertical } = buildMapGrid();
+    const { grid, extent, separatorCoords, isVertical, deadZoneCoords } = buildMapGrid();
 
     if (!extent) {
         mapArea.innerHTML = "<p style='color:#aaa;padding:16px;'>音符がありません</p>";
@@ -1436,6 +1701,10 @@ function renderMap() {
     // グリッドの範囲は、実際に配置されたセルではなく（「未使用センサー非表示」設定の有無で
     // 変わらない）extentを使う。これにより、この設定を切り替えてもレールの描画位置がズレない
     let { minX, maxX, minY, maxY } = extent;
+    // どの小節にも属さない「見た目用の余白マス」（下記の+1マージン）をクリック判定から
+    // 除外するため、マージンを足す前の実測範囲（＝どこかの小節に属するマスがあり得る範囲）を
+    // 別に保持しておく
+    const extMinX = minX, extMaxX = maxX, extMinY = minY, extMaxY = maxY;
 
     // 端のセルが枠に密着して見えないよう、表示範囲の周囲に1マス分の余白を持たせる。
     // ただし折り返し軸方向（isVerticalならX、そうでなければY）は、既にbuildMapGrid側で
@@ -1451,14 +1720,15 @@ function renderMap() {
     const gridW = maxX - minX + 1;
     const gridH = maxY - minY + 1;
 
-    // 層の概念は廃止（グリッドは1つだけ）
-    const z = 0;
+    // 表示する層（中間層/上位層/下位層）に応じたzを選ぶ
+    const z = MAP_LAYER_Z[mapSettings.activeLayer] ?? 0;
 
     // グリッド線はcontainerのgapではなく、セル1つ1つが右端・下端の罫線を自分で持つ方式にする
     // （段の区切りマスだけ罫線を消して背景になじませたいが、gap方式だと特定セルだけ線を
     // 消すことができない＝ネガティブマージンで隙間を塗りつぶす方式を試したところ見た目が
     // ボコついてしまったため、この罫線持ち回し方式に変更した）
     const gridDiv = document.createElement("div");
+    gridDiv.id = "mapGrid";
     gridDiv.style.cssText = `
         display: grid;
         grid-template-columns: repeat(${gridW}, ${cellSize}px);
@@ -1489,6 +1759,13 @@ function renderMap() {
             const skipBottomBorder = isVertical ? isSeparator : false;
 
             const cell = document.createElement("div");
+            // 見た目の余白のためだけに追加した1マス分のマージン（どの小節にも属さない）、および
+            // 最後の段の理論上の最大フットプリントのうち実際にはビートが存在しない末尾部分
+            // （deadZoneCoords）は、どちらもクリック/ドラッグの判定から除外する
+            // （getMapMeasureIndexAtPoint参照）
+            if (ax < extMinX || ax > extMaxX || ay < extMinY || ay > extMaxY || deadZoneCoords.has(`${ax},${ay}`)) {
+                cell.dataset.outsideExtent = "1";
+            }
             cell.style.cssText = isSeparator ? `
                 width: ${cellSize}px;
                 height: ${cellSize}px;
@@ -1505,7 +1782,6 @@ function renderMap() {
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                font-size: ${cellSize * 0.25}px;
                 color: #555;
                 box-sizing: border-box;
                 overflow: hidden;
@@ -1541,6 +1817,13 @@ function renderMap() {
                     const isVert = data.direction === "vertical";
                     cell.dataset.laserDirection = isVert ? "horizontal" : "vertical";
                     cell.textContent = data.beatNum;
+                    // 桁数が増えるほど1文字あたりの幅が必要になり、マス幅に対して
+                    // 文字がはみ出して見切れてしまう（実測: 3桁だとcellSize*0.5程度が限界）。
+                    // 桁数に応じて比率を下げることで、マスサイズに関わらず見切れないようにしつつ、
+                    // できるだけ大きい文字サイズにする
+                    const digits = String(data.beatNum).length;
+                    const fontRatio = digits <= 2 ? 0.5 : 0.4 * 3 / digits;
+                    cell.style.fontSize = `${cellSize * fontRatio}px`;
                 } else if (data.type === "panel") {
                     const file = PITCH_TO_FILE[toCanonicalPitch(data.pitch)];
                     if (file) {
@@ -1562,6 +1845,14 @@ function renderMap() {
                         cell.appendChild(img);
                     }
                 }
+
+                // クリック/ドラッグでそのマスが属する小節を選択できるようにする
+                // （五線譜タブの選択と相互連携、実際のドラッグ処理はsetupMapAreaDrag()側）
+                if (data.measureIndex !== undefined) {
+                    cell.dataset.measureIndex = data.measureIndex;
+                    cell.style.cursor = "pointer";
+                    if (data.band !== undefined) cell.dataset.mapBand = data.band;
+                }
             }
 
             gridDiv.appendChild(cell);
@@ -1574,6 +1865,7 @@ function renderMap() {
         if (handle) handle.style.display = "";
     });
     repositionMapResizeHandle(gridDiv);
+    drawMapSelectionOverlays();
     updateCountsBar();
 
     // 再生中/一時停止中にグリッドが再構築された場合、現在位置のハイライトを再適用する
@@ -1583,6 +1875,300 @@ function renderMap() {
     if (playState !== "stopped" && currentHighlightRailStep !== null) {
         highlightRailStep(currentHighlightRailStep);
     }
+}
+
+// マップ上の選択ハイライト（.mapSelectionOverlay）を描き直す。renderMap()の全再構築を
+// 経由しない軽量な処理なので、ドラッグ中のライブプレビュー表示にも使える。
+// previewSetを渡すとそちらを優先表示し（ドラッグ中の暫定選択）、省略時はselectedMeasuresを使う。
+// 再生中ハイライト（highlightMapSensor/highlightRailStep）はセル自身のoutline/backgroundを
+// 直接書き換える方式のため、この選択ハイライトは独立した重ね合わせの子要素
+// （pointer-events:none）にして干渉しないようにしている。
+// 音符マット自体の色（ピッチごとの画像）が透けて見えなくなると見分けづらいという指摘を受け、
+// 半透明の塗りつぶしはやめ、白+青の二重リングの縁取りだけにして中身の色を隠さないようにした
+function createMapOverlayEl(key, box, wrapperRect, scrollLeft, scrollTop) {
+    const { left, top, right, bottom } = box;
+    const el = document.createElement("div");
+    el.className = "mapSelectionOverlay";
+    el.dataset.key = key;
+    el.style.cssText = `
+        position: absolute;
+        left: ${left - wrapperRect.left + scrollLeft}px;
+        top: ${top - wrapperRect.top + scrollTop}px;
+        width: ${right - left}px;
+        height: ${bottom - top}px;
+        box-shadow: inset 0 0 0 2px #fff, inset 0 0 0 4px #2f6fe0;
+        pointer-events: none;
+        z-index: 4;
+    `;
+    return el;
+}
+
+// animate=false（既定）: 従来通り全部消して全部描き直す（グリッドの再構築を伴う通常の
+// 再描画で使う）。animate=true: 現在表示中の枠と今回表示すべき集合（(measureIndex,band)の
+// 組み合わせごと）を比較し、新しく選択された枠だけフェードイン、選択から外れた枠だけ
+// フェードアウトさせる
+function drawMapSelectionOverlays(previewSet, animate = false) {
+    const effective = previewSet || selectedMeasures;
+
+    const wrapper = document.getElementById("mapAreaWrapper");
+    if (!wrapper) {
+        document.querySelectorAll(".mapSelectionOverlay").forEach(el => el.remove());
+        return;
+    }
+    const wrapperRect = wrapper.getBoundingClientRect();
+    // オーバーレイは#mapAreaWrapper（position:relative）を基準にposition:absoluteで配置するが、
+    // このwrapper自身が（「両方」タブでは）overflow:autoでスクロールする場合、absolute要素の
+    // top/leftはwrapperの「現在見えている位置」ではなく「スクロールされる中身の原点」からの
+    // 距離として解釈される。getBoundingClientRect()は常に現在の可視位置（スクロール分を
+    // 差し引いた後の値）を返すため、その差分をそのままtop/leftに使うと、描画した瞬間の
+    // スクロール量だけずれてしまう（マップをスクロールしてから選択すると顕著に発生した）。
+    // wrapper自身の現在のscrollTop/scrollLeftを足し戻すことで、スクロール位置に関わらず
+    // 常に正しい位置に描画されるようにする
+    const scrollLeft = wrapper.scrollLeft;
+    const scrollTop = wrapper.scrollTop;
+
+    // 音符マット1つ1つを個別に囲うのではなく、その小節に属するレールのマスだけをまとめて覆う
+    // 四角（バウンディングボックス）を描く（センサー・音符マットは枠の対象に含めない。
+    // 含めると音符マットが左右/上下に張り出す分だけ枠が不要に大きくなってしまうため）。
+    // 折り返し（改行）をまたぐ小節はレールが離れた場所に分かれるため、1つの四角にまとめると
+    // 間の無関係な領域まで囲ってしまう。段（data-map-band）ごとにグループ分けし、
+    // 段ごとに別々の四角を描くことで、それぞれのレール区間だけをタイトに囲む
+    const targets = new Map(); // "measureIndex:band" -> {left,top,right,bottom}
+    effective.forEach(measureIndex => {
+        const cells = document.querySelectorAll(`#mapArea [data-measure-index="${measureIndex}"][data-cell-type="rail"]`);
+        if (!cells.length) return;
+
+        const bands = new Map(); // band -> {left,top,right,bottom}
+        cells.forEach(cell => {
+            const band = cell.dataset.mapBand ?? "";
+            const r = cell.getBoundingClientRect();
+            let box = bands.get(band);
+            if (!box) {
+                box = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity };
+                bands.set(band, box);
+            }
+            box.left = Math.min(box.left, r.left);
+            box.top = Math.min(box.top, r.top);
+            box.right = Math.max(box.right, r.right);
+            box.bottom = Math.max(box.bottom, r.bottom);
+        });
+
+        bands.forEach((box, band) => targets.set(`${measureIndex}:${band}`, box));
+    });
+
+    if (!animate) {
+        document.querySelectorAll(".mapSelectionOverlay").forEach(el => el.remove());
+        targets.forEach((box, key) => {
+            wrapper.appendChild(createMapOverlayEl(key, box, wrapperRect, scrollLeft, scrollTop));
+        });
+        return;
+    }
+
+    const existingByKey = new Map();
+    document.querySelectorAll(".mapSelectionOverlay").forEach(el => {
+        existingByKey.set(el.dataset.key, el);
+    });
+
+    existingByKey.forEach((el, key) => {
+        if (!targets.has(key)) fadeOutAndRemove(el);
+    });
+
+    targets.forEach((box, key) => {
+        if (existingByKey.has(key)) return; // 既に表示中ならそのまま
+        const el = createMapOverlayEl(key, box, wrapperRect, scrollLeft, scrollTop);
+        wrapper.appendChild(el);
+        fadeInIfAnimated(el, true);
+    });
+}
+
+// 折り返し軸（段/バンドが変わる方向）のズレを最優先し、進行軸方向のズレは同じ段内での
+// 判定にだけ使う重み付き距離を返す（五線譜タブのgetMeasureIndexFromWrapperXYが「行のズレを
+// 最優先」しているのと同じ考え方）。単純なユークリッド距離だと、段によって長さが違う場合
+// （最後の段が短い等）に、グリッドから大きく外れた位置から一番近いセルを探すと、本来
+// 近いはずの段（例えば最後の段）ではなく、たまたま距離が近いだけの別の段のセルを
+// 誤って選んでしまうことがあった（例: ドラッグの終点がグリッドの右下はるか先にあり、
+// 短い最後の段より、手前の長い段の方が直線距離では近い場合）
+function mapCellWeightedDistance(cx, cy, x, y) {
+    const isVertical = mapSettings.railDirection === "vertical";
+    const wrapDist = isVertical ? Math.abs(cx - x) : Math.abs(cy - y);
+    const travelDist = isVertical ? Math.abs(cy - y) : Math.abs(cx - x);
+    return wrapDist * 100000 + travelDist;
+}
+
+// 指定座標を直接含むセル（レール/センサー/音符マット、どの種類でも良い）があればそれを使う。
+// 無ければ、レールセルだけを対象に、上記の重み付き距離が最も近いものにフォールバックする
+// （マップタブがアクティブな間はページのどこからでもドラッグを開始できるようにするための設計）。
+// フォールバック探索をレールだけに絞るのは、センサー・音符マットは和音の配置
+// （中間層の「遠い/近い」等）により進行軸方向で自分の本来のビート位置から前後にずれて
+// 配置されることがあり、それらも候補に含めると「マウスが一方向に動いているのに、
+// 解決される小節番号が前後してしまう（非単調になる）」問題があったため。レールは
+// 常に自分のビート位置ぴったり（±1の連続する帯）にしか存在せず、小節番号の並び順と
+// 進行軸方向の位置が必ず一致するため、フォールバックの基準として安全に使える
+function findNearestMapCell(x, y) {
+    const allCells = document.querySelectorAll("#mapArea [data-measure-index]");
+    let directHitIndex = null;
+    allCells.forEach(cell => {
+        if (directHitIndex !== null) return;
+        const r = cell.getBoundingClientRect();
+        if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+            directHitIndex = parseInt(cell.dataset.measureIndex, 10);
+        }
+    });
+    if (directHitIndex !== null) return directHitIndex;
+
+    const railCells = document.querySelectorAll('#mapArea [data-measure-index][data-cell-type="rail"]');
+    let nearestIndex = null;
+    let nearestDist = Infinity;
+    railCells.forEach(cell => {
+        const r = cell.getBoundingClientRect();
+        const cx = r.left + r.width / 2;
+        const cy = r.top + r.height / 2;
+        const dist = mapCellWeightedDistance(cx, cy, x, y);
+        if (dist < nearestDist) {
+            nearestDist = dist;
+            nearestIndex = parseInt(cell.dataset.measureIndex, 10);
+        }
+    });
+    return nearestIndex;
+}
+
+// 指定した座標（ビューポート基準）にあるマスが属する小節インデックスを返す。
+// 座標を直接含むマスがあればそれを、無ければ最も近いマスの小節にフォールバックする
+// （マップは隙間だらけのグリッドなので、ドラッグ中の座標がマスの真上とは限らないため）
+function getMapMeasureIndexAtPoint(x, y) {
+    // グリッド本体（#mapGrid）の外側（背景を埋めるために広げた白い余白部分や、ページの
+    // 他の場所）を押しても選択が始まらないようにする
+    const gridDiv = document.getElementById("mapGrid");
+    if (!gridDiv) return null;
+    const gridRect = gridDiv.getBoundingClientRect();
+    if (x < gridRect.left || x > gridRect.right || y < gridRect.top || y > gridRect.bottom) {
+        return null;
+    }
+
+    // どの小節にも属さない「見た目用の余白マス」（renderMap()が表示範囲の端に追加する
+    // 1マス分のマージン、cell.dataset.outsideExtentが立っている）を直接クリックした場合は
+    // 選択しない。レール/センサー/音符マットが無い普通の空白マス（小節の実測範囲内にあり、
+    // たまたまその位置に何も配置されていないだけのマス）はここでは対象外で、
+    // 従来通り下の「最も近いセルへのフォールバック」で選択できる
+    const marginCells = document.querySelectorAll("#mapArea [data-outside-extent]");
+    for (const marginCell of marginCells) {
+        const r = marginCell.getBoundingClientRect();
+        if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+            return null;
+        }
+    }
+
+    return findNearestMapCell(x, y);
+}
+
+// getMapMeasureIndexAtPoint()と同様だが、グリッド外・余白マス（outsideExtent）による
+// null判定を一切行わず、常に最も近いセルの小節を返す（距離無制限のフォールバックのみ）。
+// ドラッグ中は、開始点さえ有効なセル上であれば（setupMapAreaDrag()のmousedownで保証済み）、
+// 現在点がグリッド外や末尾の余白にはみ出しても選択自体は続行してほしい
+// （「エンドポイントは有効として働いてほしい」との要望。クリックのみでの単発選択や、
+// ドラッグの開始点判定には使わず、あくまで進行中のドラッグの現在点解決にだけ使う）
+function getNearestMapMeasureIndex(x, y) {
+    return findNearestMapCell(x, y);
+}
+
+// 開始点の小節（mousedown時点で一度だけ解決し確定させた値）・現在点の小節（都度解決）の
+// 間を「まるっと」全部選択範囲にする（五線譜タブの`getMeasuresInDragRange`と同じ、開始小節→
+// 終了小節の連続範囲という考え方。マップ上でグリッドが物理的にどう並んでいるかは無関係で、
+// あくまで小節番号としての範囲選択にする）。
+// 開始点は生座標(x1,y1)から毎回再解決するのではなく、mousedown時点で一度だけ解決した
+// startMeasureIndexをそのまま受け取る。ドラッグ中に何らかの理由でグリッドが再描画され
+// セル位置が変わった場合でも、開始小節の判定がブレないようにするため
+// （現在点は生きたマウス位置を反映する必要があるため、その都度x2,y2から解決する）
+function getMapMeasuresInDragRange(startMeasureIndex, x2, y2) {
+    const endIndex = getNearestMapMeasureIndex(x2, y2);
+    const result = new Set();
+    if (startMeasureIndex === null || endIndex === null) return result;
+    const from = Math.min(startMeasureIndex, endIndex);
+    const to = Math.max(startMeasureIndex, endIndex);
+    for (let i = from; i <= to; i++) result.add(i);
+    return result;
+}
+
+// マップ上でのクリック/ドラッグによる小節選択。selectedMeasuresは五線譜タブの選択と共有の
+// 状態のため、タブを切り替えると renderScore()/drawSelectionRect() が自動的にこの選択を
+// 五線譜側にも反映する（逆に、五線譜タブで選択してからマップタブに切り替えた場合も
+// renderMap()がselectedMeasuresを見てオーバーレイを描き直す）。
+// 単発クリック（閾値未満の移動）ではその1マスの小節だけを選択、実際にドラッグした場合は
+// 開始点の小節→現在点の小節までの連続範囲をまるごと選択する（五線譜タブのドラッグ選択と
+// 同じ操作感。マス単位ではなく必ず小節単位で選択されるようにするため）
+const MAP_DRAG_THRESHOLD_PX = 4;
+let mapDragState = null;
+
+function setupMapAreaDrag() {
+    document.addEventListener("mousedown", (e) => {
+        // 五線譜タブのドラッグ選択と同じく、マップが表示されている間はページのどこから
+        // （#mapAreaの外からでも）ドラッグを開始できるようにする。ボタン等の通常操作の邪魔を
+        // しないよう、それらの上でのmousedownだけは除外する。
+        // 「両方」タブでは五線譜エリア内でのmousedownはこちらでは処理しない（setupGlobalEvents()側に任せる）
+        if (activeTab !== "map" && activeTab !== "both") return;
+        if (activeTab === "both" && e.target.closest("#scoreWrapper")) return;
+        if (e.target.closest("button")) return;
+        if (e.target.closest("input")) return;
+        if (e.target.closest("label")) return;
+        if (e.target.closest("select")) return;
+        // 単発クリック（ドラッグに発展しなかった場合）用に、グリッド外・余白を除外する
+        // 厳密な判定も別途取っておく。実際にドラッグに発展した場合は、開始点がグリッド外/
+        // 余白上でも（＝マウスを下ろした瞬間はまだ厳密な判定で無効でも）、そこから実際に
+        // ドラッグして有効なセルの方へ動かせば選択できてほしいため、ドラッグ開始自体は
+        // 距離無制限の寛容な判定（getNearestMapMeasureIndex）で許可する
+        const strictStartMeasureIndex = getMapMeasureIndexAtPoint(e.clientX, e.clientY);
+        const lenientStartMeasureIndex = getNearestMapMeasureIndex(e.clientX, e.clientY);
+        if (lenientStartMeasureIndex === null) return; // マップに小節が1つも無い等、本当に何も無い場合のみ諦める
+        mapDragState = {
+            startX: e.clientX,
+            startY: e.clientY,
+            currentX: e.clientX,
+            currentY: e.clientY,
+            isDragging: false,
+            startMeasureIndex: lenientStartMeasureIndex,
+            strictStartMeasureIndex,
+        };
+        e.preventDefault();
+    });
+
+    document.addEventListener("mousemove", (e) => {
+        if (!mapDragState) return;
+        mapDragState.currentX = e.clientX;
+        mapDragState.currentY = e.clientY;
+        if (!mapDragState.isDragging) {
+            const dx = mapDragState.currentX - mapDragState.startX;
+            const dy = mapDragState.currentY - mapDragState.startY;
+            if (Math.hypot(dx, dy) < MAP_DRAG_THRESHOLD_PX) return;
+            mapDragState.isDragging = true;
+        }
+        const previewSet = getMapMeasuresInDragRange(
+            mapDragState.startMeasureIndex,
+            mapDragState.currentX, mapDragState.currentY
+        );
+        drawMapSelectionOverlays(previewSet);
+        // 「両方」タブでは、ドラッグ中のプレビュー範囲をリアルタイムで五線譜側にも反映する
+        if (activeTab === "both") drawSelectionRect(previewSet);
+    });
+
+    document.addEventListener("mouseup", () => {
+        if (!mapDragState) return;
+        if (mapDragState.isDragging) {
+            const measures = getMapMeasuresInDragRange(
+                mapDragState.startMeasureIndex,
+                mapDragState.currentX, mapDragState.currentY
+            );
+            if (measures.size) selectedMeasures = measures;
+        } else if (mapDragState.strictStartMeasureIndex !== null) {
+            // 単発クリック（ドラッグしなかった場合）は、グリッド外・余白のクリックが誤って
+            // 選択されないよう、厳密な判定の結果だけを使う
+            selectedMeasures = new Set([mapDragState.strictStartMeasureIndex]);
+        }
+        mapDragState = null;
+        // 選択が確定した瞬間なので、枠をふわっとフェードインさせる
+        drawMapSelectionOverlays(undefined, true);
+        // 「両方」タブでは、マップ側で確定した選択を五線譜側にも即座に反映する
+        if (activeTab === "both") drawSelectionRect(undefined, true);
+    });
 }
 
 // 音符マット数・レール数・センサー数の表示（全タブ共通、#panelCountに表示）
@@ -1656,7 +2242,10 @@ function updateCountsBar() {
     const { grid } = buildMapGrid();
     let railCellCount = 0;
     let sensorCellCount = 0;
-    grid.forEach(data => {
+    grid.forEach((data, key) => {
+        // レールは上位層/下位層にも表示用に複製されているため、実体(z=0)のみ数える
+        const z = Number(key.split(",")[2]);
+        if (z !== 0) return;
         if (data.type === "rail") railCellCount++;
         if (data.type === "sensor") sensorCellCount++;
     });
@@ -1715,7 +2304,7 @@ function undo() {
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
-    if (activeTab === "map") renderMap();
+    if (activeTab === "map" || activeTab === "both") renderMap();
     rescheduleFromCurrentPosition();
 }
 
@@ -1728,17 +2317,21 @@ function redo() {
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
-    if (activeTab === "map") renderMap();
+    if (activeTab === "map" || activeTab === "both") renderMap();
     rescheduleFromCurrentPosition();
 }
 
 function getMeasuresPerRow() {
     // #scoreWrapperはマップタブ表示中はdisplay:noneになりclientWidthが0になるため、
-    // 常に表示されている#main（タブ切替では中身の表示/非表示しか変えない）の幅を基準にする。
+    // その場合は常に表示されている#mainの幅を基準にする。
     // これを使わないと、マップタブで再生開始した場合に1行1小節と誤って計算され、
     // noteTimeMapのrowIndexが実際の行数と食い違い、五線譜タブに戻したときに再生位置の
-    // 縦線が描画されなくなるバグになる
-    const wrapper = document.getElementById("main");
+    // 縦線が描画されなくなるバグになる。
+    // 一方「両方」タブの左右レイアウトでは#scoreWrapperは非表示ではなく画面の半分幅で
+    // 表示されているため、その場合は#scoreWrapper自身の幅を優先する（#mainの全幅を使うと
+    // 実際より多い小節数で折り返してしまい、はみ出す）
+    const scoreWrapper = document.getElementById("scoreWrapper");
+    const wrapper = (scoreWrapper && scoreWrapper.clientWidth > 0) ? scoreWrapper : document.getElementById("main");
     const availableWidth = wrapper.clientWidth - 40;
     const firstRowWidth = FIRST_MEASURE_EXTRA + STAVE_WIDTH_BASE;
     if (availableWidth < firstRowWidth * scale) return 1;
@@ -2360,15 +2953,74 @@ function renderScore() {
 
 // 選択中（確定 + ドラッグ中の暫定）の小節にDIVオーバーレイでハイライトを重ねる
 // renderScore() を呼ばずに高速更新できるようにするための仕組み
-function drawSelectionRect() {
-    document.querySelectorAll(".selectionHighlight").forEach(el => el.remove());
+// previewSetOverrideを渡すと、自分自身のdragStateではなく指定集合をプレビューとして描画する
+// （「両方」タブでマップ側のドラッグプレビューをリアルタイムで五線譜側にも反映するために使う）
+// animate=trueの場合、要素をopacity:0で追加した直後に次フレームでopacity:1へ遷移させ、
+// ふわっとフェードインさせる。animate=false（既定）なら即座に表示する。
+// ドラッグ中のライブプレビュー等、頻繁に再描画される場面でアニメーションさせると
+// 毎回フェードがやり直されてかえってちらついて見えるため、そうした呼び出しでは使わない
+// （選択操作が確定した瞬間だけanimate=trueを渡す）
+function fadeInIfAnimated(el, animate) {
+    if (!animate) {
+        el.style.opacity = "1";
+        return;
+    }
+    el.style.transition = "opacity 0.15s ease";
+    el.style.opacity = "0";
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+            el.style.opacity = "1";
+        });
+    });
+}
 
+// 要素をふわっとフェードアウトさせてから取り除く（0.15秒後にDOMから削除）
+const SELECTION_FADE_MS = 150;
+function fadeOutAndRemove(el) {
+    el.style.transition = `opacity ${SELECTION_FADE_MS / 1000}s ease`;
+    el.style.opacity = "0";
+    setTimeout(() => el.remove(), SELECTION_FADE_MS);
+}
+
+function createSelectionHighlightEl(measureIndex, rowDivs) {
+    const { rowIndex, left, right } = getMeasureXRange(measureIndex);
+    const rowDiv = rowDivs[rowIndex];
+    if (!rowDiv) return null;
+
+    const top = rowDiv.offsetTop + (STAVE_TOP_BASE - 6) * scale;
+    const height = (score.grandStaff ? GRAND_STAFF_GAP + 130 : 130) * scale;
+
+    const el = document.createElement("div");
+    el.className = "selectionHighlight";
+    el.dataset.measureIndex = measureIndex;
+    el.style.cssText = `
+        position: absolute;
+        left: ${left}px;
+        top: ${top}px;
+        width: ${right - left}px;
+        height: ${height}px;
+        background: rgba(74, 144, 226, 0.14);
+        border: 2px solid rgba(74, 144, 226, 0.55);
+        border-radius: 6px;
+        box-shadow: 0 0 0 3px rgba(74, 144, 226, 0.08);
+        box-sizing: border-box;
+        pointer-events: none;
+        z-index: 5;
+    `;
+    return el;
+}
+
+// animate=false（既定）: 従来通り、既存のハイライトを全部消してから対象を全部描き直す
+// （小節の再レイアウト（拍子/ズーム変更等）を伴う通常の再描画で使う。位置がズレる心配が無い）
+// animate=true: 現在表示中のハイライトと今回表示すべき集合を比較し、新しく選択された
+// ものだけフェードイン、選択から外れたものだけフェードアウトさせる（既に表示中で
+// 引き続き選択されているものはそのまま、消して作り直したりしない）
+function drawSelectionRect(previewSetOverride, animate = false) {
     const scoreElement = document.getElementById("score");
     const rowDivs = scoreElement.querySelectorAll("div[data-row-index]");
-    if (!rowDivs.length || !score.measures.length) return;
 
-    let previewSet = null;
-    if (editMode === "select" && dragState && dragState.isDragging) {
+    let previewSet = previewSetOverride || null;
+    if (!previewSet && editMode === "select" && dragState && dragState.isDragging) {
         previewSet = new Set(getMeasuresInDragRange(
             dragState.startX, dragState.startY,
             dragState.currentX, dragState.currentY
@@ -2377,35 +3029,46 @@ function drawSelectionRect() {
 
     const wrapper = document.getElementById("scoreWrapper");
 
+    if (!animate) {
+        document.querySelectorAll(".selectionHighlight").forEach(el => el.remove());
+        if (!rowDivs.length || !score.measures.length) return;
+        score.measures.forEach((_, measureIndex) => {
+            const isSelected = selectedMeasures.has(measureIndex) ||
+                (previewSet && previewSet.has(measureIndex));
+            if (!isSelected) return;
+            const el = createSelectionHighlightEl(measureIndex, rowDivs);
+            if (el) wrapper.appendChild(el);
+        });
+        return;
+    }
+
+    if (!rowDivs.length || !score.measures.length) {
+        document.querySelectorAll(".selectionHighlight").forEach(el => fadeOutAndRemove(el));
+        return;
+    }
+
+    const targetIndexes = new Set();
     score.measures.forEach((_, measureIndex) => {
         const isSelected = selectedMeasures.has(measureIndex) ||
             (previewSet && previewSet.has(measureIndex));
-        if (!isSelected) return;
+        if (isSelected) targetIndexes.add(measureIndex);
+    });
 
-        const { rowIndex, left, right } = getMeasureXRange(measureIndex);
-        const rowDiv = rowDivs[rowIndex];
-        if (!rowDiv) return;
+    const existingByIndex = new Map();
+    document.querySelectorAll(".selectionHighlight").forEach(el => {
+        existingByIndex.set(Number(el.dataset.measureIndex), el);
+    });
 
-        const top = rowDiv.offsetTop + (STAVE_TOP_BASE - 6) * scale;
-        const height = (score.grandStaff ? GRAND_STAFF_GAP + 130 : 130) * scale;
+    existingByIndex.forEach((el, measureIndex) => {
+        if (!targetIndexes.has(measureIndex)) fadeOutAndRemove(el);
+    });
 
-        const el = document.createElement("div");
-        el.className = "selectionHighlight";
-        el.style.cssText = `
-            position: absolute;
-            left: ${left}px;
-            top: ${top}px;
-            width: ${right - left}px;
-            height: ${height}px;
-            background: rgba(74, 144, 226, 0.14);
-            border: 2px solid rgba(74, 144, 226, 0.55);
-            border-radius: 6px;
-            box-shadow: 0 0 0 3px rgba(74, 144, 226, 0.08);
-            box-sizing: border-box;
-            pointer-events: none;
-            z-index: 5;
-        `;
+    targetIndexes.forEach(measureIndex => {
+        if (existingByIndex.has(measureIndex)) return; // 既に表示中ならそのまま
+        const el = createSelectionHighlightEl(measureIndex, rowDivs);
+        if (!el) return;
         wrapper.appendChild(el);
+        fadeInIfAnimated(el, true);
     });
 }
 
@@ -2508,7 +3171,7 @@ function setupInsertButtons() {
             renderScore();
             setupDeleteButtons();
             setupInsertButtons();
-            if (activeTab === "map") renderMap();
+            if (activeTab === "map" || activeTab === "both") renderMap();
             rescheduleFromCurrentPosition();
         });
 
@@ -3106,8 +3769,12 @@ function setupGlobalEvents() {
     document.addEventListener("mousemove", e => {
         if (!dragState) return;
         const wrapperRect = wrapper.getBoundingClientRect();
-        dragState.currentX = e.clientX - wrapperRect.left;
-        dragState.currentY = e.clientY - wrapperRect.top;
+        // wrapper（「両方」タブではoverflow:autoでスクロール可能）の現在のスクロール量を
+        // 足し戻し、rowDiv.offsetTopなど（スクロール位置に関係ない絶対座標）と比較可能な
+        // 座標系に揃える。これが無いと、五線譜エリアをスクロールした状態でのドラッグ選択が
+        // スクロール量ぶんズレた行を指してしまう（マップ側と同種のバグ）
+        dragState.currentX = e.clientX - wrapperRect.left + wrapper.scrollLeft;
+        dragState.currentY = e.clientY - wrapperRect.top + wrapper.scrollTop;
 
         const dx = dragState.currentX - dragState.startX;
         const dy = dragState.currentY - dragState.startY;
@@ -3116,6 +3783,14 @@ function setupGlobalEvents() {
         }
         if (dragState.isDragging) {
             drawSelectionRect();
+            // 「両方」タブでは、ドラッグ中のプレビュー範囲をリアルタイムでマップ側にも反映する
+            if (activeTab === "both" && editMode === "select") {
+                const previewSet = new Set(getMeasuresInDragRange(
+                    dragState.startX, dragState.startY,
+                    dragState.currentX, dragState.currentY
+                ));
+                drawMapSelectionOverlays(previewSet);
+            }
         }
     });
 
@@ -3134,6 +3809,10 @@ function setupGlobalEvents() {
             }
             dragState = null;
             renderScore();
+            // 選択が確定した瞬間なので、枠をふわっとフェードインさせる
+            drawSelectionRect(undefined, true);
+            // 「両方」タブでは、五線譜側で確定した選択をマップ側にも即座に反映する
+            if (activeTab === "both") drawMapSelectionOverlays(undefined, true);
         } else {
             // ドラッグなし
             const { svg, rowDiv, originalEvent } = dragState;
@@ -3149,12 +3828,15 @@ function setupGlobalEvents() {
                 if (measureIndex >= 0 && measureIndex < score.measures.length) {
                     selectedMeasures = new Set([measureIndex]);
                     renderScore();
+                    drawSelectionRect(undefined, true);
+                    if (activeTab === "both") drawMapSelectionOverlays(undefined, true);
                 }
             } else {
                 // 音符モード：通常の音符編集処理
                 if (selectedMeasures.size > 0) {
                     selectedMeasures.clear();
                     renderScore();
+                    if (activeTab === "both") drawMapSelectionOverlays();
                 }
                 if (svg && editMode === "note") {
                     handleNoteEdit(originalEvent, svg, rowDiv);
@@ -3165,6 +3847,12 @@ function setupGlobalEvents() {
 
     // document全体のmousedownでドラッグ選択を開始（ページのどこからでも）
     document.addEventListener("mousedown", e => {
+        // マップタブの操作（マップ側の独立したドラッグ選択、setupMapAreaDrag()）と
+        // 干渉しないよう、このハンドラは五線譜が表示されている時だけ動く。
+        // 「両方」タブでは五線譜・マップの両エリアが同時に見えるため、マップエリア内での
+        // mousedownはこちらでは処理しない（setupMapAreaDrag()側に任せる）
+        if (activeTab !== "score" && activeTab !== "both") return;
+        if (activeTab === "both" && e.target.closest("#mapAreaWrapper")) return;
         if (e.target.closest("button")) return;
         if (e.target.closest("input")) return;
         if (e.target.closest("label")) return;
@@ -3191,6 +3879,7 @@ function setupGlobalEvents() {
         if (selectedMeasures.size > 0) {
             selectedMeasures.clear();
             drawSelectionRect();
+            if (activeTab === "both") drawMapSelectionOverlays();
         }
 
         // SVG上からのクリックなら svg と rowDiv を記録
@@ -3210,10 +3899,10 @@ function setupGlobalEvents() {
 
         const wrapperRect = wrapper.getBoundingClientRect();
         dragState = {
-            startX: e.clientX - wrapperRect.left,
-            startY: e.clientY - wrapperRect.top,
-            currentX: e.clientX - wrapperRect.left,
-            currentY: e.clientY - wrapperRect.top,
+            startX: e.clientX - wrapperRect.left + wrapper.scrollLeft,
+            startY: e.clientY - wrapperRect.top + wrapper.scrollTop,
+            currentX: e.clientX - wrapperRect.left + wrapper.scrollLeft,
+            currentY: e.clientY - wrapperRect.top + wrapper.scrollTop,
             isDragging: false,
             svg: hitSvg,
             rowDiv: hitRowDiv,
@@ -3257,7 +3946,7 @@ function updateZoom(newScale) {
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
-    if (activeTab === "map") renderMap();
+    if (activeTab === "map" || activeTab === "both") renderMap();
     if (playState !== "stopped") {
         rebuildNoteTimeMap();
     }
@@ -3288,7 +3977,7 @@ function cutSelectedMeasures() {
     setupDeleteButtons();
     setupInsertButtons();
     updateClipboardButtons();
-    if (activeTab === "map") renderMap();
+    if (activeTab === "map" || activeTab === "both") renderMap();
     rescheduleFromCurrentPosition();
 }
 
@@ -3308,7 +3997,7 @@ function pasteSelectedMeasures() {
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
-    if (activeTab === "map") renderMap();
+    if (activeTab === "map" || activeTab === "both") renderMap();
     rescheduleFromCurrentPosition();
 }
 
@@ -3348,7 +4037,7 @@ function deleteSelectedMeasures() {
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
-    if (activeTab === "map") renderMap();
+    if (activeTab === "map" || activeTab === "both") renderMap();
     rescheduleFromCurrentPosition();
 }
 
@@ -3367,7 +4056,7 @@ async function main() {
         measures: migrateMeasuresToStaffArrays(data.measures, !!data.grandStaff, beatsPerMeasureSample)
     };
 
-    // サンプルJSONに表題・テンポ・コンパス・ズーム・マップ設定があれば復元する
+    // サンプルJSONに表題・テンポ・コンパス・マップ設定があれば復元する（ズームはJSONに保存しない）
     if (data.title != null) {
         document.getElementById("scoreTitleInput").value = data.title;
     }
@@ -3377,10 +4066,6 @@ async function main() {
     if (data.northDirection != null) {
         northDirection = data.northDirection;
         document.getElementById("compassLabel").textContent = COMPASS_LABELS[northDirection];
-    }
-    if (data.scale != null) {
-        scale = data.scale;
-        document.getElementById("zoomSlider").value = scale;
     }
     if (data.mapSettings) {
         Object.assign(mapSettings, data.mapSettings);
@@ -3397,18 +4082,24 @@ async function main() {
         btn.addEventListener("click", () => switchTab(tab.id));
         tabContainer.appendChild(btn);
     });
+    // 初回描画時は、インジケーターが(0,0)からスライドしてくるように見えないよう
+    // transitionなしで即座にアクティブタブの位置へ配置する
+    updateTabIndicator(false);
 
     applyTabVisibility();
+    if (activeTab === "both") applyBothTabLayout();
+    updateContentAreaMinHeights();
 
     renderScore();
     saveHistory();
     setupDeleteButtons();
     setupInsertButtons();
     // localStorageに保存されたタブが「五線譜」以外の場合、そのタブの中身も初期描画する
-    if (activeTab === "map") renderMap();
+    if (activeTab === "map" || activeTab === "both") renderMap();
     setupGlobalEvents(); // document/wrapperイベントは一度だけ登録
     setupMapResizeHandle();
     setupNoteToolbarDrag();
+    setupMapAreaDrag();
 
     // モード切替ボタンの初期状態を反映
     updateEditModeButtons();
@@ -3463,7 +4154,7 @@ async function main() {
             updateKeySignatureUI();
             saveHistory();
             renderScore();
-            if (activeTab === "map") renderMap();
+            if (activeTab === "map" || activeTab === "both") renderMap();
             rescheduleFromCurrentPosition();
         });
     document.getElementById("transposeDown")
@@ -3472,7 +4163,7 @@ async function main() {
             updateKeySignatureUI();
             saveHistory();
             renderScore();
-            if (activeTab === "map") renderMap();
+            if (activeTab === "map" || activeTab === "both") renderMap();
             rescheduleFromCurrentPosition();
         });
 
@@ -3485,7 +4176,17 @@ async function main() {
 
     updateClipboardButtons();
 
+    // 「両方」タブのレイアウト切り替えボタン
+    document.getElementById("bothLayoutRotate")?.addEventListener("click", rotateBothTabLayout);
+
     // マップ専用ツールバーのイベント登録
+    ["upper", "middle", "lower"].forEach(layer => {
+        const id = `mapLayer${layer.charAt(0).toUpperCase()}${layer.slice(1)}`;
+        document.getElementById(id)?.addEventListener("click", () => {
+            mapSettings.activeLayer = layer;
+            saveMapSettings(); updateMapToolbarUI(); renderMap();
+        });
+    });
     document.getElementById("mapRailVertical")?.addEventListener("click", () => {
         mapSettings.railDirection = "vertical";
         saveMapSettings(); updateMapToolbarUI(); renderMap();
@@ -3531,6 +4232,8 @@ async function main() {
     updateMapToolbarUI();
 
     window.addEventListener("resize", () => {
+        updateBothTabContainerHeight();
+        updateContentAreaMinHeights();
         renderScore();
         setupDeleteButtons();
         setupInsertButtons();
@@ -3547,7 +4250,7 @@ async function main() {
             setupDeleteButtons();
             setupInsertButtons();
             window.scrollTo(0, scrollY);
-            if (activeTab === "map") renderMap();
+            if (activeTab === "map" || activeTab === "both") renderMap();
             rescheduleFromCurrentPosition();
         });
 
@@ -3622,7 +4325,7 @@ async function main() {
             northDirection = (northDirection + 1) % 4;
             document.getElementById("compassLabel").textContent = COMPASS_LABELS[northDirection];
             updateCountsBar();
-            if (activeTab === "map") renderMap();
+            if (activeTab === "map" || activeTab === "both") renderMap();
         });
 
     document.getElementById("newScoreBtn")
@@ -3663,7 +4366,7 @@ async function main() {
             renderScore();
             setupDeleteButtons();
             setupInsertButtons();
-            if (activeTab === "map") renderMap();
+            if (activeTab === "map" || activeTab === "both") renderMap();
             closeNewScoreModal();
         });
 
@@ -3714,7 +4417,6 @@ async function main() {
                 title,
                 bpm,
                 northDirection,
-                scale,
                 mapSettings: { ...mapSettings },
             };
             const json = JSON.stringify(payload, null, 2);
@@ -3754,10 +4456,6 @@ async function main() {
                         northDirection = data.northDirection;
                         document.getElementById("compassLabel").textContent = COMPASS_LABELS[northDirection];
                     }
-                    if (data.scale != null) {
-                        scale = data.scale;
-                        document.getElementById("zoomSlider").value = scale;
-                    }
                     if (data.mapSettings) {
                         Object.assign(mapSettings, data.mapSettings);
                         saveMapSettings();
@@ -3772,7 +4470,7 @@ async function main() {
                     renderScore();
                     setupDeleteButtons();
                     setupInsertButtons();
-                    if (activeTab === "map") renderMap();
+                    if (activeTab === "map" || activeTab === "both") renderMap();
                 } catch (err) {
                     alert("JSONの読み込みに失敗しました");
                 }

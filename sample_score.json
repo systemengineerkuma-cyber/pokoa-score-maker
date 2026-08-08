@@ -902,7 +902,6 @@
   "grandStaff": false,
   "bpm": 150,
   "northDirection": 0,
-  "scale": 0.72,
   "mapSettings": {
     "railDirection": "horizontal",
     "startCorner": "top-left",
