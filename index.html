@@ -1,42 +1,528 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
     <title>ぽこあスコアメーカー</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎵</text></svg>">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='%234a6cf7'/><stop offset='1' stop-color='%237c5cff'/></linearGradient></defs><rect width='100' height='100' rx='22' fill='url(%23g)'/><g fill='white' transform='translate(22 24) scale(0.11)'><path d='M499.1 6.3c8.1 6 12.9 15.6 12.9 25.7v72V368c0 44.2-43 80-96 80s-96-35.8-96-80s43-80 96-80c11.2 0 22 1.6 32 4.6V147L192 223.8V432c0 44.2-43 80-96 80s-96-35.8-96-80s43-80 96-80c11.2 0 22 1.6 32 4.6V200 128c0-14.1 9.3-26.6 22.8-30.7l320-96c9.7-2.9 20.2-1.1 28.3 5z'/></g></svg>">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
     <style>
+        :root {
+            --font-sans: 'Noto Sans JP', 'Meiryo', 'メイリオ', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+
+            --bg: #f5f5f5;
+            --surface: #fff;
+            --surface-hover: #f0f0f0;
+            --surface-active: #e6e6e6;
+            --surface-muted: #e8e8e8;
+            --border: #ddd;
+            --text: #222;
+            --text-secondary: #444;
+            --text-tertiary: #666;
+            --text-muted: #999;
+            --text-faint: #aaa;
+            --text-subtle: #bbb;
+
+            --accent: #4a6cf7;
+            --accent-dark: #3451d1;
+            --accent-light: #eaefff;
+            --accent-gradient: linear-gradient(135deg, #4a6cf7, #7c5cff);
+
+            --shadow-xs: 0 1px 3px rgba(20, 30, 70, 0.06);
+            --shadow-sm: 0 2px 8px rgba(20, 30, 70, 0.08);
+            --shadow-md: 0 8px 24px rgba(20, 30, 70, 0.14);
+            --shadow-accent: 0 4px 14px rgba(74, 108, 247, 0.35);
+
+            --radius-sm: 6px;
+            --radius-md: 10px;
+            --radius-pill: 999px;
+
+            --drawer-width: 156px;
+        }
+
         * {
             box-sizing: border-box;
             margin: 0;
             padding: 0;
+            scrollbar-width: thin;
+            scrollbar-color: #c7c7d1 transparent;
+        }
+
+        *::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+
+        *::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        *::-webkit-scrollbar-thumb {
+            background: #c7c7d1;
+            border-radius: var(--radius-sm);
+            border: 2px solid var(--bg);
+            background-clip: padding-box;
+        }
+
+        *::-webkit-scrollbar-thumb:hover {
+            background: #a8a8b8;
+            background-clip: padding-box;
         }
 
         body {
-            font-family: 'Meiryo', 'メイリオ', sans-serif;
-            background: #f5f5f5;
-            color: #222;
+            font-family: var(--font-sans);
+            background: var(--bg);
+            color: var(--text);
             min-height: 100vh;
             user-select: none;
+            /* 画面下部固定の#playbackBar(シークバー行上部余白8px+20px+操作行40px+上境界1px=69px)と
+               #statusBar(高さ26px+上境界1px=27px)、合わせて96pxぶんにコンテンツ末尾が
+               隠れないよう、その分だけ下に余白を確保する */
+            padding-bottom: 96px;
         }
 
-        header {
-            background: #111;
-            color: #fff;
-            padding: 5px 14px;
+        /* Spotifyのようなミニプレイヤー風の再生バー。#statusBarのすぐ上に固定する。
+           上段=シークバー（現在位置/総時間）、下段は左=楽譜タイトル+BPM、
+           中央=最初に戻す/停止/再生/ループ（再生ボタンだけ丸で強調）、右=音量、という構成 */
+        #playbackBar {
+            position: fixed;
+            left: 0;
+            right: 0;
+            bottom: 27px;
+            display: flex;
+            flex-direction: column;
+            background: var(--surface);
+            border-top: 1px solid var(--border);
+            box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.06);
+            z-index: 140;
+        }
+
+        /* Spotifyの再生バーのように、画面幅いっぱいではなく中央に収めた
+           控えめな幅にする（幅は再生系ボタンの並びに近い、ほどよい広さに留める） */
+        #seekBarRow {
             display: flex;
             align-items: center;
             gap: 8px;
+            height: 28px;
+            width: 100%;
+            max-width: 640px;
+            margin: 0 auto;
+            padding: 8px 16px 0;
+        }
+
+        #seekBarRow span {
+            font-size: 12px;
+            color: var(--text-faint);
+            font-variant-numeric: tabular-nums;
+            width: 30px;
+        }
+
+        #seekTimeCurrent {
+            text-align: right;
+        }
+
+        /* #playbackBarCenterは、grid(1fr auto 1fr)ではなくleft:50%+transformで
+           position:absolute配置にしている。gridだと左右トラックの内容量（タイトル+BPM vs
+           音量）が違う場合に、左右トラックの実際の幅がズレて中央列がバー全体の真ん中から
+           ズレて見えることがあったため。position:absoluteならバー全体の幅を基準に
+           確実に中央になり、上のシークバー（同じくバー全体基準で中央寄せ）と揃う */
+        /* #playbackControlsRowはバー全体の幅いっぱいに広がる透明な箱のため、
+           pointer-eventsを切っておかないと、中身のボタン以外の「何も無い」部分
+           （タイトル/BPM・音量が視覚的にはみ出して重なっている部分を含む）まで
+           クリックを奪ってしまい、それらが反応しなくなる。ボタン側で
+           pointer-events:autoに戻して、ボタン自身はクリックできるようにする */
+        #playbackControlsRow {
+            position: relative;
+            height: 40px;
+            padding: 0 16px;
+            pointer-events: none;
+        }
+
+        /* タイトル/BPM・音量は、下段（#playbackControlsRow、40px）だけでなく
+           シークバー行も含めたバー全体の高さを基準に縦中央寄せする
+           （そうしないと、シークバーの幅が控えめなため左右に生まれる余白の分だけ、
+           タイトル/音量が下段に寄って見え、縦方向で中央からズレて見えていた） */
+        #playbackBarLeft {
+            position: absolute;
+            left: 16px;
+            top: 0;
+            bottom: 0;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        #playbackBarRight {
+            position: absolute;
+            right: 16px;
+            top: 0;
+            bottom: 0;
+            display: flex;
+            align-items: center;
+        }
+
+        /* 中央4ボタン（最初に戻す/再生/停止/ループ）は、#playbackBarCenterをflexで
+           まとめて中央寄せするのではなく、各ボタンを#playbackControlsRow基準の
+           left:50%からのpxオフセットで個別に配置している。理由: 再生ボタン(32px)の
+           前後にあるボタンの個数・幅が非対称（前=最初に戻すの1個、後=停止+ループの2個）
+           なため、4つをまとめて中央寄せするとグループ全体の中心と再生ボタン自身の
+           中心がズレてしまい、上のシークバー（バー全体基準で中央寄せ）と再生ボタンの
+           位置が合わなくなっていた。オフセットの値はボタン幅(26px/32px)とgap(10px)
+           から計算しているため、これらのサイズを変える場合はここも合わせて調整する */
+        #playbackBarCenter {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: 0;
+            bottom: 0;
+            pointer-events: none;
+        }
+
+        #playbackBarCenter button {
+            pointer-events: auto;
+        }
+
+        #restartBtn {
+            position: absolute;
+            left: calc(50% - 52px); /* 再生ボタン左端(-16px) - gap(10px) - 自身の幅(26px) */
+            top: 50%;
+            transform: translateY(-50%);
+        }
+
+        #stopBtn {
+            position: absolute;
+            left: calc(50% + 26px); /* 再生ボタン右端(+16px) + gap(10px) */
+            top: 50%;
+            transform: translateY(-50%);
+        }
+
+        #loopBtn {
+            position: absolute;
+            left: calc(50% + 62px); /* 停止ボタン右端(+52px) + gap(10px) */
+            top: 50%;
+            transform: translateY(-50%);
+        }
+
+        /* 塗りつぶしだと主張が強すぎたため、枠線だけのゴーストボタンにして
+           控えめなモノクロにしている（大きさだけで他のボタンより主役だと分かる） */
+        .playback-play-btn {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            border: 1.5px solid var(--text-secondary);
+            background: none;
+            color: var(--text-secondary);
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: background 0.15s, transform 0.1s;
+        }
+
+        .playback-play-btn:hover {
+            background: var(--surface-hover);
+        }
+
+        /* transform: translate(-50%,-50%)（中央寄せのため）を上書きしてしまわないよう、
+           :active時もそれを含めた上でscale()を重ねる（別々に指定すると、後から
+           マッチした方のtransformが丸ごと勝ってしまい、中央寄せぶんが失われて
+           ボタンが左上にずれて見えていた＝これが「押すと動く」ように見えた原因） */
+        .playback-play-btn:active {
+            transform: translate(-50%, -50%) scale(0.92);
+        }
+
+        /* 三角形の再生アイコンは図形として重心が左寄りのため、円の幾何学的な中心に
+           合わせると視覚的には左に寄って見える。少し右にずらして光学的に中央へ補正する
+           （一時停止中に表示される左右対称な一時停止アイコンには影響しない） */
+        .playback-play-btn .fa-play {
+            margin-left: 2px;
+        }
+
+        .playback-ctrl-btn {
+            width: 26px;
+            height: 26px;
+            border-radius: 50%;
+            border: none;
+            background: none;
+            color: var(--text-secondary);
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+
+        .playback-ctrl-btn:hover {
+            background: var(--surface-hover);
+        }
+
+        .playback-ctrl-btn:disabled {
+            cursor: not-allowed;
+            pointer-events: none;
+        }
+
+        #statusBar {
+            position: fixed;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            height: 26px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 0 14px;
+            background: var(--surface);
+            border-top: 1px solid var(--border);
+            box-shadow: 0 -2px 6px rgba(0, 0, 0, 0.06);
+            font-size: 12px;
+            color: var(--text-muted);
+            font-variant-numeric: tabular-nums;
+            z-index: 150;
+        }
+
+        #statusBar .status-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            white-space: nowrap;
+        }
+
+        /* 保存状態・選択中の情報は左寄せ、パネルカウント・小節数・ズームは右寄せにするため、
+           右寄せグループの先頭要素（#panelCount）だけmargin-left:autoで手前の余白を吸収させる
+           （gapは維持したまま、このアイテムより後ろだけ右端に押しやられる） */
+        #panelCount {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        #statusSaveState.unsaved i {
+            color: var(--accent);
+        }
+
+        /* ドロワーが開いている間、本体コンテンツをドロワーの幅ぶん押しやる。
+           ヘッダー(header)は常に全幅の土台として動かしたくないので、marginは
+           bodyではなく#stickyHeader内のツールバー行と#mainだけに付ける。
+           margin-leftはアニメーションさせない（五線譜など複雑なコンテンツを含む
+           要素のmargin-leftを毎フレーム変化させると、その都度レイアウト再計算が
+           走ってもっさりして見えるため）。動きの演出はドロワー本体側のtransform
+           スライドだけで表現し、コンテンツの幅は開閉と同時に瞬時に切り替える */
+        body.drawer-pinned #stickyHeader .sticky-toolbars-inner,
+        body.drawer-pinned #main {
+            margin-left: var(--drawer-width);
+        }
+
+        header {
+            background: linear-gradient(135deg, #14141c 0%, #1c1c2c 100%);
+            color: #fff;
+            padding: 3px 14px;
+            height: 30px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        /* 左からスライドしてくるドロワーメニュー。ヘッダーは常に全幅の土台として
+           固定し、ドロワーはヘッダーの高さぶん(30px)下から始めることで、
+           ヘッダーには一切かぶらないようにする */
+        .drawer {
+            position: fixed;
+            top: 30px;
+            left: 0;
+            bottom: 96px;
+            width: var(--drawer-width);
+            max-width: 85vw;
+            background: var(--surface);
+            box-shadow: var(--shadow-md);
+            z-index: 900;
+            display: flex;
+            flex-direction: column;
+            transform: translateX(-100%);
+            transition: transform 0.25s ease;
+        }
+
+        .drawer.open {
+            transform: translateX(0);
+        }
+
+        /* ドロワー本体の右端よりさらに外側(right:負の値)に飛び出させることで、
+           ドロワーが閉じてtranslateXで画面外に出ている間も、このタブだけが
+           画面の左端にちょこんと覗いている状態になる（つまみ/取っ手のイメージ）。
+           開閉はこの矢印だけで行う */
+        .drawer-tab {
+            position: absolute;
+            top: 50%;
+            right: -18px;
+            transform: translateY(-50%);
+            width: 18px;
+            height: 44px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-left: none;
+            border-radius: 0 8px 8px 0;
+            box-shadow: 2px 2px 8px rgba(0, 0, 0, 0.1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            color: var(--text-faint);
+            font-size: 9px;
+        }
+
+        .drawer-tab:hover {
+            color: var(--text);
+            background: var(--surface-hover);
+        }
+
+        .drawer-tab i {
+            transition: transform 0.25s ease;
+        }
+
+        .drawer.open .drawer-tab i {
+            transform: rotate(180deg);
+        }
+
+        .drawer-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 12px;
+            color: var(--text-faint);
+            font-size: 12px;
+        }
+
+        /* ドロワー内の設定項目は、元は横並びツールバー用に作った.toolbarの寄せ集めだと
+           項目ごとに幅も見た目もバラバラになってしまうため、ここだけ専用のスタイルで
+           統一する。ラベルの下に、選択肢の数だけ均等割りしたセグメントボタン列を
+           並べる形（iOSのセグメントコントロールのイメージ）に揃えている */
+        .drawer-settings-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            width: 100%;
+        }
+
+        .drawer-setting {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            width: 100%;
+        }
+
+        .drawer-setting-row {
+            display: flex;
+            width: 100%;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            overflow: hidden;
+        }
+
+        /* 区切り線は各ボタン自身ではなく、行の子要素（ボタンでも数字入力でも）に
+           共通で「最後以外は右側に線」を付ける形にする。以前はボタンだけに
+           border-rightを付けていたため、最大センサー数の行（ボタン-入力欄-ボタン）で
+           入力欄の右（＝下矢印との間）だけ線が抜けてしまっていた */
+        .drawer-setting-row > *:not(:last-child) {
+            border-right: 1px solid var(--border);
+        }
+
+        .drawer-seg-btn {
+            flex: 1;
+            background: var(--surface);
+            border: none;
+            padding: 5px 4px;
+            font-size: 12px;
+            line-height: 1;
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: background 0.15s, color 0.15s;
+        }
+
+        .drawer-seg-btn:hover {
+            background: var(--surface-hover);
+        }
+
+        .drawer-select {
+            width: 100%;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background: var(--surface);
+            padding: 6px 8px;
+            font-size: 12px;
+            color: var(--text);
+            outline: none;
+            cursor: pointer;
+        }
+
+        .drawer-select:focus-visible {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(74, 108, 247, 0.15);
+        }
+
+        .drawer-wrap-input {
+            flex: 1;
+            min-width: 0;
+            border: none;
+            background: transparent;
+            text-align: center;
+            font-size: 12px;
+            font-variant-numeric: tabular-nums;
+            outline: none;
+            color: var(--text);
+            -moz-appearance: textfield;
+        }
+
+        .drawer-wrap-input:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: -2px;
+        }
+
+        /* 左右にすでに増減ボタンがあるので、ブラウザ標準のスピナー矢印は二重になり不要 */
+        .drawer-wrap-input::-webkit-outer-spin-button,
+        .drawer-wrap-input::-webkit-inner-spin-button {
+            -webkit-appearance: none;
+            margin: 0;
+        }
+
+        .brand-mark {
+            width: 20px;
+            height: 20px;
+            border-radius: var(--radius-sm);
+            background: var(--accent-gradient);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: var(--shadow-accent);
+            flex-shrink: 0;
+        }
+
+        .brand-mark i {
+            font-size: 10px;
+            color: #fff;
+        }
+
+        .brand-text {
+            display: flex;
+            flex-direction: column;
+            line-height: 1.3;
         }
 
         #stickyHeader {
             position: sticky;
             top: 0;
             z-index: 100;
-            background: #f5f5f5;
+            background: var(--bg);
             box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
         }
 
@@ -53,14 +539,9 @@
         }
 
         header h1 {
-            font-size: 16px;
-            font-weight: 600;
-            letter-spacing: 0.05em;
-        }
-
-        header i {
-            font-size: 14px;
-            color: #aaa;
+            font-size: 12px;
+            font-weight: normal;
+            letter-spacing: 0.04em;
         }
 
         #main {
@@ -93,54 +574,50 @@
             display: flex;
             align-items: center;
             gap: 3px;
-            background: #fff;
-            border: 1px solid #ddd;
-            border-radius: 6px;
+            background: var(--surface);
+            border-radius: var(--radius-sm);
             padding: 4px 8px;
             min-height: 40px;
+            box-shadow: var(--shadow-xs);
+            transition: box-shadow 0.15s ease;
         }
 
-        /* タブバー（.tab-row）に同居するレイアウトボタンは、通常の.toolbar（min-height:40px、
-           ボタン30x30px）だとタブのピル（高さ約34px）より背が高くなり、「並べて」タブを
-           選んだ瞬間に.tab-row全体の高さが押し広げられてタブ列とツールバー列がわずかに
-           下にずれてしまっていた。タブのピルと高さが揃うようmin-heightを外し、ボタンも
-           一回り小さくする */
-        #toolbarBothLayout {
-            min-height: 0;
-            padding: 2px 6px;
-            margin-left: -2px; /* タブのすぐ右にもう少し寄せる */
-        }
-        #toolbarBothLayout button {
-            width: 28px;
-            height: 28px;
-            font-size: 14px;
+        .toolbar:hover {
+            box-shadow: var(--shadow-sm);
         }
 
-        /* レイアウト切り替えボタンは全タブで常に表示するが、「並べて」タブ以外では
-           操作対象が無いため非活性にする（クリック不可＋見た目を薄くする） */
+        /* disabled属性付きの.toolbarボタン（貼り付けボタンなど、操作対象が無い時に
+           クリック不可＋見た目を薄くする） */
         .toolbar button:disabled {
             opacity: 0.35;
             cursor: not-allowed;
             pointer-events: none;
         }
 
-        /* 音符マット/レール/センサー数（#panelCount）も、「並べて」タブの右（タブ行）に
-           表示するようになったため、#toolbarBothLayoutと同じ理由でmin-heightを外し、
-           タブのピルと高さを揃える */
         #panelCount {
             min-height: 0;
             padding: 5px 8px;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* ツールバー内の項目名ラベル（「調号」「レール方向」等）を、字間を少し空けた
+           小さめ・やや太字にして、管理画面系サイトのセクションラベルらしい見た目にする */
+        .section-label {
+            font-size: 12px;
+            font-weight: normal;
+            color: var(--text-tertiary);
+            letter-spacing: 0.05em;
         }
 
         .toolbar button, .toolbar label {
             background: none;
             border: none;
             cursor: pointer;
-            color: #444;
-            font-size: 16px;
-            width: 30px;
-            height: 30px;
-            border-radius: 6px;
+            color: var(--text-secondary);
+            font-size: 14px;
+            width: 28px;
+            height: 28px;
+            border-radius: var(--radius-sm);
             display: flex;
             align-items: center;
             justify-content: center;
@@ -148,14 +625,14 @@
         }
 
         .toolbar button:hover, .toolbar label:hover {
-            background: #f0f0f0;
+            background: var(--surface-hover);
             transform: translateY(-1px);
             box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
         }
 
         .toolbar button:active, .toolbar label:active {
             transform: translateY(0) scale(0.92);
-            background: #e6e6e6;
+            background: var(--surface-active);
             box-shadow: none;
             transition: background 0.05s, transform 0.05s;
         }
@@ -165,32 +642,62 @@
             display: flex;
             align-items: center;
             gap: 4px;
-            background: #f5f5f5;
-            border-radius: 14px;
+            background: var(--bg);
+            border-radius: var(--radius-pill);
             padding: 3px 10px 3px 8px;
         }
 
         /* アイコン1文字用の固定サイズではなく、文字ラベル用に幅・文字サイズを揃えたボタン */
         .toolbar button.text-btn {
             width: auto;
-            min-width: 30px;
+            min-width: 28px;
             padding: 0 8px;
             font-size: 12px;
             white-space: nowrap;
         }
 
-        /* 音符/休符グループはデフォルトでツールバーにドッキングされているが、
-           グリップハンドルをドラッグして切り離す（フローティング化する）ことができる。
-           ドッキング中は#toolbarDurationRow（flex-basis:100%の透明なラッパー、幅だけ
-           次の行を占有し中身は自身のコンテンツ幅のまま）に包まれることで、余分な空白の
-           箱を作らずに常にツールバーの次の行から単独で始まるようにしている */
+        /* 音符/休符グループはデフォルトでツールバー（#toolbarDurationToolbarSlot、
+           以前ズームがあった場所）にドッキングされているが、グリップハンドルをドラッグして
+           切り離す（フローティング化する）ことも、ドロワー内（#toolbarDurationDrawerSlot）へ
+           ドッキングし直すこともできる（setupNoteToolbarDrag参照） */
         #toolbarDuration {
             flex-wrap: wrap;
         }
 
+        /* ドロワーへドッキングした時だけ、幅の狭さに合わせて2列（左:音符/右:休符）の
+           グリッドレイアウトに切り替える（通常のツールバー幅では横一列で十分収まるため） */
+        #toolbarDuration.drawer-columns {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            /* denseにしないと、音符列(1列目)を先に一気に敷き詰めてから休符列(2列目)に
+               移るため、休符側だけ音符列の下に取り残されてズレてしまう
+               （スパース配置はカーソルを後戻りさせないため） */
+            grid-auto-flow: dense;
+            gap: 2px;
+            /* ドロワー内では周囲がbox-shadowだけだと他の設定項目に埋もれて見づらいため、
+               他の.drawer-setting-row同様、はっきりした枠線で囲んでグループを分かりやすくする */
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+        }
+        #toolbarDuration.drawer-columns #toolbarDurationHandle {
+            grid-column: 1 / 3;
+        }
+        #toolbarDuration.drawer-columns .dur-sep {
+            display: none;
+        }
+        #toolbarDuration.drawer-columns button[data-kind="note"] {
+            grid-column: 1;
+        }
+        #toolbarDuration.drawer-columns button[data-kind="rest"] {
+            grid-column: 2;
+        }
+
         #toolbarDuration.floating {
             position: fixed;
-            z-index: 90;
+            /* ドロワー（z-index:900）やヘッダー（100）より低かったため、フローティング中に
+               それらの下へ潜り込んでしまっていた。ユーザーが直接ドラッグして操作する
+               フローティングパネルなので、常に手前（ヘルプポップオーバーと同格）に来るようにする */
+            z-index: 950;
             box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
             /* position:fixed+leftのみ指定だとwidth:autoの場合、CSS仕様上「leftから
                ビューポート右端までの残り幅」に収縮してしまい、右端付近では中身が
@@ -203,18 +710,18 @@
         /* ツールバー付近までドラッグすると、離す前にドッキング後の位置へ吸い付いて見せる */
         #toolbarDuration.floating.snapping {
             transition: left 0.08s ease-out, top 0.08s ease-out;
-            outline: 3px solid #4a90e2;
+            outline: 3px solid var(--accent);
         }
 
         .drag-handle {
             display: flex;
             align-items: center;
             justify-content: center;
-            width: 18px;
-            height: 30px;
-            color: #bbb;
+            width: 16px;
+            height: 28px;
+            color: var(--text-subtle);
             cursor: grab;
-            font-size: 14px;
+            font-size: 13px;
         }
 
         .drag-handle:active {
@@ -229,18 +736,144 @@
             margin: 0 6px;
         }
 
+        /* ズーム/音量/シークバーは共通の見た目にする。ブランドカラー(--accent)は
+           ズーム・音量・再生ボタンには使わない方針のため、塗り分けはニュートラルな
+           濃淡（--text / --border）のみで表現する */
+        #zoomSlider,
+        #volumeSlider,
+        #seekBar {
+            -webkit-appearance: none;
+            appearance: none;
+            height: 16px;
+            background: transparent;
+            outline: none;
+            cursor: pointer;
+            vertical-align: middle;
+        }
+
         #zoomSlider {
             width: 240px;
-            accent-color: #222;
+        }
+
+        #seekBar {
+            flex: 1;
+            min-width: 0;
+        }
+
+        #zoomSlider::-webkit-slider-runnable-track,
+        #volumeSlider::-webkit-slider-runnable-track,
+        #seekBar::-webkit-slider-runnable-track {
+            height: 4px;
+            border-radius: var(--radius-pill);
+            background: linear-gradient(to right,
+                var(--text) 0%, var(--text) var(--fill, 50%),
+                var(--border) var(--fill, 50%), var(--border) 100%);
+        }
+
+        #zoomSlider::-webkit-slider-thumb,
+        #volumeSlider::-webkit-slider-thumb,
+        #seekBar::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 14px;
+            height: 14px;
+            margin-top: -5px;
+            border-radius: 50%;
+            background: var(--surface);
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(0, 0, 0, 0.08);
+            cursor: pointer;
+            transition: transform 0.12s ease, box-shadow 0.12s ease, opacity 0.12s ease;
+        }
+
+        /* シークバーのつまみは、普段は透明にしておき、行にマウスを乗せた時だけ
+           見せることで、Spotifyのような「普段は細い線、ホバーで操作可能に見える」
+           印象にする */
+        #seekBar::-webkit-slider-thumb {
+            margin-top: -6px;
+            opacity: 0;
+        }
+
+        #seekBarRow:hover #seekBar::-webkit-slider-thumb {
+            opacity: 1;
+        }
+
+        #zoomSlider::-webkit-slider-thumb:hover,
+        #volumeSlider::-webkit-slider-thumb:hover,
+        #seekBar::-webkit-slider-thumb:hover {
+            transform: scale(1.15);
+            box-shadow: 0 2px 7px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(0, 0, 0, 0.08);
+        }
+
+        #zoomSlider::-webkit-slider-thumb:active,
+        #volumeSlider::-webkit-slider-thumb:active,
+        #seekBar::-webkit-slider-thumb:active {
+            transform: scale(0.92);
+        }
+
+        #zoomSlider::-moz-range-track,
+        #volumeSlider::-moz-range-track,
+        #seekBar::-moz-range-track {
+            height: 4px;
+            border-radius: var(--radius-pill);
+            background: var(--border);
+        }
+
+        #zoomSlider::-moz-range-progress,
+        #volumeSlider::-moz-range-progress,
+        #seekBar::-moz-range-progress {
+            height: 4px;
+            border-radius: var(--radius-pill);
+            background: var(--text);
+        }
+
+        #zoomSlider::-moz-range-thumb,
+        #volumeSlider::-moz-range-thumb,
+        #seekBar::-moz-range-thumb {
+            width: 14px;
+            height: 14px;
+            border: none;
+            border-radius: 50%;
+            background: var(--surface);
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(0, 0, 0, 0.08);
+            cursor: pointer;
+            transition: transform 0.12s ease, box-shadow 0.12s ease, opacity 0.12s ease;
+        }
+
+        #seekBar::-moz-range-thumb {
+            opacity: 0;
+        }
+
+        #seekBarRow:hover #seekBar::-moz-range-thumb {
+            opacity: 1;
+        }
+
+        #zoomSlider::-moz-range-thumb:hover,
+        #volumeSlider::-moz-range-thumb:hover,
+        #seekBar::-moz-range-thumb:hover {
+            transform: scale(1.15);
+        }
+
+        #zoomSlider:focus-visible::-webkit-slider-thumb,
+        #volumeSlider:focus-visible::-webkit-slider-thumb,
+        #seekBar:focus-visible::-webkit-slider-thumb,
+        #zoomSlider:focus-visible::-moz-range-thumb,
+        #volumeSlider:focus-visible::-moz-range-thumb,
+        #seekBar:focus-visible::-moz-range-thumb {
+            box-shadow: 0 0 0 3px rgba(34, 34, 34, 0.15), 0 1px 4px rgba(0, 0, 0, 0.3);
+            opacity: 1;
         }
 
         #scoreWrapper {
             position: relative;
-            background: #fff;
-            border: 1px solid #ddd;
-            border-radius: 8px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
             overflow: visible;
-            padding: 4px 0;
+            /* 左右方向はVexFlowの描画座標や小節の追加/削除/挿入ボタンの絶対配置が
+               左端0基準で計算されているため、左右のpaddingは0のまま変えない
+               （変えると譜面とボタンの位置がずれる）。上下だけ広げて余白を作る */
+            padding: 10px 0;
+            box-shadow: var(--shadow-sm);
         }
 
         #mapAreaWrapper {
@@ -254,37 +887,76 @@
            （上下2パターンは2026-08-04にユーザーの依頼で廃止済み） */
         #bothTabContainer.bothTabActive {
             display: grid;
-            gap: 12px;
+            gap: 0;
         }
 
         /* 左右入れ替えボタンのアイコンを、押すたびに左右反転させる
            （左右2パターンをトグルしていることを視覚的に伝える。反転自体はJSがtransform
            を都度書き換えて行う） */
+        /* 境界線（#bothTabDivider）のちょうど中央に重ねて表示する、四角いボタン。
+           境界線自体は10px幅しかないため、ボタンはその両側の五線譜/マップ領域に
+           少しはみ出す形になる（position:absoluteなのでクリック判定・見た目とも問題ない） */
+        #bothLayoutRotate {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 26px;
+            height: 26px;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border);
+            background: var(--surface);
+            color: var(--text-secondary);
+            font-size: 12px;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            box-shadow: var(--shadow-sm);
+            z-index: 5;
+            transition: background 0.15s, box-shadow 0.15s;
+        }
+
+        #bothLayoutRotate:hover {
+            background: var(--surface-hover);
+            box-shadow: var(--shadow-md);
+        }
+
         #bothLayoutRotate i {
             display: inline-block;
             transition: transform 0.3s ease;
         }
 
-        /* 左右2パターン: grid-template-columns: 1fr 1fr で幅をちょうど半分ずつに分ける。
+        /* 左右2パターン: 3列（左パネル/境界線/右パネル）のgridにする。左右の幅の比率は
+           #bothTabDividerをドラッグしてJS側（applyBothSplitRatio）がgrid-template-columnsを
+           直接書き換えることで調整できるようにしている（ここでの1fr 10px 1frは初期値）。
            grid-columnだけ指定してgrid-rowをautoのままにすると、ブラウザによっては
            もう片方の要素が意図せず2段目（暗黙の行）に配置されてしまうことがあったため、
-           両方の子要素に明示的にgrid-row: 1を指定して1行に固定する。
+           3つの子要素すべてに明示的にgrid-row: 1を指定して1行に固定する。
            このパターンでも#bothTabContainerの高さはJS側（updateBothTabContainerHeight）で
            ブラウザ表示領域基準に計算・指定しており、五線譜側・マップ側それぞれが
            下のoverflow:autoルールにより独立して縦スクロールできるようになっている */
         #bothTabContainer.bothTabActive.layout-left-right,
         #bothTabContainer.bothTabActive.layout-right-left {
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: 1fr 10px 1fr;
             grid-template-rows: 1fr;
         }
         #bothTabContainer.bothTabActive.layout-left-right > #scoreWrapper,
         #bothTabContainer.bothTabActive.layout-left-right > #mapAreaWrapper,
+        #bothTabContainer.bothTabActive.layout-left-right > #bothTabDivider,
         #bothTabContainer.bothTabActive.layout-right-left > #scoreWrapper,
-        #bothTabContainer.bothTabActive.layout-right-left > #mapAreaWrapper {
+        #bothTabContainer.bothTabActive.layout-right-left > #mapAreaWrapper,
+        #bothTabContainer.bothTabActive.layout-right-left > #bothTabDivider {
             grid-row: 1;
         }
-        #bothTabContainer.bothTabActive.layout-right-left > #scoreWrapper { grid-column: 2; }
+        #bothTabContainer.bothTabActive.layout-left-right > #scoreWrapper { grid-column: 1; }
+        #bothTabContainer.bothTabActive.layout-left-right > #mapAreaWrapper { grid-column: 3; }
         #bothTabContainer.bothTabActive.layout-right-left > #mapAreaWrapper { grid-column: 1; }
+        #bothTabContainer.bothTabActive.layout-right-left > #scoreWrapper { grid-column: 3; }
+        #bothTabContainer.bothTabActive > #bothTabDivider {
+            grid-column: 2;
+        }
 
         #bothTabContainer.bothTabActive > #scoreWrapper,
         #bothTabContainer.bothTabActive > #mapAreaWrapper {
@@ -293,38 +965,104 @@
             overflow: auto;
         }
 
-        /* 「表示する層」ボタン（上位層/中間層/下位層）は、以前はマップ専用ツールバーの
-           一部として並んでいたが、「音符マットエリアにホバーしたい（＝マップの上に
-           浮かせて表示したい）」との要望を受け、#mapAreaWrapper（position:relative）を
-           基準にposition:absoluteで右上に重ねて表示するよう変更した。リサイズハンドル
-           （.map-resize-handle）と同じ「ラッパー基準の絶対配置」の仕組みを踏襲している。
-           その後「グリッドにかぶる」との指摘を受け、普段は薄く目立たせておき、マップ
-           エリアにマウスをホバーした時だけくっきり見えるようにした（トロッコ開始地点の
-           設定次第でどの角にも実データが来うるため、常に空くコーナーを確保する代わりに
-           この方式を採用した） */
-        #mapLayerOverlay {
+        /* 「並べて」タブでのみ表示する、五線譜/マップの幅比率を調整するための境界線。
+           10px幅の当たり判定の中央に2pxの線を置き、ホバー/ドラッグ中はアクセントカラーで
+           光らせて操作対象であることを伝える */
+        /* 境界線の見た目（縦線）は表示しない。ドラッグでの幅調整自体は
+           このまま10px幅の透明な当たり判定エリアとして機能する */
+        #bothTabDivider {
+            display: none;
+            position: relative;
+            cursor: col-resize;
+        }
+        #bothTabContainer.bothTabActive > #bothTabDivider {
+            display: block;
+        }
+
+        /* コンパス（北の向き）と「表示する層」ボタン（上位層/中間層/下位層）は、以前は
+           マップ専用ツールバーの一部として並んでいたが、「音符マットエリアにホバーしたい
+           （＝マップの上に浮かせて表示したい）」との要望を受け、#mapAreaWrapper
+           （position:relative）を基準にposition:absoluteで右上に重ねて表示するよう
+           変更した。リサイズハンドル（.map-resize-handle）と同じ「ラッパー基準の絶対配置」
+           の仕組みを踏襲している。その後「グリッドにかぶる」との指摘を受け、普段は薄く
+           目立たせておき、マップエリアにマウスをホバーした時だけくっきり見えるようにした
+           （トロッコ開始地点の設定次第でどの角にも実データが来うるため、常に空くコーナーを
+           確保する代わりにこの方式を採用した）。
+           「並べて」タブ等、#mapAreaWrapper自体がスクロールする（overflow:auto）場面では、
+           position:absoluteだけだとスクロール内容と一緒に流れていってしまう
+           （リサイズハンドルはグリッドの実際の端に追従させたいのでそれで正しいが、この
+           コーナーUIは常に見えている角に留まってほしい）。position:stickyはtop方向は
+           効くがright方向はサイズがscroll幅に依存してしまい効かなかったため、
+           JS側（#mapAreaWrapperのscrollイベント）でtranslateを使いスクロール量を
+           打ち消して常に同じ画面位置に留まるようにしている（setupMapCornerOverlayScrollSync参照） */
+        #mapCornerOverlay {
             position: absolute;
             top: 8px;
             right: 8px;
             z-index: 10;
+            display: flex;
             flex-direction: column;
+            align-items: flex-end;
+            gap: 8px;
             opacity: 0.15;
             transition: opacity 0.15s ease;
         }
-        #mapAreaWrapper:hover #mapLayerOverlay {
+        #mapAreaWrapper:hover #mapCornerOverlay {
+            opacity: 1;
+        }
+        #mapLayerOverlay {
+            flex-direction: column;
+        }
+        /* コンパスボタンは他のツールバーボタンと違いアイコン+文字ラベルを横並びで持つため、
+           固定28px幅ではなく内容に合わせた幅にする */
+        #mapCompassOverlay button {
+            width: auto;
+            padding: 0 6px;
+        }
+        /* 矢印の向き（↑↓→←）ごとにグリフの実測幅が微妙に異なり、切り替えるたびに
+           ボタン全体の幅がわずかにブレて見えてしまうため、ラベル部分の幅を固定して吸収する */
+        #compassLabel {
+            display: inline-block;
+            width: 14px;
+            text-align: center;
+        }
+
+        /* 3層を重ねたアイコン。上位層/中間層/下位層のバーを縦に並べ、選択中の層だけ
+           濃く表示することで、現在どの層を見ているかをアイコン単体で把握できるようにする */
+        #mapLayerStack {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 3px;
+            width: 28px;
+            height: 28px;
+            cursor: default;
+        }
+        .map-layer-bar {
+            width: 16px;
+            height: 3px;
+            border-radius: var(--radius-pill);
+            background: var(--border);
+            opacity: 0.6;
+            transition: background 0.15s ease, opacity 0.15s ease;
+        }
+        .map-layer-bar.active {
+            background: var(--accent-dark);
             opacity: 1;
         }
 
         #mapArea {
-            background: #fff;
-            border: 1px solid #ddd;
-            border-radius: 8px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
             width: fit-content;
             /* 音符マットが少なくグリッドが狭い時でも、白背景はエリアの幅いっぱいに広がる
                ようにする（グリッドがエリアより広い場合は従来通りwidth: fit-contentが
                優先され、白背景がきっちり内容を囲む＝はみ出し分は外側のスクロールに任せる） */
             min-width: 100%;
-            padding: 4px;
+            padding: 8px;
+            box-shadow: var(--shadow-sm);
         }
 
         .map-resize-handle {
@@ -335,7 +1073,7 @@
         #mapResizeHandleRight {
             width: 10px;
             cursor: ew-resize;
-            background-image: linear-gradient(90deg, transparent 0 30%, #bbb 30% 40%, transparent 40% 60%, #bbb 60% 70%, transparent 70% 100%);
+            background-image: linear-gradient(90deg, transparent 0 30%, var(--text-subtle) 30% 40%, transparent 40% 60%, var(--text-subtle) 60% 70%, transparent 70% 100%);
             background-repeat: no-repeat;
             background-position: center;
             background-size: 10px 28px;
@@ -344,7 +1082,7 @@
         #mapResizeHandleBottom {
             height: 10px;
             cursor: ns-resize;
-            background-image: linear-gradient(0deg, transparent 0 30%, #bbb 30% 40%, transparent 40% 60%, #bbb 60% 70%, transparent 70% 100%);
+            background-image: linear-gradient(0deg, transparent 0 30%, var(--text-subtle) 30% 40%, transparent 40% 60%, var(--text-subtle) 60% 70%, transparent 70% 100%);
             background-repeat: no-repeat;
             background-position: center;
             background-size: 28px 10px;
@@ -354,7 +1092,7 @@
             width: 16px;
             height: 16px;
             cursor: nwse-resize;
-            background-image: linear-gradient(135deg, transparent 0 40%, #bbb 40% 46%, transparent 46% 60%, #bbb 60% 66%, transparent 66% 80%, #bbb 80% 86%, transparent 86%);
+            background-image: linear-gradient(135deg, transparent 0 40%, var(--text-subtle) 40% 46%, transparent 46% 60%, var(--text-subtle) 60% 66%, transparent 66% 80%, var(--text-subtle) 80% 86%, transparent 86%);
         }
 
         #score {
@@ -363,14 +1101,14 @@
 
         #addMeasureBtn {
             position: absolute;
-            width: 28px;
-            height: 28px;
+            width: 24px;
+            height: 24px;
             background: none;
-            color: #bbb;
+            color: var(--text-subtle);
             border: none;
             border-radius: 50%;
             cursor: pointer;
-            font-size: 16px;
+            font-size: 14px;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -388,7 +1126,7 @@
             position: relative;
             display: flex;
             gap: 3px;
-            background: #e8e8e8;
+            background: var(--surface-muted);
             padding: 3px;
             border-radius: 9px;
         }
@@ -402,8 +1140,8 @@
             top: 3px;
             bottom: 3px;
             border-radius: 7px;
-            background: #fff;
-            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+            background: var(--surface);
+            box-shadow: var(--shadow-sm);
             transition: left 0.2s ease, width 0.2s ease;
             z-index: 0;
             pointer-events: none;
@@ -420,14 +1158,14 @@
             border-radius: 7px;
             padding: 5px 14px;
             font-size: 12px;
-            color: #999;
+            color: var(--text-muted);
             cursor: pointer;
             font-family: inherit;
             transition: color 0.15s;
         }
 
         .tab-btn i {
-            font-size: 11px;
+            font-size: 10px;
         }
 
         .tab-btn:hover {
@@ -435,12 +1173,12 @@
         }
 
         .tab-active {
-            color: #111;
-            font-weight: 700;
+            color: var(--accent-dark);
+            font-weight: normal;
         }
 
         .tab-active:hover {
-            color: #111;
+            color: var(--accent-dark);
         }
 
         .deleteMeasureBtn {
@@ -448,14 +1186,14 @@
             display: flex;
             align-items: center;
             justify-content: center;
-            width: 28px;
-            height: 28px;
+            width: 24px;
+            height: 24px;
             background: none;
-            color: #bbb;
+            color: var(--text-subtle);
             border: none;
             border-radius: 50%;
             cursor: pointer;
-            font-size: 16px;
+            font-size: 14px;
             z-index: 10;
             opacity: 0.35;
             transition: color 0.15s, opacity 0.15s;
@@ -471,14 +1209,14 @@
             display: flex;
             align-items: center;
             justify-content: center;
-            width: 28px;
-            height: 28px;
+            width: 24px;
+            height: 24px;
             background: none;
-            color: #bbb;
+            color: var(--text-subtle);
             border: none;
             border-radius: 50%;
             cursor: pointer;
-            font-size: 16px;
+            font-size: 14px;
             z-index: 10;
             opacity: 0.35;
             transition: color 0.15s, opacity 0.15s;
@@ -489,42 +1227,179 @@
             opacity: 1;
         }
 
+        /* 常時表示のヘルプ帯だと場所を取るため、ホバーで開くポップオーバーにしている。
+           #helpBtnをホバー中はCSSだけで開閉できるが、クリックで「ピン留め」もできるように
+           したいため（ホバーだけだとマウスを離すとすぐ閉じてじっくり読めない/タッチ操作
+           でも開けない）、ピン留め中かどうかはJS側で.pinnedクラスを付け外しして制御する */
+        /* #infoWrap自身がposition+z-indexを持つため、独自のスタッキングコンテキストを
+           作る。#info（ポップオーバー）側でどれだけz-indexを上げても、この#infoWrapの
+           z-indexがヘッダー(100)・再生バー(140)・ステータスバー(150)・ドロワー(900)より
+           低いと、内側の#infoごと下に埋もれてしまう。そのため#infoWrap自体をそれらより
+           高くしておく（モーダル1000・トースト2000より下にはしておき、それらとは
+           同時に出ないはずだが万一重なっても表示の優先度が自然になるようにする） */
+        #infoWrap {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            z-index: 950;
+        }
+
+        #helpBtn {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            border: none;
+            background: none;
+            color: var(--text-faint);
+            font-size: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: background 0.15s, color 0.15s;
+        }
+
+        #helpBtn:hover,
+        #helpBtn.pinned {
+            background: var(--surface-hover);
+            color: var(--text-secondary);
+        }
+
         #info {
-            margin-top: 16px;
+            position: absolute;
+            top: 100%;
+            right: 0;
+            margin-top: 8px;
+            width: max-content;
+            max-width: min(360px, 90vw);
             font-size: 12px;
-            color: #aaa;
-            line-height: 1.8;
-            border-top: 1px solid #ddd;
-            padding-top: 12px;
+            color: var(--text-faint);
+            /* backdrop-filter(すりガラス風のぼかし)は、この環境では効果が乗らないどころか
+               rgba背景の透過自体も一緒に潰してほぼ不透明に見えてしまっていたため使わない。
+               単純なrgba背景だけなら透過が正しく反映されることを確認済み */
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            box-shadow: var(--shadow-md);
+            padding: 10px 14px;
+            z-index: 50;
+            display: none;
         }
 
-        #info span {
-            display: inline-block;
-            background: #f0f0f0;
-            border-radius: 4px;
-            padding: 2px 8px;
-            margin: 2px;
-            color: #555;
+        /* 「？」ボタンのクリックでのみ開閉する（ホバーでは開かない） */
+        #info.pinned {
+            display: block;
         }
 
-        #scoreTitle {
+        /* ドラッグでウィンドウのように自由に動かせるようにした際、position:fixedへ
+           切り替えて画面基準の座標を直接指定する（JS側でinline style指定）。
+           その状態でもここでのtop/right/margin-topが混ざらないよう明示的に打ち消す */
+        #info.dragged {
+            position: fixed;
+            top: auto;
+            right: auto;
+            margin-top: 0;
+        }
+
+        /* タイトルバー相当。ここをドラッグしてウィンドウごと移動できる */
+        #infoHeader {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 12px;
+            margin: -10px -14px 4px -14px;
+            padding: 2px 10px 4px 14px;
+            color: var(--text-secondary);
+            font-weight: normal;
+            user-select: none;
+        }
+
+        /* ヘッダーだけでなくウィンドウ内のどこからでもドラッグして動かせるようにしたため、
+           カーソルもウィンドウ全体でmoveにする（閉じるボタンは下の#infoCloseBtnで
+           個別にpointerへ戻している） */
+        #info {
+            cursor: move;
+        }
+
+        #infoCloseBtn {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            border: none;
+            background: none;
+            color: var(--text-faint);
+            font-size: 11px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+        }
+
+        #infoCloseBtn:hover {
+            background: var(--surface-hover);
+            color: var(--text-secondary);
+        }
+
+        .info-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
             margin-bottom: 6px;
+        }
+
+        .info-row:last-child {
+            margin-bottom: 0;
+        }
+
+        .info-row span {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            flex-shrink: 0;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-bottom: 2px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 3px 9px;
+            color: var(--text-secondary);
+            font-family: Consolas, 'SFMono-Regular', Menlo, 'Liberation Mono', monospace;
+            font-size: 12px;
+        }
+
+        .info-row span i {
+            color: var(--accent);
+        }
+
+        /* 再生バー左側に置くため、以前のような独立したカード（背景/枠線/影）は持たせず、
+           バー内の他の要素と地続きに見える最小限のスタイルにする */
+        #scoreTitle {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+        }
+
+        #scoreTitle i {
+            font-size: 11px;
+            color: var(--text-faint);
         }
 
         #scoreTitleInput {
             border: none;
-            border-bottom: 1px solid #ddd;
+            border-bottom: 1px solid transparent;
             font-size: 12px;
-            color: #222;
+            font-weight: normal;
+            color: var(--text);
             outline: none;
             background: transparent;
-            padding: 2px 0 2px 6px;
-            width: 300px;
+            padding: 2px 0;
+            width: 160px;
+            min-width: 0;
             user-select: text;
         }
 
         #scoreTitleInput:focus {
-            border-bottom: 1px solid #222;
+            border-bottom: 1px solid var(--accent);
         }
 
         @keyframes modalOverlayFadeIn {
@@ -549,17 +1424,17 @@
         }
 
         .modal-box {
-            background: #fff;
-            border-radius: 10px;
+            background: var(--surface);
+            border-radius: var(--radius-md);
             padding: 20px 24px;
             width: 320px;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+            box-shadow: var(--shadow-md), 0 8px 24px rgba(0, 0, 0, 0.25);
             animation: modalBoxScaleIn 0.18s ease-out;
         }
 
         .modal-box h2 {
-            font-size: 15px;
-            font-weight: 600;
+            font-size: 12px;
+            font-weight: normal;
             margin-bottom: 16px;
         }
 
@@ -573,8 +1448,8 @@
 
         .modal-label {
             display: block;
-            font-size: 11px;
-            color: #aaa;
+            font-size: 12px;
+            color: var(--text-faint);
             margin-bottom: 6px;
         }
 
@@ -586,33 +1461,128 @@
         }
 
         .modal-btn-primary, .modal-btn-secondary {
-            border-radius: 6px;
+            border-radius: var(--radius-sm);
             padding: 6px 16px;
-            font-size: 13px;
+            font-size: 12px;
             cursor: pointer;
             font-family: inherit;
         }
 
         .modal-btn-primary {
-            background: #222;
+            background: var(--accent);
             color: #fff;
             border: none;
+            transition: background 0.15s;
+        }
+
+        .modal-btn-primary:hover {
+            background: var(--accent-dark);
         }
 
         .modal-btn-secondary {
             background: none;
-            border: 1px solid #ddd;
-            color: #444;
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+        }
+
+        /* 保存/アンドゥ/リドゥなど、画面の見た目に変化が出にくい操作の手応えを
+           伝えるための一時的な通知。画面下中央に積み上げて表示する */
+        #toastContainer {
+            position: fixed;
+            left: 50%;
+            bottom: 118px;
+            transform: translateX(-50%);
+            z-index: 2000;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            pointer-events: none;
+        }
+
+        @keyframes toastIn {
+            from { opacity: 0; transform: translateY(8px) scale(0.96); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        .toast {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: #1c1c24;
+            color: #fff;
+            font-size: 12px;
+            padding: 7px 14px;
+            border-radius: var(--radius-pill);
+            box-shadow: var(--shadow-md);
+            animation: toastIn 0.2s ease-out;
+            transition: opacity 0.2s ease, transform 0.2s ease;
+        }
+
+        .toast i {
+            font-size: 10px;
+            color: #8ef0a8;
+        }
+
+        .toast.toast-hide {
+            opacity: 0;
+            transform: translateY(8px) scale(0.96);
+        }
+
+        /* 狭い画面向けの最小限の調整。譜面/マップ本体はもともと横スクロール前提の
+           固定サイズ描画（VexFlow/マップグリッド）のため、ここではその周辺のUI
+           （ヘッダー・タイトル欄・モーダル・ズームスライダー）が画面幅を超えて
+           はみ出さないようにするだけに留める（「並べて」タブの左右2分割は
+           2026-08-04にユーザーの依頼で上下パターンを廃止した経緯があるため、
+           この対応でも維持し、縦積みへの変更はしない） */
+        @media (max-width: 640px) {
+            header {
+                padding: 4px 10px;
+            }
+
+            #stickyHeader .sticky-toolbars-inner,
+            #main {
+                padding-left: 8px;
+                padding-right: 8px;
+            }
+
+            #scoreTitleInput {
+                width: 100px;
+            }
+
+            #zoomSlider {
+                width: 140px;
+            }
+
+            .modal-box {
+                width: calc(100vw - 32px);
+            }
         }
 
     </style>
 </head>
 <body>
 
+<script>
+    // ドロワーが開いた状態で保存されている場合、CSSやapp.jsの読み込みを待たずに
+    // ここで先にbodyへクラスを付けておく。こうしないと、一瞬「閉じた状態（余白なし）」
+    // で描画されてから後でJSがpushマージンを付けてズレる＝F5リロード時のちらつきの
+    // 原因になる。#drawer要素自体はまだ存在しないため、こちらはapp.js側
+    // （setupDrawer）で改めて開いた状態のクラスを付ける
+    (function () {
+        var v = localStorage.getItem("drawerOpen");
+        if (v === null || v === "true") {
+            document.body.classList.add("drawer-pinned");
+        }
+    })();
+</script>
+
 <div id="stickyHeader">
     <header>
-        <i class="fa-solid fa-music"></i>
-        <h1>ぽこあスコアメーカー</h1>
+        <div class="brand-mark"><i class="fa-solid fa-music"></i></div>
+        <div class="brand-text">
+            <h1>ぽこあスコアメーカー</h1>
+        </div>
     </header>
 
     <div class="sticky-toolbars-inner">
@@ -620,10 +1590,11 @@
             <div id="tabContainer" class="tab-container">
                 <div id="tabActiveIndicator"></div>
             </div>
-            <div class="toolbar" id="toolbarBothLayout" style="display:none;">
-                <button id="bothLayoutRotate" tabindex="-1" title="左右を入れ替え"><i class="fa-solid fa-right-left"></i></button>
+            <div class="toolbar" id="toolbarZoom">
+                <button id="zoomOut" tabindex="-1" title="縮小"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
+                <input type="range" id="zoomSlider" min="0.375" max="1.5" step="0.005" value="0.75">
+                <button id="zoomIn" tabindex="-1" title="拡大"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
             </div>
-            <div id="panelCount" class="toolbar" style="display:none; flex-wrap:wrap;"></div>
         </div>
         <div id="toolbars">
             <div class="toolbar">
@@ -632,24 +1603,6 @@
                 <button id="saveBtn" tabindex="-1" title="保存"><i class="fa-solid fa-floppy-disk"></i></button>
                 <button id="undoBtn" tabindex="-1" title="アンドゥ (Ctrl+Z)"><i class="fa-solid fa-rotate-left"></i></button>
                 <button id="redoBtn" tabindex="-1" title="リドゥ (Ctrl+Y)"><i class="fa-solid fa-rotate-right"></i></button>
-            </div>
-            <div class="toolbar" id="toolbarZoom">
-                <button id="zoomOut" tabindex="-1" title="縮小"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
-                <input type="range" id="zoomSlider" min="0.25" max="1.75" step="0.01" value="0.75">
-                <button id="zoomIn" tabindex="-1" title="拡大"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
-            </div>
-            <div class="toolbar" id="toolbarPlayback">
-                <button id="playBtn" tabindex="-1" title="再生/一時停止"><i class="fa-solid fa-play"></i></button>
-                <button id="stopBtn" tabindex="-1" title="停止" style="opacity:0.4;" disabled><i class="fa-solid fa-stop"></i></button>
-                <button id="loopBtn" tabindex="-1" title="ループ再生"><i class="fa-solid fa-repeat" style="color:#ccc;"></i></button>
-                <span class="playback-chip">
-                    <input type="number" id="bpmInput" value="120" min="40" max="240" step="1" style="width:44px; border:none; font-size:14px; text-align:center; background:transparent; outline:none;" title="BPM">
-                    <span style="font-size:11px; color:#aaa;">BPM</span>
-                </span>
-                <span class="playback-chip">
-                    <i class="fa-solid fa-volume-high" style="font-size:14px; color:#aaa;"></i>
-                    <input type="range" id="volumeSlider" min="0" max="1" step="0.01" value="0.8" title="音量" style="width:80px; accent-color:#222;">
-                </span>
             </div>
             <div class="toolbar" id="toolbarEditMode">
                 <button id="editModeNote" tabindex="-1" title="編集モード"><i class="fa-solid fa-pencil"></i></button>
@@ -660,113 +1613,51 @@
                 <button id="cutBtn" tabindex="-1" title="切り取り (Ctrl+X)"><i class="fa-solid fa-scissors"></i></button>
                 <button id="pasteBtn" tabindex="-1" title="貼り付け (Ctrl+V)" style="opacity:0.4;" disabled><i class="fa-solid fa-paste"></i></button>
             </div>
-            <div class="toolbar" id="toolbarKeySig">
-                <span style="font-size:11px;color:#aaa;">調号</span>
-                <select id="keySignatureSelect" tabindex="-1" style="font-size:13px;border:none;background:transparent;outline:none;">
-                    <option value="C">ハ長調</option>
-                    <option value="G">ト長調</option>
-                    <option value="D">ニ長調</option>
-                    <option value="A">イ長調</option>
-                    <option value="E">ホ長調</option>
-                    <option value="B">ロ長調</option>
-                    <option value="F#">嬰ヘ長調</option>
-                    <option value="C#">嬰ハ長調</option>
-                    <option value="F">ヘ長調</option>
-                    <option value="Bb">変ロ長調</option>
-                    <option value="Eb">変ホ長調</option>
-                    <option value="Ab">変イ長調</option>
-                    <option value="Db">変ニ長調</option>
-                    <option value="Gb">変ト長調</option>
-                    <option value="Cb">変ハ長調</option>
-                </select>
-            </div>
-            <div class="toolbar" id="toolbarTranspose">
-                <span style="font-size:11px;color:#aaa;">移調</span>
-                <button id="transposeDown" tabindex="-1" title="半音下げる">▼</button>
-                <button id="transposeUp" tabindex="-1" title="半音上げる">▲</button>
-            </div>
-            <!-- コンパス以降（マップ専用グループ）を#toolbars内の2行目にまとめて折り返させる
-                 ための空アイテム。flex-wrap下でflex-basis:100%の要素は「残りの行幅を
-                 使い切る」ため、これ自身は見えないまま、後続のアイテムが強制的に次の行へ
-                 送られる（#toolbarDurationRowと同じ仕組み） -->
-            <div style="flex-basis:100%; height:0;"></div>
-            <div class="toolbar" id="toolbarCompass">
-                <button id="compassBtn" tabindex="-1" title="北の向きを変える">
-                    <i class="fa-solid fa-compass"></i>
-                    <span id="compassLabel" style="font-size:10px; margin-left:2px;">N↑</span>
-                </button>
-            </div>
-            <div id="mapToolbar" style="display:none; flex-wrap:wrap; gap:6px; align-items:center;">
-                <div class="toolbar">
-                    <span style="font-size:11px;color:#aaa;">レール方向</span>
-                    <button id="mapRailVertical" class="text-btn" tabindex="-1" title="縦向き">縦</button>
-                    <button id="mapRailHorizontal" class="text-btn" tabindex="-1" title="横向き">横</button>
-                </div>
-                <div class="toolbar">
-                    <span style="font-size:11px;color:#aaa;">トロッコ開始地点</span>
-                    <button id="mapCorner-top-left" tabindex="-1" title="左上">↖</button>
-                    <button id="mapCorner-top-right" tabindex="-1" title="右上">↗</button>
-                    <button id="mapCorner-bottom-left" tabindex="-1" title="左下">↙</button>
-                    <button id="mapCorner-bottom-right" tabindex="-1" title="右下">↘</button>
-                </div>
-                <div class="toolbar">
-                    <span style="font-size:11px;color:#aaa;">センサー開始</span>
-                    <button id="mapSideLeft" class="text-btn" tabindex="-1" title="左先行">左</button>
-                    <button id="mapSideRight" class="text-btn" tabindex="-1" title="右先行">右</button>
-                </div>
-                <div class="toolbar">
-                    <span style="font-size:11px;color:#aaa;">一列の最大センサー数</span>
-                    <button id="mapWrapDown" tabindex="-1">▼</button>
-                    <input type="number" id="mapWrapValue" value="50" min="1" style="width:44px;border:none;border-bottom:1px solid #ddd;font-size:14px;text-align:center;background:transparent;outline:none;">
-                    <button id="mapWrapUp" tabindex="-1">▲</button>
-                </div>
-                <div class="toolbar">
-                    <button id="mapHideUnusedSensors" class="text-btn" tabindex="-1" title="周りに音符マットがないセンサーを非表示にする（カウントにも含めない）">未使用センサー非表示</button>
-                </div>
-            </div>
+            <div id="toolbarDurationToolbarSlot"></div>
         </div>
     </div>
 </div>
 
-<div class="toolbar" id="toolbarDuration">
-    <span id="toolbarDurationHandle" class="drag-handle" title="ドラッグして移動"><i class="fa-solid fa-grip-vertical"></i></span>
-    <button id="durNote16" class="text-btn" data-duration="16" data-kind="note" tabindex="-1" title="16分音符" style="font-size:28px;">𝅘𝅥𝅯</button>
-    <button id="durNote8" class="text-btn" data-duration="8" data-kind="note" tabindex="-1" title="8分音符" style="font-size:28px;">𝅘𝅥𝅮</button>
-    <button id="durNoteQ" class="text-btn" data-duration="q" data-kind="note" tabindex="-1" title="4分音符" style="font-size:28px;">𝅘𝅥</button>
-    <button id="durNoteH" class="text-btn" data-duration="h" data-kind="note" tabindex="-1" title="2分音符" style="font-size:28px;">𝅗𝅥</button>
-    <button id="durNoteW" class="text-btn" data-duration="w" data-kind="note" tabindex="-1" title="全音符" style="font-size:28px;">𝅝</button>
-    <span class="dur-sep"></span>
-    <button id="durNote8Dot" class="text-btn" data-duration="8" data-kind="note" data-dotted="true" tabindex="-1" title="付点8分音符" style="font-size:28px;">𝅘𝅥𝅮.</button>
-    <button id="durNoteQDot" class="text-btn" data-duration="q" data-kind="note" data-dotted="true" tabindex="-1" title="付点4分音符" style="font-size:28px;">𝅘𝅥.</button>
-    <button id="durNoteHDot" class="text-btn" data-duration="h" data-kind="note" data-dotted="true" tabindex="-1" title="付点2分音符" style="font-size:28px;">𝅗𝅥.</button>
-    <span class="dur-sep"></span>
-    <button id="durRest16" class="text-btn" data-duration="16" data-kind="rest" tabindex="-1" title="16分休符" style="font-size:28px;">𝄿</button>
-    <button id="durRest8" class="text-btn" data-duration="8" data-kind="rest" tabindex="-1" title="8分休符" style="font-size:28px;">𝄾</button>
-    <button id="durRestQ" class="text-btn" data-duration="q" data-kind="rest" tabindex="-1" title="4分休符" style="font-size:28px;">𝄽</button>
-    <button id="durRestH" class="text-btn" data-duration="h" data-kind="rest" tabindex="-1" title="2分休符" style="font-size:28px;">𝄼</button>
-    <button id="durRestW" class="text-btn" data-duration="w" data-kind="rest" tabindex="-1" title="全休符" style="font-size:28px;">𝄻</button>
-    <span class="dur-sep"></span>
-    <button id="durRest8Dot" class="text-btn" data-duration="8" data-kind="rest" data-dotted="true" tabindex="-1" title="付点8分休符" style="font-size:28px;">𝄾.</button>
-    <button id="durRestQDot" class="text-btn" data-duration="q" data-kind="rest" data-dotted="true" tabindex="-1" title="付点4分休符" style="font-size:28px;">𝄽.</button>
-    <button id="durRestHDot" class="text-btn" data-duration="h" data-kind="rest" data-dotted="true" tabindex="-1" title="付点2分休符" style="font-size:28px;">𝄼.</button>
-</div>
-
 <div id="main">
-
-    <div id="scoreTitle">
-        <input type="text" id="scoreTitleInput" placeholder="楽譜の名前" value="NewScore">
-    </div>
     <div id="bothTabContainer" class="layout-left-right">
         <div id="scoreWrapper">
             <div id="score"></div>
             <button id="addMeasureBtn"><i class="fa-solid fa-circle-plus"></i></button>
+            <div id="infoWrap">
+                <button id="helpBtn" tabindex="-1" title="操作ヘルプ"><i class="fa-solid fa-circle-question"></i></button>
+                <div id="info">
+                    <div id="infoHeader">
+                        <button id="infoCloseBtn" tabindex="-1" title="閉じる"><i class="fa-solid fa-xmark"></i></button>
+                    </div>
+                    <div class="info-row"><span><i class="fa-solid fa-arrow-pointer"></i> 左クリック</span> 音符追加</div>
+                    <div class="info-row"><span><i class="fa-solid fa-computer-mouse"></i> 右クリック</span> 音符削除</div>
+                    <div class="info-row"><span><i class="fa-solid fa-keyboard"></i> Shift + 左クリック</span> 白鍵↔黒鍵</div>
+                    <div class="info-row"><span><i class="fa-solid fa-keyboard"></i> Ctrl</span> 音符・休符切替</div>
+                </div>
+            </div>
+        </div>
+
+        <div id="bothTabDivider" title="ドラッグして幅を調整">
+            <button id="bothLayoutRotate" tabindex="-1" title="左右を入れ替え"><i class="fa-solid fa-right-left"></i></button>
         </div>
 
         <div id="mapAreaWrapper" style="display:none;">
-            <div id="mapLayerOverlay" class="toolbar" style="display:none;">
-                <button id="mapLayerUpper" tabindex="-1" title="上位層"><i class="fa-solid fa-angles-up"></i></button>
-                <button id="mapLayerMiddle" tabindex="-1" title="中間層"><i class="fa-solid fa-equals"></i></button>
-                <button id="mapLayerLower" tabindex="-1" title="下位層"><i class="fa-solid fa-angles-down"></i></button>
+            <div id="mapCornerOverlay" style="display:none;">
+                <div id="mapCompassOverlay" class="toolbar">
+                    <button id="compassBtn" tabindex="-1" title="北の向きを変える">
+                        <i class="fa-solid fa-compass"></i>
+                        <span id="compassLabel" style="font-size:12px; margin-left:2px;">N↑</span>
+                    </button>
+                </div>
+                <div id="mapLayerOverlay" class="toolbar">
+                    <button id="mapLayerUp" tabindex="-1" title="上の層へ"><i class="fa-solid fa-chevron-up"></i></button>
+                    <div id="mapLayerStack" title="表示する層">
+                        <div class="map-layer-bar" data-layer="upper"></div>
+                        <div class="map-layer-bar" data-layer="middle"></div>
+                        <div class="map-layer-bar" data-layer="lower"></div>
+                    </div>
+                    <button id="mapLayerDown" tabindex="-1" title="下の層へ"><i class="fa-solid fa-chevron-down"></i></button>
+                </div>
             </div>
             <div id="mapArea"></div>
             <div id="mapResizeHandleRight" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
@@ -775,14 +1666,47 @@
         </div>
     </div>
 
-    <div id="info">
-        <span><i class="fa-solid fa-arrow-pointer"></i> 左クリック</span> 音符追加（ツールバーで選んだ音価） &nbsp;
-        <span><i class="fa-solid fa-arrow-pointer"></i> 左クリック（音符上・違う高さ）</span> 和音に追加 &nbsp;
-        <span><i class="fa-solid fa-computer-mouse"></i> 右クリック（音符上）</span> 削除 &nbsp;
-        <span><i class="fa-solid fa-keyboard"></i> Shift + 左クリック</span> 白鍵↔黒鍵 &nbsp;
-        <span><i class="fa-solid fa-keyboard"></i> Ctrl + 左クリック</span> 休符追加（ツールバーで選んだ音価）
-    </div>
 
+</div>
+
+<div id="playbackBar">
+    <div id="playbackBarLeft">
+        <div id="scoreTitle">
+            <i class="fa-solid fa-file-lines"></i>
+            <input type="text" id="scoreTitleInput" placeholder="楽譜の名前" value="">
+        </div>
+        <span class="playback-chip">
+            <input type="number" id="bpmInput" value="120" min="40" max="240" step="1" style="width:40px; border:none; font-size:12px; text-align:center; background:transparent; outline:none; font-variant-numeric:tabular-nums;" title="BPM">
+            <span style="font-size:12px; color:var(--text-faint);">BPM</span>
+        </span>
+    </div>
+    <div id="playbackBarRight">
+        <span class="playback-chip">
+            <i id="muteBtn" class="fa-solid fa-volume-high" style="font-size:12px; color:var(--text-faint); cursor:pointer;" title="ミュート"></i>
+            <input type="range" id="volumeSlider" min="0" max="1" step="0.01" value="0.8" title="音量" style="width:100px;">
+        </span>
+    </div>
+    <div id="seekBarRow">
+        <span id="seekTimeCurrent">0:00</span>
+        <input type="range" id="seekBar" min="0" max="1" step="0.001" value="0" title="再生位置">
+        <span id="seekTimeTotal">0:00</span>
+    </div>
+    <div id="playbackControlsRow">
+    <div id="playbackBarCenter">
+        <button id="restartBtn" class="playback-ctrl-btn" tabindex="-1" title="最初に戻す" style="opacity:0.4;" disabled><i class="fa-solid fa-backward-step"></i></button>
+        <button id="playBtn" class="playback-play-btn" tabindex="-1" title="再生/一時停止"><i class="fa-solid fa-play"></i></button>
+        <button id="stopBtn" class="playback-ctrl-btn" tabindex="-1" title="停止" style="opacity:0.4;" disabled><i class="fa-solid fa-stop"></i></button>
+        <button id="loopBtn" class="playback-ctrl-btn" tabindex="-1" title="ループ再生"><i class="fa-solid fa-repeat" style="color:#ccc;"></i></button>
+    </div>
+    </div>
+</div>
+
+<div id="statusBar">
+    <span id="statusSaveState" class="status-item"></span>
+    <span id="statusSelection" class="status-item"></span>
+    <div id="panelCount" style="display:none;"></div>
+    <span id="statusMeasureCount" class="status-item"></span>
+    <span id="statusZoom" class="status-item"></span>
 </div>
 
 <div id="newScoreModalOverlay" class="modal-overlay" style="display:none;">
@@ -808,6 +1732,118 @@
         </div>
     </div>
 </div>
+
+<div id="toastContainer"></div>
+
+<div id="drawer" class="drawer">
+    <button id="drawerTab" class="drawer-tab" title="メニュー"><i class="fa-solid fa-chevron-right"></i></button>
+    <div class="drawer-body">
+        <div class="drawer-settings-group">
+            <div class="drawer-setting">
+                <span class="section-label">調号</span>
+                <select id="keySignatureSelect" tabindex="-1" class="drawer-select">
+                    <option value="C">ハ長調</option>
+                    <option value="G">ト長調</option>
+                    <option value="D">ニ長調</option>
+                    <option value="A">イ長調</option>
+                    <option value="E">ホ長調</option>
+                    <option value="B">ロ長調</option>
+                    <option value="F#">嬰ヘ長調</option>
+                    <option value="C#">嬰ハ長調</option>
+                    <option value="F">ヘ長調</option>
+                    <option value="Bb">変ロ長調</option>
+                    <option value="Eb">変ホ長調</option>
+                    <option value="Ab">変イ長調</option>
+                    <option value="Db">変ニ長調</option>
+                    <option value="Gb">変ト長調</option>
+                    <option value="Cb">変ハ長調</option>
+                </select>
+            </div>
+            <div class="drawer-setting">
+                <span class="section-label">移調</span>
+                <div class="drawer-setting-row">
+                    <button id="transposeDown" class="drawer-seg-btn" tabindex="-1" title="半音下げる">▼</button>
+                    <button id="transposeUp" class="drawer-seg-btn" tabindex="-1" title="半音上げる">▲</button>
+                </div>
+            </div>
+            <div class="drawer-setting">
+                <span class="section-label">レール方向</span>
+                <div class="drawer-setting-row">
+                    <button id="mapRailVertical" class="drawer-seg-btn" tabindex="-1" title="縦向き">縦</button>
+                    <button id="mapRailHorizontal" class="drawer-seg-btn" tabindex="-1" title="横向き">横</button>
+                </div>
+            </div>
+            <div class="drawer-setting">
+                <span class="section-label">トロッコ開始位置</span>
+                <div class="drawer-setting-row">
+                    <button id="mapCorner-top-left" class="drawer-seg-btn" tabindex="-1" title="左上">↖</button>
+                    <button id="mapCorner-top-right" class="drawer-seg-btn" tabindex="-1" title="右上">↗</button>
+                    <button id="mapCorner-bottom-left" class="drawer-seg-btn" tabindex="-1" title="左下">↙</button>
+                    <button id="mapCorner-bottom-right" class="drawer-seg-btn" tabindex="-1" title="右下">↘</button>
+                </div>
+            </div>
+            <div class="drawer-setting">
+                <span class="section-label">センサー開始位置</span>
+                <div class="drawer-setting-row">
+                    <button id="mapSideLeft" class="drawer-seg-btn" tabindex="-1" title="左先行">左</button>
+                    <button id="mapSideRight" class="drawer-seg-btn" tabindex="-1" title="右先行">右</button>
+                </div>
+            </div>
+            <div class="drawer-setting">
+                <span class="section-label">未使用センサー</span>
+                <div class="drawer-setting-row">
+                    <button id="mapShowUnusedSensors" class="drawer-seg-btn" tabindex="-1" title="周りに音符マットがないセンサーも表示する">表示</button>
+                    <button id="mapHideUnusedSensors" class="drawer-seg-btn" tabindex="-1" title="周りに音符マットがないセンサーを非表示にする（カウントにも含めない）">非表示</button>
+                </div>
+            </div>
+            <div class="drawer-setting">
+                <span class="section-label">一列の最大センサー数</span>
+                <div class="drawer-setting-row">
+                    <button id="mapWrapUp" class="drawer-seg-btn" tabindex="-1">▲</button>
+                    <input type="number" id="mapWrapValue" value="50" min="1" class="drawer-wrap-input">
+                    <button id="mapWrapDown" class="drawer-seg-btn" tabindex="-1">▼</button>
+                </div>
+            </div>
+            <div class="drawer-setting" id="toolbarDurationDrawerSlot">
+                <span class="section-label">音符/休符</span>
+                <div class="toolbar" id="toolbarDuration">
+                    <span id="toolbarDurationHandle" class="drag-handle" title="ドラッグして移動"><i class="fa-solid fa-grip-vertical"></i></span>
+                    <button id="durNote16" class="text-btn" data-duration="16" data-kind="note" tabindex="-1" title="16分音符" style="font-size:25px;">𝅘𝅥𝅯</button>
+                    <button id="durNote8" class="text-btn" data-duration="8" data-kind="note" tabindex="-1" title="8分音符" style="font-size:25px;">𝅘𝅥𝅮</button>
+                    <button id="durNoteQ" class="text-btn" data-duration="q" data-kind="note" tabindex="-1" title="4分音符" style="font-size:25px;">𝅘𝅥</button>
+                    <button id="durNoteH" class="text-btn" data-duration="h" data-kind="note" tabindex="-1" title="2分音符" style="font-size:25px;">𝅗𝅥</button>
+                    <button id="durNoteW" class="text-btn" data-duration="w" data-kind="note" tabindex="-1" title="全音符" style="font-size:25px;">𝅝</button>
+                    <span class="dur-sep"></span>
+                    <button id="durNote8Dot" class="text-btn" data-duration="8" data-kind="note" data-dotted="true" tabindex="-1" title="付点8分音符" style="font-size:25px;">𝅘𝅥𝅮.</button>
+                    <button id="durNoteQDot" class="text-btn" data-duration="q" data-kind="note" data-dotted="true" tabindex="-1" title="付点4分音符" style="font-size:25px;">𝅘𝅥.</button>
+                    <button id="durNoteHDot" class="text-btn" data-duration="h" data-kind="note" data-dotted="true" tabindex="-1" title="付点2分音符" style="font-size:25px;">𝅗𝅥.</button>
+                    <span class="dur-sep"></span>
+                    <button id="durRest16" class="text-btn" data-duration="16" data-kind="rest" tabindex="-1" title="16分休符" style="font-size:25px;">𝄿</button>
+                    <button id="durRest8" class="text-btn" data-duration="8" data-kind="rest" tabindex="-1" title="8分休符" style="font-size:25px;">𝄾</button>
+                    <button id="durRestQ" class="text-btn" data-duration="q" data-kind="rest" tabindex="-1" title="4分休符" style="font-size:25px;">𝄽</button>
+                    <button id="durRestH" class="text-btn" data-duration="h" data-kind="rest" tabindex="-1" title="2分休符" style="font-size:25px;">𝄼</button>
+                    <button id="durRestW" class="text-btn" data-duration="w" data-kind="rest" tabindex="-1" title="全休符" style="font-size:25px;">𝄻</button>
+                    <span class="dur-sep"></span>
+                    <button id="durRest8Dot" class="text-btn" data-duration="8" data-kind="rest" data-dotted="true" tabindex="-1" title="付点8分休符" style="font-size:25px;">𝄾.</button>
+                    <button id="durRestQDot" class="text-btn" data-duration="q" data-kind="rest" data-dotted="true" tabindex="-1" title="付点4分休符" style="font-size:25px;">𝄽.</button>
+                    <button id="durRestHDot" class="text-btn" data-duration="h" data-kind="rest" data-dotted="true" tabindex="-1" title="付点2分休符" style="font-size:25px;">𝄼.</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // #drawer自体はここまで来てようやくDOMに存在するので、bodyの方の早期スクリプトとは
+    // 別にここで開いた状態のクラスを付ける（同じ判定なので、app.js側(setupDrawer)は
+    // クリックイベントの登録だけを行えばよい）
+    (function () {
+        var v = localStorage.getItem("drawerOpen");
+        if (v === null || v === "true") {
+            document.getElementById("drawer").classList.add("open");
+        }
+    })();
+</script>
 
 <script src="https://cdn.jsdelivr.net/npm/vexflow@5.0.0/build/cjs/vexflow.js"></script>
 <script>
