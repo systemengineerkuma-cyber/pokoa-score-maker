@@ -536,6 +536,7 @@
             justify-content: flex-start;
             gap: 4px;
             margin-bottom: 4px;
+            flex-wrap: wrap;
         }
 
         header h1 {
@@ -560,14 +561,6 @@
 
         #main.tab-content-fade {
             animation: tabContentFadeIn 0.22s ease-out;
-        }
-
-        #toolbars {
-            display: flex;
-            align-items: center;
-            gap: 4px;
-            margin-bottom: 6px;
-            flex-wrap: wrap;
         }
 
         .toolbar {
@@ -656,40 +649,23 @@
             white-space: nowrap;
         }
 
-        /* 音符/休符グループはデフォルトでツールバー（#toolbarDurationToolbarSlot、
-           以前ズームがあった場所）にドッキングされているが、グリップハンドルをドラッグして
-           切り離す（フローティング化する）ことも、ドロワー内（#toolbarDurationDrawerSlot）へ
-           ドッキングし直すこともできる（setupNoteToolbarDrag参照） */
+        /* 音符/休符グループはツールバー（#toolbarDurationToolbarSlot、2段目）に
+           ドッキングされているが、グリップハンドルをドラッグして切り離し、
+           フローティングパネルとして画面上の任意の位置に配置することもできる
+           （setupNoteToolbarDrag参照） */
         #toolbarDuration {
             flex-wrap: wrap;
         }
 
-        /* ドロワーへドッキングした時だけ、幅の狭さに合わせて2列（左:音符/右:休符）の
-           グリッドレイアウトに切り替える（通常のツールバー幅では横一列で十分収まるため） */
-        #toolbarDuration.drawer-columns {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            /* denseにしないと、音符列(1列目)を先に一気に敷き詰めてから休符列(2列目)に
-               移るため、休符側だけ音符列の下に取り残されてズレてしまう
-               （スパース配置はカーソルを後戻りさせないため） */
-            grid-auto-flow: dense;
-            gap: 2px;
-            /* ドロワー内では周囲がbox-shadowだけだと他の設定項目に埋もれて見づらいため、
-               他の.drawer-setting-row同様、はっきりした枠線で囲んでグループを分かりやすくする */
-            border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-        }
-        #toolbarDuration.drawer-columns #toolbarDurationHandle {
-            grid-column: 1 / 3;
-        }
-        #toolbarDuration.drawer-columns .dur-sep {
-            display: none;
-        }
-        #toolbarDuration.drawer-columns button[data-kind="note"] {
-            grid-column: 1;
-        }
-        #toolbarDuration.drawer-columns button[data-kind="rest"] {
-            grid-column: 2;
+        /* #tabRow内の他のグループ（タブ/ファイル操作/編集モード/コピペ/ズーム）と
+           横一列に並べず、常に単独で2段目を占有させる（flex-wrapのコンテナ内で
+           flex-basis:100%の要素は「残りの行幅を使い切る」ため、後続要素が無い状態でも
+           自分自身が必ず改行される）。スロット自身もflexにすることで、中の
+           #toolbarDuration（実際に見える白い箱）はスロットの100%幅いっぱいに伸びず、
+           コンテンツ分の幅のまま左詰めで収まる */
+        #toolbarDurationToolbarSlot {
+            flex-basis: 100%;
+            display: flex;
         }
 
         #toolbarDuration.floating {
@@ -1122,13 +1098,21 @@
             opacity: 1;
         }
 
+        /* タブ（画面の切り替え=ナビゲーション）は、そのあとに続くツールバーの
+           グループ群（コピー/貼り付け等の操作ボタン、白背景）とは役割が異なるため、
+           見た目で「別の種類の部品」だと一目でわかるようにする。
+           一度ブランドカラー（青系）を薄く敷いてみたが「青は選択状態を示す色」と
+           指摘され撤回、次にヘッダーと同じ真っ黒に近いダーク背景にしたが今度は
+           「目を引きすぎる」と指摘された。強い色・強い明暗どちらにも寄せすぎず、
+           控えめな中間の濃さのニュートラルグレーに落ち着かせる */
         .tab-container {
             position: relative;
             display: flex;
             gap: 3px;
-            background: var(--surface-muted);
+            background: #c6c6d0;
             padding: 3px;
             border-radius: 9px;
+            margin-right: 10px;
         }
 
         /* アクティブなタブの背景（白い丸角ピル）。以前は.tab-active自身にbackgroundを
@@ -1158,7 +1142,7 @@
             border-radius: 7px;
             padding: 5px 14px;
             font-size: 12px;
-            color: var(--text-muted);
+            color: #63636f;
             cursor: pointer;
             font-family: inherit;
             transition: color 0.15s;
@@ -1586,20 +1570,13 @@
     </header>
 
     <div class="sticky-toolbars-inner">
-        <div class="tab-row">
+        <div class="tab-row" id="tabRow">
             <div id="tabContainer" class="tab-container">
                 <div id="tabActiveIndicator"></div>
             </div>
-            <div class="toolbar" id="toolbarZoom">
-                <button id="zoomOut" tabindex="-1" title="縮小"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
-                <input type="range" id="zoomSlider" min="0.375" max="1.5" step="0.005" value="0.75">
-                <button id="zoomIn" tabindex="-1" title="拡大"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
-            </div>
-        </div>
-        <div id="toolbars">
             <div class="toolbar">
                 <button id="newScoreBtn" tabindex="-1" title="新規作成"><i class="fa-solid fa-file"></i></button>
-                <label id="loadBtn" tabindex="-1" title="開く"><i class="fa-solid fa-folder-open"></i><input type="file" id="loadFile" accept=".json" style="display:none"></label>
+                <label id="loadBtn" tabindex="-1" title="開く"><i class="fa-solid fa-folder-open"></i><input type="file" id="loadFile" accept=".musicxml,.xml,.mxl,.json" style="display:none"></label>
                 <button id="saveBtn" tabindex="-1" title="保存"><i class="fa-solid fa-floppy-disk"></i></button>
                 <button id="undoBtn" tabindex="-1" title="アンドゥ (Ctrl+Z)"><i class="fa-solid fa-rotate-left"></i></button>
                 <button id="redoBtn" tabindex="-1" title="リドゥ (Ctrl+Y)"><i class="fa-solid fa-rotate-right"></i></button>
@@ -1613,7 +1590,35 @@
                 <button id="cutBtn" tabindex="-1" title="切り取り (Ctrl+X)"><i class="fa-solid fa-scissors"></i></button>
                 <button id="pasteBtn" tabindex="-1" title="貼り付け (Ctrl+V)" style="opacity:0.4;" disabled><i class="fa-solid fa-paste"></i></button>
             </div>
-            <div id="toolbarDurationToolbarSlot"></div>
+            <div class="toolbar" id="toolbarZoom">
+                <button id="zoomOut" tabindex="-1" title="縮小"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
+                <input type="range" id="zoomSlider" min="0.375" max="1.5" step="0.005" value="0.75">
+                <button id="zoomIn" tabindex="-1" title="拡大"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
+            </div>
+            <div id="toolbarDurationToolbarSlot">
+                <div class="toolbar" id="toolbarDuration">
+                    <span id="toolbarDurationHandle" class="drag-handle" title="ドラッグして移動"><i class="fa-solid fa-grip-vertical"></i></span>
+                    <button id="durNote16" class="text-btn" data-duration="16" data-kind="note" tabindex="-1" title="16分音符" style="font-size:25px;">𝅘𝅥𝅯</button>
+                    <button id="durNote8" class="text-btn" data-duration="8" data-kind="note" tabindex="-1" title="8分音符" style="font-size:25px;">𝅘𝅥𝅮</button>
+                    <button id="durNoteQ" class="text-btn" data-duration="q" data-kind="note" tabindex="-1" title="4分音符" style="font-size:25px;">𝅘𝅥</button>
+                    <button id="durNoteH" class="text-btn" data-duration="h" data-kind="note" tabindex="-1" title="2分音符" style="font-size:25px;">𝅗𝅥</button>
+                    <button id="durNoteW" class="text-btn" data-duration="w" data-kind="note" tabindex="-1" title="全音符" style="font-size:25px;">𝅝</button>
+                    <span class="dur-sep"></span>
+                    <button id="durNote8Dot" class="text-btn" data-duration="8" data-kind="note" data-dotted="true" tabindex="-1" title="付点8分音符" style="font-size:25px;">𝅘𝅥𝅮.</button>
+                    <button id="durNoteQDot" class="text-btn" data-duration="q" data-kind="note" data-dotted="true" tabindex="-1" title="付点4分音符" style="font-size:25px;">𝅘𝅥.</button>
+                    <button id="durNoteHDot" class="text-btn" data-duration="h" data-kind="note" data-dotted="true" tabindex="-1" title="付点2分音符" style="font-size:25px;">𝅗𝅥.</button>
+                    <span class="dur-sep"></span>
+                    <button id="durRest16" class="text-btn" data-duration="16" data-kind="rest" tabindex="-1" title="16分休符" style="font-size:25px;">𝄿</button>
+                    <button id="durRest8" class="text-btn" data-duration="8" data-kind="rest" tabindex="-1" title="8分休符" style="font-size:25px;">𝄾</button>
+                    <button id="durRestQ" class="text-btn" data-duration="q" data-kind="rest" tabindex="-1" title="4分休符" style="font-size:25px;">𝄽</button>
+                    <button id="durRestH" class="text-btn" data-duration="h" data-kind="rest" tabindex="-1" title="2分休符" style="font-size:25px;">𝄼</button>
+                    <button id="durRestW" class="text-btn" data-duration="w" data-kind="rest" tabindex="-1" title="全休符" style="font-size:25px;">𝄻</button>
+                    <span class="dur-sep"></span>
+                    <button id="durRest8Dot" class="text-btn" data-duration="8" data-kind="rest" data-dotted="true" tabindex="-1" title="付点8分休符" style="font-size:25px;">𝄾.</button>
+                    <button id="durRestQDot" class="text-btn" data-duration="q" data-kind="rest" data-dotted="true" tabindex="-1" title="付点4分休符" style="font-size:25px;">𝄽.</button>
+                    <button id="durRestHDot" class="text-btn" data-duration="h" data-kind="rest" data-dotted="true" tabindex="-1" title="付点2分休符" style="font-size:25px;">𝄼.</button>
+                </div>
+            </div>
         </div>
     </div>
 </div>
@@ -1804,31 +1809,6 @@
                     <button id="mapWrapDown" class="drawer-seg-btn" tabindex="-1">▼</button>
                 </div>
             </div>
-            <div class="drawer-setting" id="toolbarDurationDrawerSlot">
-                <span class="section-label">音符/休符</span>
-                <div class="toolbar" id="toolbarDuration">
-                    <span id="toolbarDurationHandle" class="drag-handle" title="ドラッグして移動"><i class="fa-solid fa-grip-vertical"></i></span>
-                    <button id="durNote16" class="text-btn" data-duration="16" data-kind="note" tabindex="-1" title="16分音符" style="font-size:25px;">𝅘𝅥𝅯</button>
-                    <button id="durNote8" class="text-btn" data-duration="8" data-kind="note" tabindex="-1" title="8分音符" style="font-size:25px;">𝅘𝅥𝅮</button>
-                    <button id="durNoteQ" class="text-btn" data-duration="q" data-kind="note" tabindex="-1" title="4分音符" style="font-size:25px;">𝅘𝅥</button>
-                    <button id="durNoteH" class="text-btn" data-duration="h" data-kind="note" tabindex="-1" title="2分音符" style="font-size:25px;">𝅗𝅥</button>
-                    <button id="durNoteW" class="text-btn" data-duration="w" data-kind="note" tabindex="-1" title="全音符" style="font-size:25px;">𝅝</button>
-                    <span class="dur-sep"></span>
-                    <button id="durNote8Dot" class="text-btn" data-duration="8" data-kind="note" data-dotted="true" tabindex="-1" title="付点8分音符" style="font-size:25px;">𝅘𝅥𝅮.</button>
-                    <button id="durNoteQDot" class="text-btn" data-duration="q" data-kind="note" data-dotted="true" tabindex="-1" title="付点4分音符" style="font-size:25px;">𝅘𝅥.</button>
-                    <button id="durNoteHDot" class="text-btn" data-duration="h" data-kind="note" data-dotted="true" tabindex="-1" title="付点2分音符" style="font-size:25px;">𝅗𝅥.</button>
-                    <span class="dur-sep"></span>
-                    <button id="durRest16" class="text-btn" data-duration="16" data-kind="rest" tabindex="-1" title="16分休符" style="font-size:25px;">𝄿</button>
-                    <button id="durRest8" class="text-btn" data-duration="8" data-kind="rest" tabindex="-1" title="8分休符" style="font-size:25px;">𝄾</button>
-                    <button id="durRestQ" class="text-btn" data-duration="q" data-kind="rest" tabindex="-1" title="4分休符" style="font-size:25px;">𝄽</button>
-                    <button id="durRestH" class="text-btn" data-duration="h" data-kind="rest" tabindex="-1" title="2分休符" style="font-size:25px;">𝄼</button>
-                    <button id="durRestW" class="text-btn" data-duration="w" data-kind="rest" tabindex="-1" title="全休符" style="font-size:25px;">𝄻</button>
-                    <span class="dur-sep"></span>
-                    <button id="durRest8Dot" class="text-btn" data-duration="8" data-kind="rest" data-dotted="true" tabindex="-1" title="付点8分休符" style="font-size:25px;">𝄾.</button>
-                    <button id="durRestQDot" class="text-btn" data-duration="q" data-kind="rest" data-dotted="true" tabindex="-1" title="付点4分休符" style="font-size:25px;">𝄽.</button>
-                    <button id="durRestHDot" class="text-btn" data-duration="h" data-kind="rest" data-dotted="true" tabindex="-1" title="付点2分休符" style="font-size:25px;">𝄼.</button>
-                </div>
-            </div>
         </div>
     </div>
 </div>
@@ -1846,6 +1826,8 @@
 </script>
 
 <script src="https://cdn.jsdelivr.net/npm/vexflow@5.0.0/build/cjs/vexflow.js"></script>
+<!-- .mxl（ZIP圧縮MusicXML）を読み込むためのZIP解凍ライブラリ -->
+<script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
 <script>
     const s = document.createElement("script");
     s.src = "app.js?v=" + Date.now();

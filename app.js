@@ -839,7 +839,7 @@ function drawMapPlayLine(beatIndex, t) {
         top: ${y - h / 2}px;
         width: ${w}px;
         height: ${h}px;
-        background: rgba(74, 108, 247, 0.85);
+        background: rgba(255, 209, 0, 0.9);
         border-radius: 3px;
         pointer-events: none;
         z-index: 8;
@@ -884,6 +884,14 @@ const DURATION_ORDER = ["16", "8", "q", "h", "w"];
 const durationBeats = { "w": 4, "h": 2, "q": 1, "8": 0.5, "16": 0.25 };
 const DURATION_LABELS = { "w": "全音符", "h": "2分音符", "q": "4分音符", "8": "8分音符", "16": "16分音符" };
 const COMPASS_LABELS = ["N↑", "N→", "N↓", "N←"];
+
+// MusicXML書き出し/読み込み用。4分音符=8単位とすると、5音価×付点あり/なしの
+// 全10通り（最小0.25拍〜最大6拍）がすべて整数になる（最小のdivisions値）
+const MUSICXML_DIVISIONS = 8;
+const DURATION_TO_XML_TYPE = { "16": "16th", "8": "eighth", "q": "quarter", "h": "half", "w": "whole" };
+const XML_TYPE_TO_DURATION = Object.fromEntries(
+    Object.entries(DURATION_TO_XML_TYPE).map(([code, type]) => [type, code])
+);
 
 // 音符・休符1つ分の拍数を返す（付点は1.5倍）
 function noteBeats(note) {
@@ -1100,6 +1108,17 @@ function transposeKeySignature(key, shift) {
     return SEMITONE_TO_KEY[newSemitone];
 }
 
+// MusicXML書き出し/読み込み用。調号コード⇔<fifths>（符号付き五度圏カウント、
+// 負値=フラット系）の対応。SHARP_KEY_ORDER/FLAT_KEY_ORDERはアクセント文字の
+// 付加順テーブルで符号の向きが違うため、流用せず素直に新規定義する
+const KEY_SIG_FIFTHS = {
+    C: 0, G: 1, D: 2, A: 3, E: 4, B: 5, "F#": 6, "C#": 7,
+    F: -1, Bb: -2, Eb: -3, Ab: -4, Db: -5, Gb: -6, Cb: -7,
+};
+const FIFTHS_TO_KEY_SIG = Object.fromEntries(
+    Object.entries(KEY_SIG_FIFTHS).map(([key, fifths]) => [fifths, key])
+);
+
 // 調号ごとに変化するレターとその臨時記号（#/b）を返す（五線譜上の付加順）
 const SHARP_KEY_ORDER = { C: 0, G: 1, D: 2, A: 3, E: 4, B: 5, "F#": 6, "C#": 7 };
 const FLAT_KEY_ORDER = { F: 1, Bb: 2, Eb: 3, Ab: 4, Db: 5, Gb: 6, Cb: 7 };
@@ -1189,9 +1208,7 @@ function applyTabVisibility() {
     if (mapCornerOverlay) mapCornerOverlay.style.display = showMap ? "flex" : "none";
 
     // 五線譜タブのみで使うツールバー。表示する場合はinline style自体を外し、
-    // 通常はflexだがドロワードッキング時はgridになる（#toolbarDuration.drawer-columns）
-    // CSS側のdisplay指定をそのまま活かす（inlineで"flex"を強制すると、CSSクラスでの
-    // 上書きが効かなくなってしまうため）
+    // CSS側のdisplay指定（.toolbarのflex）をそのまま活かす
     SCORE_ONLY_TOOLBAR_IDS.forEach(id => {
         const el = document.getElementById(id);
         if (el) el.style.display = showScore ? "" : "none";
@@ -1698,23 +1715,19 @@ function attachMapResizeHandle(handleId, getDelta) {
     });
 }
 
-// 音符/休符グループ（#toolbarDuration）は、デフォルトではドロワー内（#toolbarDurationDrawerSlot）
-// にドッキングされた状態で表示される。左端のグリップハンドルをドラッグすると切り離されて
-// position:fixedのフローティングパネルになり、画面上の任意の位置に配置できる。
-// フローティング中にドロワー付近までドラッグして離すと、再びドッキングされる。
+// 音符/休符グループ（#toolbarDuration）は、ツールバー内（#toolbarDurationToolbarSlot、
+// 2段目）にドッキングされた状態で表示される。左端のグリップハンドルをドラッグすると
+// 切り離されてposition:fixedのフローティングパネルになり、画面上の任意の位置に配置できる。
+// フローティング中にツールバー付近までドラッグして離すと、再びドッキングされる。
 // 位置・ドッキング状態はセッション内でのみ保持し、ページ再読み込み（F5）のたびに
 // 必ず初期位置（ドッキング状態）へ戻す（永続化はあえてしない）
 const NOTE_TOOLBAR_UNDOCK_THRESHOLD_PX = 20;
 const NOTE_TOOLBAR_DOCK_ZONE_MARGIN_PX = 40;
-// ドッキング先は2箇所（"toolbar"=ズームがあった場所 / "drawer"=ドロワー内）あり、
-// フローティング中はnull
-let noteToolbarDockZone = "toolbar";
+let noteToolbarDocked = true; // ドッキング中かどうか（フローティング中はfalse）
 
-// ドッキング先IDに対応するスロット要素を返す
-function getNoteToolbarSlot(zone) {
-    return document.getElementById(
-        zone === "drawer" ? "toolbarDurationDrawerSlot" : "toolbarDurationToolbarSlot"
-    );
+// ドッキング先のスロット要素を返す
+function getNoteToolbarSlot() {
+    return document.getElementById("toolbarDurationToolbarSlot");
 }
 
 function clampNoteToolbarPos(x, y) {
@@ -1733,45 +1746,32 @@ function applyNoteToolbarPos(x, y) {
     el.style.top = `${y}px`;
 }
 
-// 指定したドッキング先スロットへ戻す。#toolbarDuration自体の表示/非表示は
+// ドッキング先スロットへ戻す。#toolbarDuration自体の表示/非表示は
 // SCORE_ONLY_TOOLBAR_IDSの処理（五線譜表示中のみ表示）に任せているので、
-// ここではドッキング先へ差し込むだけでよい。ドロワーへドッキングする場合だけ、
-// 幅の狭さに合わせて2列（左:音符/右:休符）レイアウトのクラスを付ける
-function dockNoteToolbar(zone) {
+// ここではスロットへ差し込むだけでよい
+function dockNoteToolbar() {
     const el = document.getElementById("toolbarDuration");
-    const slot = getNoteToolbarSlot(zone);
+    const slot = getNoteToolbarSlot();
     if (!el || !slot) return;
     el.classList.remove("floating", "snapping");
-    el.classList.toggle("drawer-columns", zone === "drawer");
     el.style.left = "";
     el.style.top = "";
     slot.appendChild(el);
-    noteToolbarDockZone = zone;
+    noteToolbarDocked = true;
 }
 
-// ドッキング判定に使う領域（ツールバー/ドロワーの2箇所）のうち、指定した位置に十分近い
-// ものがあればそのゾーンIDを返す（無ければnull）。ドロワーは左端に固定された縦長パネル
-// のため、上下方向の位置に関わらず左端との水平距離だけで判定する（閉じている間は
-// translateXで画面外にあるため、実質的にドッキングできない）。両方に該当しうる画面左上
-// 付近では、より具体的な"toolbar"を優先する
-function findNoteToolbarDockZone(rect) {
-    const toolbarsEl = document.getElementById("toolbars");
-    if (toolbarsEl) {
-        const tz = toolbarsEl.getBoundingClientRect();
-        if (rect.top < tz.bottom + NOTE_TOOLBAR_DOCK_ZONE_MARGIN_PX) return "toolbar";
-    }
-    const drawerEl = document.getElementById("drawer");
-    if (drawerEl) {
-        const dz = drawerEl.getBoundingClientRect();
-        if (rect.left < dz.right + NOTE_TOOLBAR_DOCK_ZONE_MARGIN_PX) return "drawer";
-    }
-    return null;
+// ドッキング判定に使う領域（ツールバー行）に、指定した位置が十分近いかどうかを返す
+function isNearNoteToolbarDockZone(rect) {
+    const toolbarsEl = document.getElementById("tabRow");
+    if (!toolbarsEl) return false;
+    const tz = toolbarsEl.getBoundingClientRect();
+    return rect.top < tz.bottom + NOTE_TOOLBAR_DOCK_ZONE_MARGIN_PX;
 }
 
-// ドッキングした場合に実際に収まる位置（該当スロット）を概算する。
+// ドッキングした場合に実際に収まる位置（スロット）を概算する。
 // ドラッグ中にこの位置へ「吸い付いて」見せることで、離せばここにドッキングされることを予告する
-function computeNoteToolbarDockSnapPos(zone) {
-    const slot = getNoteToolbarSlot(zone);
+function computeNoteToolbarDockSnapPos() {
+    const slot = getNoteToolbarSlot();
     if (!slot) return null;
     const slotRect = slot.getBoundingClientRect();
     return { x: slotRect.left, y: slotRect.bottom + 4 };
@@ -1783,8 +1783,7 @@ function undockNoteToolbar(x, y) {
     if (!el) return;
     document.body.appendChild(el);
     el.classList.add("floating");
-    el.classList.remove("drawer-columns");
-    noteToolbarDockZone = null;
+    noteToolbarDocked = false;
     const clamped = clampNoteToolbarPos(x, y);
     applyNoteToolbarPos(clamped.x, clamped.y);
 }
@@ -1794,7 +1793,7 @@ function setupNoteToolbarDrag() {
     const handle = document.getElementById("toolbarDurationHandle");
     if (!el || !handle) return;
 
-    dockNoteToolbar("toolbar"); // 常にツールバー（ズームがあった場所）のドッキング状態から開始する
+    dockNoteToolbar(); // 常にツールバー（2段目）のドッキング状態から開始する
 
     let dragging = false;
     // このドラッグ操作で実際にフローティングパネルとして位置更新が行われたか
@@ -1805,7 +1804,7 @@ function setupNoteToolbarDrag() {
 
     handle.addEventListener("mousedown", (e) => {
         dragging = true;
-        hasMoved = noteToolbarDockZone === null; // 既にフローティング中なら最初から追従対象
+        hasMoved = !noteToolbarDocked; // 既にフローティング中なら最初から追従対象
         startX = e.clientX;
         startY = e.clientY;
         const rect = el.getBoundingClientRect();
@@ -1832,10 +1831,9 @@ function setupNoteToolbarDrag() {
 
         const { x, y } = clampNoteToolbarPos(baseX + dx, baseY + dy);
         const freeRect = { top: y, left: x, bottom: y + (el.offsetHeight || 40) };
-        const zone = findNoteToolbarDockZone(freeRect);
-        if (zone) {
+        if (isNearNoteToolbarDockZone(freeRect)) {
             // ドックゾーン内: 実際にドッキングした場合の位置へ吸い付かせ、予告の枠線を表示する
-            const snap = computeNoteToolbarDockSnapPos(zone);
+            const snap = computeNoteToolbarDockSnapPos();
             el.classList.add("snapping");
             if (snap) applyNoteToolbarPos(snap.x, snap.y);
             else applyNoteToolbarPos(x, y);
@@ -1852,15 +1850,14 @@ function setupNoteToolbarDrag() {
 
         el.classList.remove("snapping");
         const rect = el.getBoundingClientRect();
-        const zone = findNoteToolbarDockZone(rect);
-        if (zone) {
-            dockNoteToolbar(zone);
+        if (isNearNoteToolbarDockZone(rect)) {
+            dockNoteToolbar();
         }
     });
 
     // ウィンドウリサイズで画面外にはみ出さないよう追従させる（フローティング時のみ）
     window.addEventListener("resize", () => {
-        if (noteToolbarDockZone) return;
+        if (noteToolbarDocked) return;
         const rect = el.getBoundingClientRect();
         const { x, y } = clampNoteToolbarPos(rect.left, rect.top);
         applyNoteToolbarPos(x, y);
@@ -4678,6 +4675,316 @@ function deleteSelectedMeasures() {
     rescheduleFromCurrentPosition();
 }
 
+// ===== MusicXML入出力 =====
+// 保存は常にMusicXML形式で書き出す。読み込みは従来のJSON保存ファイル（後方互換）と、
+// このアプリ自身が書き出したMusicXMLファイルの両方に対応する（他ソフト製の任意の
+// MusicXMLファイルへの汎用対応は対象外。<backup>を使う複数声部やファイルごとに
+// 異なるdivisions、タイ/スラーの混同、.mxl圧縮などの「現実のファイルの癖」を
+// 吸収するのは別途大掛かりな作業になるため、今回は自分の書き出し形式を確実に
+// 読み戻せることに専念する）
+
+function escapeXmlText(str) {
+    return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&apos;");
+}
+
+// ピッチ文字列（例:"F#4"）→MusicXMLのstep/alter/octave
+function pitchStringToMusicXML(pitchStr) {
+    const match = pitchStr.match(/^([A-Ga-g])([#b]?)(-?\d+)$/);
+    const step = match[1].toUpperCase();
+    const alter = match[2] === "#" ? 1 : match[2] === "b" ? -1 : 0;
+    const octave = parseInt(match[3], 10);
+    return { step, alter, octave };
+}
+
+// MusicXMLのstep/alter/octave→ピッチ文字列
+function musicXMLToPitchString(step, alter, octave) {
+    const accidental = alter === 1 ? "#" : alter === -1 ? "b" : "";
+    return `${step}${accidental}${octave}`;
+}
+
+// 1つの音符/休符オブジェクトのMusicXML上の長さ（divisions単位）を返す
+function noteDurationUnits(note) {
+    return Math.round(durationBeats[note.duration] * (note.dotted ? 1.5 : 1) * MUSICXML_DIVISIONS);
+}
+
+// 1段（upperNotes/lowerNotes）分の<note>要素群を組み立てる
+function buildStaffNotesXML(notes, staffNumber, voiceNumber) {
+    return notes.map(note => {
+        const type = DURATION_TO_XML_TYPE[note.duration];
+        const units = noteDurationUnits(note);
+        const dotXml = note.dotted ? "<dot/>" : "";
+        if (note.rest) {
+            return `<note><rest/><duration>${units}</duration><voice>${voiceNumber}</voice><type>${type}</type>${dotXml}<staff>${staffNumber}</staff></note>`;
+        }
+        return note.pitches.map((pitchStr, i) => {
+            const { step, alter, octave } = pitchStringToMusicXML(pitchStr);
+            const alterXml = alter !== 0 ? `<alter>${alter}</alter>` : "";
+            const chordXml = i > 0 ? "<chord/>" : "";
+            return `<note>${chordXml}<pitch><step>${step}</step>${alterXml}<octave>${octave}</octave></pitch><duration>${units}</duration><voice>${voiceNumber}</voice><type>${type}</type>${dotXml}<staff>${staffNumber}</staff></note>`;
+        }).join("");
+    }).join("");
+}
+
+// 1段分の音符/休符列の合計長さ（divisions単位）。和音は1つの音符として1回だけ数える
+function staffNotesUnits(notes) {
+    return notes.reduce((sum, note) => sum + noteDurationUnits(note), 0);
+}
+
+// score（+title/bpm/northDirection/mapSettings）→MusicXML文字列
+function scoreToMusicXML(scoreData, { title, bpm, northDirection: nd, mapSettings: ms }) {
+    const fifths = KEY_SIG_FIFTHS[scoreData.keySignature] ?? 0;
+    const [beatsNum, beatsDen] = (scoreData.timeSignature || "4/4").split("/").map(Number);
+    const appState = JSON.stringify({ grandStaff: !!scoreData.grandStaff, northDirection: nd, mapSettings: ms });
+
+    const measuresXml = scoreData.measures.map((measure, i) => {
+        const upperXml = buildStaffNotesXML(measure.upperNotes, 1, 1);
+        const lowerXml = buildStaffNotesXML(measure.lowerNotes, 2, 2);
+        const backupUnits = staffNotesUnits(measure.upperNotes);
+
+        const attributesXml = i === 0 ? `<attributes><divisions>${MUSICXML_DIVISIONS}</divisions><key><fifths>${fifths}</fifths></key><time><beats>${beatsNum}</beats><beat-type>${beatsDen}</beat-type></time><staves>2</staves><clef number="1"><sign>G</sign><line>2</line></clef><clef number="2"><sign>G</sign><line>2</line></clef></attributes>` : "";
+        const directionXml = i === 0 ? `<direction placement="above"><direction-type><metronome><beat-unit>quarter</beat-unit><per-minute>${bpm}</per-minute></metronome></direction-type><sound tempo="${bpm}"/></direction>` : "";
+
+        return `<measure number="${i + 1}">${attributesXml}${directionXml}${upperXml}<backup><duration>${backupUnits}</duration></backup>${lowerXml}</measure>`;
+    }).join("");
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+<movement-title>${escapeXmlText(title)}</movement-title>
+<identification><miscellaneous><miscellaneous-field name="pokoa:appState">${escapeXmlText(appState)}</miscellaneous-field></miscellaneous></identification>
+<part-list><score-part id="P1"><part-name>Pokoa</part-name></score-part></part-list>
+<part id="P1">${measuresXml}</part>
+</score-partwise>`;
+}
+
+// 読み込んだファイルのテキストがJSON/MusicXML/不明のどれかを判定する
+function detectFileFormat(text) {
+    const trimmed = text.replace(/^﻿/, "").trim();
+    if (/<score-partwise/i.test(trimmed.slice(0, 500))) return "musicxml";
+    if (trimmed.startsWith("{")) return "json";
+    return "unknown";
+}
+
+// .mxl（ZIP圧縮MusicXML、musescore.com等のダウンロードの既定形式）から、
+// 中のMusicXML本体だけをテキストとして取り出す。解凍にはfflate（CDN読み込み、
+// window.fflate）を使う。取り出した後のテキストはdetectFileFormat/musicXMLToScoreに
+// そのまま渡せる（.mxlは「MusicXML本体をZIPで包んだ入れ物」でしかないため）
+function extractMusicXMLFromMxl(arrayBuffer) {
+    let entries;
+    try {
+        entries = fflate.unzipSync(new Uint8Array(arrayBuffer));
+    } catch (err) {
+        throw new Error(`ZIPとして展開できませんでした（${err.message || err}）`);
+    }
+
+    // 正規の.mxl構造では、META-INF/container.xmlのrootfileが本体のパスを教えてくれる
+    let rootPath = null;
+    const containerBytes = entries["META-INF/container.xml"];
+    if (containerBytes) {
+        const containerXml = new TextDecoder("utf-8").decode(containerBytes);
+        const doc = new DOMParser().parseFromString(containerXml, "application/xml");
+        const rootfileEl = doc.querySelector("rootfile");
+        if (rootfileEl) rootPath = rootfileEl.getAttribute("full-path");
+    }
+
+    // container.xmlが無い/読めない/指しているファイルが実在しない場合のフォールバックとして、
+    // META-INF以外にある.xml/.musicxmlエントリを1つ拾う
+    if (!rootPath || !entries[rootPath]) {
+        rootPath = Object.keys(entries).find(
+            name => !name.startsWith("META-INF/") && /\.(musicxml|xml)$/i.test(name)
+        );
+    }
+
+    if (!rootPath || !entries[rootPath]) {
+        throw new Error("圧縮ファイル内にMusicXML本体が見つかりませんでした");
+    }
+
+    return new TextDecoder("utf-8").decode(entries[rootPath]);
+}
+
+// <pitch>要素→ピッチ文字列
+function readPitchFromXML(pitchEl) {
+    const step = pitchEl.querySelector("step").textContent;
+    const alterEl = pitchEl.querySelector("alter");
+    const alter = alterEl ? parseInt(alterEl.textContent, 10) : 0;
+    if (alter !== 0 && alter !== 1 && alter !== -1) {
+        throw new Error(`対応していない臨時記号です（alter=${alter}）`);
+    }
+    const octave = pitchEl.querySelector("octave").textContent;
+    return musicXMLToPitchString(step, alter, octave);
+}
+
+// MusicXML文字列→{score, title, bpm, northDirection, mapSettings}。
+// このアプリ自身が書き出した形式（1パート・2段・1段=1声部）以外は分かりやすい
+// エラーメッセージ付きでErrorを投げる
+function musicXMLToScore(xmlString) {
+    const doc = new DOMParser().parseFromString(xmlString, "application/xml");
+    if (doc.querySelector("parsererror")) {
+        throw new Error("XMLとして解析できませんでした");
+    }
+    const root = doc.documentElement;
+    if (!root || root.tagName !== "score-partwise") {
+        throw new Error("score-partwise形式のMusicXMLのみ対応しています");
+    }
+    const parts = root.querySelectorAll(":scope > part");
+    if (parts.length !== 1) {
+        throw new Error("複数パートのMusicXMLには対応していません");
+    }
+    const part = parts[0];
+    const measureEls = part.querySelectorAll(":scope > measure");
+    if (measureEls.length === 0) {
+        throw new Error("小節が見つかりませんでした");
+    }
+
+    const firstAttributes = measureEls[0].querySelector(":scope > attributes");
+    if (!firstAttributes) {
+        throw new Error("拍子/調号の情報（attributes）が見つかりませんでした");
+    }
+    const fifthsEl = firstAttributes.querySelector("key > fifths");
+    const fifths = fifthsEl ? parseInt(fifthsEl.textContent, 10) : 0;
+    const keySignature = FIFTHS_TO_KEY_SIG[fifths];
+    if (!keySignature) {
+        throw new Error(`対応していない調号です（fifths=${fifths}）`);
+    }
+    const beatsEl = firstAttributes.querySelector("time > beats");
+    const beatTypeEl = firstAttributes.querySelector("time > beat-type");
+    const timeSignature = beatsEl && beatTypeEl ? `${beatsEl.textContent}/${beatTypeEl.textContent}` : "4/4";
+    const stavesEl = firstAttributes.querySelector("staves");
+    const hasSecondStaff = stavesEl ? parseInt(stavesEl.textContent, 10) >= 2 : false;
+
+    let appState = {};
+    const miscField = root.querySelector('identification > miscellaneous > miscellaneous-field[name="pokoa:appState"]');
+    if (miscField) {
+        try { appState = JSON.parse(miscField.textContent); } catch { appState = {}; }
+    }
+
+    const titleEl = root.querySelector(":scope > movement-title");
+    const title = titleEl ? titleEl.textContent : "NewScore";
+    const soundEl = part.querySelector("sound[tempo]");
+    const bpm = soundEl ? Math.round(parseFloat(soundEl.getAttribute("tempo"))) : 120;
+
+    const measures = Array.from(measureEls).map((measureEl) => {
+        const upperNotes = [];
+        const lowerNotes = [];
+        const currentSlotByStaff = { 1: null, 2: null };
+        const seenVoiceByStaff = { 1: null, 2: null };
+
+        measureEl.querySelectorAll(":scope > note").forEach((noteEl) => {
+            const staffEl = noteEl.querySelector("staff");
+            const staffNum = staffEl ? parseInt(staffEl.textContent, 10) : 1;
+            if (staffNum !== 1 && staffNum !== 2) {
+                throw new Error(`対応していない段番号です（staff=${staffNum}）`);
+            }
+
+            const voiceEl = noteEl.querySelector("voice");
+            if (voiceEl) {
+                const voiceNum = voiceEl.textContent;
+                if (seenVoiceByStaff[staffNum] == null) {
+                    seenVoiceByStaff[staffNum] = voiceNum;
+                } else if (seenVoiceByStaff[staffNum] !== voiceNum) {
+                    throw new Error("複数声部（voice）が混在する段には対応していません");
+                }
+            }
+
+            const isChordFlag = !!noteEl.querySelector(":scope > chord");
+            if (isChordFlag) {
+                const target = currentSlotByStaff[staffNum];
+                if (!target || !target.pitches) {
+                    throw new Error("孤立した<chord/>要素があります");
+                }
+                const pitchEl = noteEl.querySelector("pitch");
+                if (!pitchEl) throw new Error("<chord/>要素に音高情報がありません");
+                target.pitches.push(readPitchFromXML(pitchEl));
+                target.pitches.sort((a, b) => pitchToSemitone(a) - pitchToSemitone(b));
+                return;
+            }
+
+            const typeEl = noteEl.querySelector("type");
+            if (!typeEl) {
+                throw new Error("音価（<type>）を持たない音符には対応していません");
+            }
+            const durationCode = XML_TYPE_TO_DURATION[typeEl.textContent];
+            if (!durationCode) {
+                throw new Error(`対応していない音価です（type=${typeEl.textContent}）`);
+            }
+            const dotted = !!noteEl.querySelector(":scope > dot");
+            const isRest = !!noteEl.querySelector(":scope > rest");
+            const targetArray = staffNum === 1 ? upperNotes : lowerNotes;
+
+            let noteObj;
+            if (isRest) {
+                noteObj = { rest: true, duration: durationCode, ...(dotted ? { dotted: true } : {}) };
+            } else {
+                const pitchEl = noteEl.querySelector("pitch");
+                if (!pitchEl) throw new Error("音高情報が見つかりませんでした");
+                noteObj = { pitches: [readPitchFromXML(pitchEl)], duration: durationCode, ...(dotted ? { dotted: true } : {}) };
+            }
+            targetArray.push(noteObj);
+            currentSlotByStaff[staffNum] = noteObj;
+        });
+
+        // 単一段のMusicXML（<staves>が無い等）を読んだ場合、下段が空のままだと
+        // 「小節は常に上段/下段とも音符/休符で埋まっている」という前提が崩れるため、
+        // 上段と同じ長さの休符で埋めておく
+        if (lowerNotes.length === 0) {
+            const upperBeats = upperNotes.reduce((sum, n) => sum + durationBeats[n.duration] * (n.dotted ? 1.5 : 1), 0);
+            if (upperBeats > 0) lowerNotes.push(...beatsToRests(upperBeats));
+        }
+
+        return { upperNotes, lowerNotes };
+    });
+
+    return {
+        score: {
+            timeSignature,
+            keySignature,
+            grandStaff: appState.grandStaff != null ? !!appState.grandStaff : hasSecondStaff,
+            measures,
+        },
+        title,
+        bpm,
+        northDirection: appState.northDirection != null ? appState.northDirection : 0,
+        mapSettings: appState.mapSettings || null,
+    };
+}
+
+// 読み込み完了後の共通後処理（JSON/MusicXMLどちらの読み込み結果もここに渡す）
+function applyLoadedScore({ score: loadedScore, title, bpm, northDirection: loadedNorthDirection, mapSettings: loadedMapSettings }) {
+    score = loadedScore;
+
+    if (title != null) {
+        document.getElementById("scoreTitleInput").value = title;
+    }
+    if (bpm != null) {
+        document.getElementById("bpmInput").value = bpm;
+    }
+    if (loadedNorthDirection != null) {
+        northDirection = loadedNorthDirection;
+        document.getElementById("compassLabel").textContent = COMPASS_LABELS[northDirection];
+    }
+    if (loadedMapSettings) {
+        Object.assign(mapSettings, loadedMapSettings);
+        saveMapSettings();
+        updateMapToolbarUI();
+    }
+    updateKeySignatureUI();
+
+    history = [];
+    historyIndex = -1;
+    selectedMeasures.clear();
+    saveHistory();
+    // 読み込み直後はファイルの内容そのものなので「未保存の変更」ではない
+    hasUnsavedChanges = false;
+    renderScore();
+    setupDeleteButtons();
+    setupInsertButtons();
+    if (activeTab === "map" || activeTab === "both") renderMap();
+}
+
 async function main() {
 
     loadSeBuffers();
@@ -4961,12 +5268,12 @@ async function main() {
 
     document.getElementById("zoomIn")
         .addEventListener("click", () => {
-            updateZoom(Math.min(scale + 0.25, ZOOM_MAX));
+            updateZoom(Math.min(scale + 0.1, ZOOM_MAX));
         });
 
     document.getElementById("zoomOut")
         .addEventListener("click", () => {
-            updateZoom(Math.max(scale - 0.25, ZOOM_MIN));
+            updateZoom(Math.max(scale - 0.1, ZOOM_MIN));
         });
 
     document.getElementById("zoomSlider")
@@ -5127,14 +5434,7 @@ async function main() {
         .addEventListener("click", async () => {
             const title = document.getElementById("scoreTitleInput").value || "NewScore";
             const bpm = parseInt(document.getElementById("bpmInput").value) || 120;
-            const payload = {
-                ...score,
-                title,
-                bpm,
-                northDirection,
-                mapSettings: { ...mapSettings },
-            };
-            const json = JSON.stringify(payload, null, 2);
+            const xml = scoreToMusicXML(score, { title, bpm, northDirection, mapSettings: { ...mapSettings } });
 
             // File System Access API対応ブラウザ（Chrome/Edge等）では、保存先を
             // エクスプローラーのダイアログで選べるようにする。非対応ブラウザ
@@ -5142,11 +5442,11 @@ async function main() {
             if (window.showSaveFilePicker) {
                 try {
                     const handle = await window.showSaveFilePicker({
-                        suggestedName: `${title}.json`,
-                        types: [{ description: "JSONファイル", accept: { "application/json": [".json"] } }],
+                        suggestedName: `${title}.musicxml`,
+                        types: [{ description: "MusicXMLファイル", accept: { "application/vnd.recordare.musicxml+xml": [".musicxml", ".xml"] } }],
                     });
                     const writable = await handle.createWritable();
-                    await writable.write(json);
+                    await writable.write(xml);
                     await writable.close();
                     hasUnsavedChanges = false;
                     updateStatusBar();
@@ -5158,11 +5458,11 @@ async function main() {
                 return;
             }
 
-            const blob = new Blob([json], { type: "application/json" });
+            const blob = new Blob([xml], { type: "application/vnd.recordare.musicxml+xml" });
             const url = URL.createObjectURL(blob);
             const a = document.createElement("a");
             a.href = url;
-            a.download = `${title}.json`;
+            a.download = `${title}.musicxml`;
             a.click();
             URL.revokeObjectURL(url);
             hasUnsavedChanges = false;
@@ -5176,49 +5476,58 @@ async function main() {
             if (!file) return;
             const reader = new FileReader();
             reader.onload = (event) => {
-                try {
-                    const data = JSON.parse(event.target.result);
-                    const [tsNumLoad, tsDenLoad] = (data.timeSignature || "4/4").split("/").map(Number);
-                    const beatsPerMeasureLoad = tsNumLoad * 4 / tsDenLoad;
-                    score = {
-                        timeSignature: data.timeSignature,
-                        keySignature: data.keySignature || "C",
-                        grandStaff: !!data.grandStaff,
-                        measures: migrateMeasuresToStaffArrays(data.measures, !!data.grandStaff, beatsPerMeasureLoad)
-                    };
+                const buffer = event.target.result;
+                const bytes = new Uint8Array(buffer);
+                let text;
 
-                    if (data.title != null) {
-                        document.getElementById("scoreTitleInput").value = data.title;
+                // 先頭2バイトがZIPのマジックナンバー"PK"（0x50,0x4B）なら.mxl（ZIP圧縮
+                // MusicXML）とみなして解凍する。拡張子ではなく中身のバイト列で判定するため、
+                // 拡張子を.xmlにリネームした.mxl等でも正しく扱える
+                if (bytes[0] === 0x50 && bytes[1] === 0x4B) {
+                    try {
+                        text = extractMusicXMLFromMxl(buffer);
+                    } catch (err) {
+                        alert(`圧縮ファイル（.mxl）の展開に失敗しました\n${err.message || ""}`);
+                        return;
                     }
-                    if (data.bpm != null) {
-                        document.getElementById("bpmInput").value = data.bpm;
-                    }
-                    if (data.northDirection != null) {
-                        northDirection = data.northDirection;
-                        document.getElementById("compassLabel").textContent = COMPASS_LABELS[northDirection];
-                    }
-                    if (data.mapSettings) {
-                        Object.assign(mapSettings, data.mapSettings);
-                        saveMapSettings();
-                        updateMapToolbarUI();
-                    }
-                    updateKeySignatureUI();
+                } else {
+                    text = new TextDecoder("utf-8").decode(buffer);
+                }
 
-                    history = [];
-                    historyIndex = -1;
-                    selectedMeasures.clear();
-                    saveHistory();
-                    // 読み込み直後はファイルの内容そのものなので「未保存の変更」ではない
-                    hasUnsavedChanges = false;
-                    renderScore();
-                    setupDeleteButtons();
-                    setupInsertButtons();
-                    if (activeTab === "map" || activeTab === "both") renderMap();
-                } catch (err) {
-                    alert("JSONの読み込みに失敗しました");
+                const format = detectFileFormat(text);
+
+                if (format === "json") {
+                    try {
+                        const data = JSON.parse(text);
+                        const [tsNumLoad, tsDenLoad] = (data.timeSignature || "4/4").split("/").map(Number);
+                        const beatsPerMeasureLoad = tsNumLoad * 4 / tsDenLoad;
+                        const loadedScore = {
+                            timeSignature: data.timeSignature,
+                            keySignature: data.keySignature || "C",
+                            grandStaff: !!data.grandStaff,
+                            measures: migrateMeasuresToStaffArrays(data.measures, !!data.grandStaff, beatsPerMeasureLoad)
+                        };
+                        applyLoadedScore({
+                            score: loadedScore,
+                            title: data.title,
+                            bpm: data.bpm,
+                            northDirection: data.northDirection,
+                            mapSettings: data.mapSettings,
+                        });
+                    } catch (err) {
+                        alert("JSONの読み込みに失敗しました");
+                    }
+                } else if (format === "musicxml") {
+                    try {
+                        applyLoadedScore(musicXMLToScore(text));
+                    } catch (err) {
+                        alert(`MusicXMLの読み込みに失敗しました（このアプリで書き出したファイル以外は現時点で非対応です）\n${err.message || ""}`);
+                    }
+                } else {
+                    alert("対応していないファイル形式です");
                 }
             };
-            reader.readAsText(file);
+            reader.readAsArrayBuffer(file);
             e.target.value = "";
         });
 }
