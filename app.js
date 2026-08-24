@@ -32,10 +32,10 @@ let playState = "stopped"; // "stopped" | "playing" | "paused"
 let isLooping = false;
 let playStartTime = null;
 let playEndTime = 0; // audioCtx時刻での再生終了予定時刻（終了検知・ループに使用）
-// 現在の再生対象範囲（選択があればその範囲、無ければ曲全体）の先頭から数えて、
-// 今回の再生開始位置が何秒目にあたるか。シークバーの現在位置表示に使う
-// （シークで途中の小節から再生し直しても、範囲先頭からの絶対位置を保つため）
-let playRangeElapsedAtStart = 0;
+// 曲の絶対的な先頭（小節0）から数えて、今回の再生開始位置が何秒目にあたるか。
+// シークバーの現在位置表示に使う（A-B区間ループ中でもシークバー自体は曲全体の
+// 絶対時間で動かしたいため、区間の先頭ではなく常に曲の先頭からの絶対位置にする）
+let playAbsoluteElapsedAtStart = 0;
 // シークバーをドラッグ操作中かどうか。trueの間はtrackPlayback()側からの
 // シークバーの値の自動更新を止め、ドラッグ中の値を上書きしないようにする
 let isSeekDragging = false;
@@ -142,15 +142,24 @@ function rotateBothTabLayout() {
     // 切り替え後に「切り替え前の位置にいるように見える」だけズレたtransformを
     // 一旦transitionなしで当ててから、それを0へ戻すtransitionをかけることで、
     // 実際の移動距離ぶんだけ滑らかにスライドしたように見せる
-    const flipEls = [document.getElementById("scoreWrapper"), document.getElementById("mapAreaWrapper")]
+    // #bothTabDivider（入れ替えボタンを乗せている境界線）も、bothSplitRatioの反転で
+    // 実際の画面上の位置（列1の幅が変わるため）が動く。ここに含めないと、境界線・
+    // 入れ替えボタンだけ即座に新しい位置へスナップし、五線譜/マップ本体がFLIPで
+    // 追いつくまでの間、両者のタイミングがズレて見えてしまう
+    const flipEls = [document.getElementById("scoreWrapper"), document.getElementById("mapAreaWrapper"), document.getElementById("bothTabDivider")]
         .filter(Boolean);
     const firstRects = new Map(flipEls.map(el => [el, el.getBoundingClientRect()]));
 
+    // bothSplitRatioを反転させているため、五線譜・マップそれぞれ自身の幅は変わらず
+    // 左右の位置（grid-column）だけが入れ替わる。renderScore()/renderMap()が依存する
+    // 入力（各ラッパー自身のclientWidth・scale・データ内容）は何一つ変化しないため、
+    // 中身を再構築するrenderScore()/renderMap()の呼び直しは不要（かつ、五線譜は数十ms、
+    // マップは小節数・マス数次第で数百msかかることもあり、単なる左右入れ替えのたびに
+    // 呼ぶと体感のもたつきの主因になっていた）。削除/挿入ボタンやマップのリサイズハンドルも
+    // 位置は各ラッパー自身からの相対オフセットで決まり、ラッパーの子要素として一緒に
+    // 移動するため、これらも再計算不要（FLIPアニメーション自体はapplyBothTabLayout()後の
+    // 実測left/topの差分だけで成立するため、中身の再構築とは独立して機能する）
     applyBothTabLayout();
-    renderScore();
-    setupDeleteButtons();
-    setupInsertButtons();
-    renderMap();
 
     flipEls.forEach(el => {
         const first = firstRects.get(el);
@@ -349,23 +358,29 @@ function playNote(pitch, startTime, duration) {
     activeSourceNodes.push({ node: osc, startTime });
 }
 
-// 再生は常に曲全体を対象とする（小節選択は編集用の状態であり、シークバー等の
-// 再生系操作を巻き込まないよう独立させている）
+// 再生は基本的に曲全体を対象とする（小節選択は編集用の状態であり、シークバー等の
+// 再生系操作を巻き込まないよう独立させている）が、A-B区間ループ（abLoopRange）が
+// 設定されている間はその区間だけを対象にする。scheduleMeasuresFrom()がこの関数を
+// 直接呼んでスケジュールの終端を決めているため、区間の反映はここで行う
+let abLoopRange = null; // { startMeasureIndex, endMeasureIndex } | null（#abLoopStripで設定）
+
 function getPlaybackEndMeasureIndex() {
+    if (abLoopRange) return abLoopRange.endMeasureIndex;
     return score.measures.length - 1;
 }
 
 function getPlaybackRangeMeasures() {
+    if (abLoopRange) return { startMeasureIndex: abLoopRange.startMeasureIndex, endMeasureIndex: abLoopRange.endMeasureIndex };
     return { startMeasureIndex: 0, endMeasureIndex: getPlaybackEndMeasureIndex() };
 }
 
-// 現在のBPMでの、再生対象範囲（選択があればその範囲、無ければ曲全体）の合計時間（秒）。
-// シークバーの総時間表示や、シーク位置→小節番号の計算に使う
-function getPlaybackRangeDuration() {
-    const { startMeasureIndex, endMeasureIndex } = getPlaybackRangeMeasures();
-    const measureCount = endMeasureIndex - startMeasureIndex + 1;
+// 現在のBPMでの、曲全体の合計時間（秒）。シークバーの総時間表示・シーク位置→
+// 小節番号の計算に使う。A-B区間ループ中でも常に曲全体基準のまま変えない
+// （「シークバーの秒数は変えないでほしい」との要望——動かせる範囲はA-Bに
+// 制限しつつ、表示される時刻・目盛りは曲全体の絶対時間のままにする）
+function getFullSongDuration() {
     const bpm = parseInt(document.getElementById("bpmInput")?.value) || 120;
-    return Math.max(0, measureCount * getBeatsPerMeasure() * (60 / bpm));
+    return Math.max(0, score.measures.length * getBeatsPerMeasure() * (60 / bpm));
 }
 
 function playScore() {
@@ -392,10 +407,9 @@ function startPlaybackFromMeasure(measureIndex) {
     // オフセットとして渡し、途中から再生してもセンサーのハイライトがずれないようにする
     const beatIndexOffset = measureIndex * getBeatsPerMeasure() * 4;
 
-    // シークバー用: 再生対象範囲の先頭から数えて、何秒ぶん進んだ位置から再生を始めるか
-    const { startMeasureIndex } = getPlaybackRangeMeasures();
+    // シークバー用: 曲の絶対的な先頭から数えて、何秒ぶん進んだ位置から再生を始めるか
     const bpm = parseInt(document.getElementById("bpmInput").value) || 120;
-    playRangeElapsedAtStart = (measureIndex - startMeasureIndex) * getBeatsPerMeasure() * (60 / bpm);
+    playAbsoluteElapsedAtStart = measureIndex * getBeatsPerMeasure() * (60 / bpm);
 
     scheduleMeasuresFrom(measureIndex, { noteIndex: 0, time: playStartTime }, { noteIndex: 0, time: playStartTime }, beatIndexOffset, null);
 
@@ -559,7 +573,10 @@ function rescheduleFromCurrentPosition() {
 // 再生を終端まで到達した状態にする（ループ時は続けて再生開始）
 function finishPlayback() {
     playState = "stopped";
-    if (isLooping) {
+    // 全曲ループ（isLooping）とA-B区間ループ（abLoopRange）は独立した別概念だが、
+    // どちらか一方でも有効なら「最後まで来たら再生対象範囲の先頭へ戻って続ける」
+    // という動作自体は共通なので、ここではORで判定する
+    if (isLooping || abLoopRange) {
         playScore();
         return;
     }
@@ -654,7 +671,7 @@ function formatPlaybackTime(seconds) {
 // 現在の再生対象範囲の先頭から数えた経過秒数（停止中は0）
 function getPlaybackElapsed() {
     if (playState === "stopped" || !audioCtx) return 0;
-    return playRangeElapsedAtStart + (audioCtx.currentTime - playStartTime);
+    return playAbsoluteElapsedAtStart + (audioCtx.currentTime - playStartTime);
 }
 
 // シークバーのつまみ位置と現在時刻/総時間の表示を、現在の再生状態に合わせて更新する。
@@ -667,7 +684,7 @@ function updateSeekBar() {
     const totalEl = document.getElementById("seekTimeTotal");
     if (!bar || !curEl || !totalEl) return;
 
-    const totalDuration = getPlaybackRangeDuration();
+    const totalDuration = getFullSongDuration();
     totalEl.textContent = formatPlaybackTime(totalDuration);
     if (isSeekDragging) return;
 
@@ -675,6 +692,19 @@ function updateSeekBar() {
     curEl.textContent = formatPlaybackTime(elapsed);
     bar.value = totalDuration > 0 ? elapsed / totalDuration : 0;
     updateSliderFill(bar);
+    updateSeekBarFillStart();
+}
+
+// A-Bループ中は、シークバーの「再生済み」を示す黒いバーがA-B区間の外にはみ出さないよう、
+// バーが塗り始める位置（--fill-start）をAの位置に揃える（CSSのグラデーション/clip-pathで参照する）。
+// A-Bが無効な間は常に0%（曲の先頭から塗る、従来通り）
+function updateSeekBarFillStart() {
+    const bar = document.getElementById("seekBar");
+    if (!bar || !score) return;
+    const startRatio = (abLoopRange && score.measures.length > 0)
+        ? abLoopRange.startMeasureIndex / score.measures.length
+        : 0;
+    bar.style.setProperty("--fill-start", `${startRatio * 100}%`);
 }
 
 // シークバーで指定された割合(0〜1、再生対象範囲内での位置)へ再生位置を移動する。
@@ -708,12 +738,17 @@ function restartPlaybackFromMeasure(measureIndex) {
 }
 
 // シークバーの割合(0〜1)から、再生対象範囲内で対応する小節indexを求める
+// シークバーの割合(0〜1、常に曲全体基準)から対応する小節indexを求める。
+// A-B区間ループが有効な間は、シークバーの目盛り自体は曲全体のままにしつつ
+// （「シークバーの秒数は変えないでほしい」との要望）、実際にシークできる小節は
+// A-B区間内にクランプする（＝シークバーが動ける範囲がA-Bの長さだけになる）
 function getMeasureIndexForRatio(ratio) {
-    const { startMeasureIndex, endMeasureIndex } = getPlaybackRangeMeasures();
-    const measureCount = endMeasureIndex - startMeasureIndex + 1;
-    if (measureCount <= 0) return null;
-    const offset = Math.min(measureCount - 1, Math.max(0, Math.floor(ratio * measureCount)));
-    return startMeasureIndex + offset;
+    const measureIndex = measureIndexForFullSongRatio(ratio);
+    if (measureIndex === null) return null;
+    if (abLoopRange) {
+        return Math.min(abLoopRange.endMeasureIndex, Math.max(abLoopRange.startMeasureIndex, measureIndex));
+    }
+    return measureIndex;
 }
 
 function seekToRatio(ratio) {
@@ -730,6 +765,206 @@ function previewSeekHighlight(measureIndex) {
     drawMapPlayLine(beatIndex, 0);
     const { left, rowIndex } = getMeasureXRange(measureIndex);
     drawPlayLine(left, rowIndex);
+}
+
+// ===== A-B区間ループ =====
+// #abLoopStrip（#seekBarの真下の帯）上でのドラッグでA-B区間を指定する。
+// getMeasureIndexForRatio()はA-B区間ループが有効な間、区間内にクランプされる
+// （シークバー自体の動く範囲をA-Bの長さだけに制限するため）ため、区間を新しく
+// 引き直す/広げ直す用途には使えない（区間の外側が表現できなくなる）。
+// このため常に「曲全体」を基準にした専用の変換関数を別に用意する
+function measureIndexForFullSongRatio(ratio) {
+    const measureCount = score.measures.length;
+    if (measureCount <= 0) return null;
+    return Math.min(measureCount - 1, Math.max(0, Math.floor(ratio * measureCount)));
+}
+
+const AB_LOOP_DRAG_THRESHOLD_PX = 4;
+
+// #abLoopStripの表示位置・幅を#seekBarの実測位置に揃える（#seekBarRowと
+// #abLoopStripRowはCSS上同じmax-width/paddingだが、#seekBar自体は左右の
+// 時刻表示スパンの分だけ内側に寄っているため、flexだけでは厳密に一致しない）
+function updateAbLoopStripGeometry() {
+    const seekBar = document.getElementById("seekBar");
+    const strip = document.getElementById("abLoopStrip");
+    const stripRow = document.getElementById("abLoopStripRow");
+    if (!seekBar || !strip || !stripRow) return;
+    const seekRect = seekBar.getBoundingClientRect();
+    const rowRect = stripRow.getBoundingClientRect();
+    strip.style.left = `${seekRect.left - rowRect.left}px`;
+    strip.style.width = `${seekRect.width}px`;
+}
+
+// abLoopRangeの有無に応じて帯・クリアボタンの表示を更新する
+function renderAbLoopBand() {
+    const band = document.getElementById("abLoopBand");
+    const clearBtn = document.getElementById("abLoopClearBtn");
+    if (!band || !clearBtn) return;
+
+    updateSeekBarFillStart();
+
+    if (!abLoopRange) {
+        band.style.display = "none";
+        clearBtn.style.display = "none";
+        return;
+    }
+
+    const measureCount = score.measures.length;
+    const startRatio = abLoopRange.startMeasureIndex / measureCount;
+    const endRatio = (abLoopRange.endMeasureIndex + 1) / measureCount;
+    band.style.display = "";
+    band.style.left = `${startRatio * 100}%`;
+    band.style.width = `${(endRatio - startRatio) * 100}%`;
+    clearBtn.style.display = "flex";
+}
+
+function clearAbLoopRange() {
+    abLoopRange = null;
+    renderAbLoopBand();
+    updateSeekBar();
+}
+
+function setupAbLoopStrip() {
+    const strip = document.getElementById("abLoopStrip");
+    const clearBtn = document.getElementById("abLoopClearBtn");
+    if (!strip || !clearBtn) return;
+
+    let dragging = false;
+    let startX = 0;
+    let startMeasureIndex = null;
+    let hasMoved = false;
+
+    strip.addEventListener("pointerdown", (e) => {
+        // 開始/終了ハンドルの上から始まったドラッグは、こちら（区間の引き直し）ではなく
+        // setupAbLoopHandle側の個別ドラッグに任せる
+        if (e.target.closest("#abLoopHandleA, #abLoopHandleB")) return;
+        dragging = true;
+        hasMoved = false;
+        startX = e.clientX;
+        startMeasureIndex = null;
+        e.preventDefault();
+    });
+
+    document.addEventListener("pointermove", (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - startX;
+        if (!hasMoved) {
+            if (Math.abs(dx) < AB_LOOP_DRAG_THRESHOLD_PX) return;
+            hasMoved = true;
+            const rect = strip.getBoundingClientRect();
+            const startRatio = (startX - rect.left) / rect.width;
+            startMeasureIndex = measureIndexForFullSongRatio(startRatio);
+        }
+        if (startMeasureIndex === null) return;
+
+        const rect = strip.getBoundingClientRect();
+        const currentRatio = (e.clientX - rect.left) / rect.width;
+        const currentMeasureIndex = measureIndexForFullSongRatio(currentRatio);
+        if (currentMeasureIndex === null) return;
+
+        // ドラッグ中のライブプレビュー（まだ確定していない、指を離すまでabLoopRangeは変更しない）
+        const previewStart = Math.min(startMeasureIndex, currentMeasureIndex);
+        const previewEnd = Math.max(startMeasureIndex, currentMeasureIndex);
+        const measureCount = score.measures.length;
+        const band = document.getElementById("abLoopBand");
+        const clearBtnEl = document.getElementById("abLoopClearBtn");
+        if (band) {
+            band.style.display = "";
+            band.style.left = `${(previewStart / measureCount) * 100}%`;
+            band.style.width = `${((previewEnd + 1 - previewStart) / measureCount) * 100}%`;
+        }
+        if (clearBtnEl) clearBtnEl.style.display = "flex";
+    });
+
+    document.addEventListener("pointerup", (e) => {
+        if (!dragging) return;
+        dragging = false;
+
+        if (!hasMoved) {
+            // ほぼ動かさないクリック＝区間があればクリア、無ければ何もしない
+            if (abLoopRange) clearAbLoopRange();
+            return;
+        }
+
+        const rect = strip.getBoundingClientRect();
+        const endRatio = (e.clientX - rect.left) / rect.width;
+        const endMeasureIndex = measureIndexForFullSongRatio(endRatio);
+        if (startMeasureIndex === null || endMeasureIndex === null) {
+            renderAbLoopBand(); // プレビューを確定前の状態に戻す
+            return;
+        }
+
+        const newStart = Math.min(startMeasureIndex, endMeasureIndex);
+        const newEnd = Math.max(startMeasureIndex, endMeasureIndex);
+        if (newEnd - newStart < 1) {
+            // 1小節未満の区間は誤操作とみなして不成立にする（元の状態に戻す）
+            renderAbLoopBand();
+            return;
+        }
+
+        abLoopRange = { startMeasureIndex: newStart, endMeasureIndex: newEnd };
+        renderAbLoopBand();
+        updateSeekBar();
+        // 一時停止中も含め、既に再生スケジュール済み（playState !== "stopped"）の場合は
+        // 新しい区間の先頭へ即座に組み直す。一時停止中はスケジュールだけが古い区間のまま
+        // 残っており、そのまま再開すると新しい区間の外（旧区間の続き）が鳴ってしまうため
+        if (playState === "playing" || playState === "paused") {
+            restartPlaybackFromMeasure(abLoopRange.startMeasureIndex);
+        }
+    });
+
+    clearBtn.addEventListener("click", () => clearAbLoopRange());
+
+    setupAbLoopHandle(document.getElementById("abLoopHandleA"), "start");
+    setupAbLoopHandle(document.getElementById("abLoopHandleB"), "end");
+}
+
+// 開始（A）/終了（B）のハンドルを個別につまんで動かす。区間の引き直し
+// （setupAbLoopStrip本体側のドラッグ）とは別の、既存区間の微調整用の操作
+function setupAbLoopHandle(handle, which) {
+    if (!handle) return;
+    let dragging = false;
+
+    handle.addEventListener("pointerdown", (e) => {
+        if (!abLoopRange) return;
+        dragging = true;
+        e.stopPropagation();
+        e.preventDefault();
+    });
+
+    document.addEventListener("pointermove", (e) => {
+        if (!dragging || !abLoopRange) return;
+        const strip = document.getElementById("abLoopStrip");
+        if (!strip) return;
+        const rect = strip.getBoundingClientRect();
+        const ratio = (e.clientX - rect.left) / rect.width;
+        const measureIndex = measureIndexForFullSongRatio(ratio);
+        if (measureIndex === null) return;
+
+        // 相手側の端との間に最低1小節分の間隔を保ったままクランプする
+        if (which === "start") {
+            const clamped = Math.max(0, Math.min(measureIndex, abLoopRange.endMeasureIndex - 1));
+            abLoopRange = { ...abLoopRange, startMeasureIndex: clamped };
+        } else {
+            const clamped = Math.min(score.measures.length - 1, Math.max(measureIndex, abLoopRange.startMeasureIndex + 1));
+            abLoopRange = { ...abLoopRange, endMeasureIndex: clamped };
+        }
+        renderAbLoopBand();
+    });
+
+    document.addEventListener("pointerup", () => {
+        if (!dragging) return;
+        dragging = false;
+        if (!abLoopRange) return;
+        updateSeekBar();
+        // Aを動かした場合だけ、練習中に今聴いている位置を新しいAへ合わせる
+        // （Bを動かした場合は、次のループの折り返し地点が変わるだけで十分なので
+        // 再生位置をジャンプさせない）。一時停止中も、再開時に古いスケジュールの
+        // ままだと新しいAより前（旧区間側）が鳴ってしまうため、playing同様に組み直す
+        if (which === "start" && (playState === "playing" || playState === "paused")) {
+            restartPlaybackFromMeasure(abLoopRange.startMeasureIndex);
+        }
+    });
 }
 
 function trackPlayback() {
@@ -786,10 +1021,6 @@ function highlightMeasure(measureIndex) {
         }
     });
 }
-
-// マップのセルに立体感を出すための共通グラデーション/影（フラットな単色より質感を出すため）
-const RAIL_GRADIENT_IDLE = "linear-gradient(135deg, #6b6b6b, #4a4a4a)";
-const CELL_INSET_SHADOW = "inset 0 1px 1px rgba(255,255,255,0.15), inset 0 -1px 2px rgba(0,0,0,0.2)";
 
 // マップ上のレールの再生位置を、五線譜のdrawPlayLineと同じ「1本のマーカーを毎フレーム
 // 描き直す」方式で示す。マス目を1つずつ塗り替える方式（旧highlightRailStep）は、
@@ -1172,7 +1403,7 @@ function makeDummyNotes(remainingBeats) {
 // タブ（五線譜/マップ）ごとの表示切り替え対象ツールバー。
 // ここに無いツールバー（ファイル操作・再生/BPM/音量・ズーム）は両方のタブで常時表示する
 const SCORE_ONLY_TOOLBAR_IDS = [
-    "toolbarDuration", "toolbarKeySig", "toolbarTranspose"
+    "toolbarKeySig", "toolbarTranspose"
 ];
 
 function applyTabVisibility() {
@@ -2009,7 +2240,6 @@ function renderMap() {
     mapArea.innerHTML = "";
 
     const cellSize = Math.round(42 * scale * 0.5);
-    const imageSize = cellSize;
     mapRailCellSize = cellSize;
 
     const { grid, extent, separatorCoords, isVertical, deadZoneCoords, beatCenters } = buildMapGrid();
@@ -2072,6 +2302,7 @@ function renderMap() {
         grid-template-rows: repeat(${gridH}, ${cellSize}px);
         background: #fff;
         width: fit-content;
+        --cell-size: ${cellSize}px;
     `;
 
     // 折り返し軸方向の座標が区切りマスかどうか
@@ -2108,54 +2339,31 @@ function renderMap() {
             if (ax < extMinX || ax > extMaxX || ay < extMinY || ay > extMaxY || deadZoneCoords.has(`${ax},${ay}`)) {
                 cell.dataset.outsideExtent = "1";
             }
-            cell.style.cssText = isSeparator ? `
-                width: ${cellSize}px;
-                height: ${cellSize}px;
-                background: #fff;
-                border-right: ${skipRightBorder ? "none" : "1px solid #e0e0e0"};
-                border-bottom: ${skipBottomBorder ? "none" : "1px solid #e0e0e0"};
-                border-left: ${showLeftBorder ? "1px solid #e0e0e0" : "none"};
-                border-top: ${showTopBorder ? "1px solid #e0e0e0" : "none"};
-                box-sizing: border-box;
-            ` : `
-                width: ${cellSize}px;
-                height: ${cellSize}px;
-                background: #fff;
-                border-right: ${skipRightBorder ? "none" : "1px solid #e0e0e0"};
-                border-bottom: ${skipBottomBorder ? "none" : "1px solid #e0e0e0"};
-                border-left: ${showLeftBorder ? "1px solid #e0e0e0" : "none"};
-                border-top: ${showTopBorder ? "1px solid #e0e0e0" : "none"};
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                color: #555;
-                box-sizing: border-box;
-                overflow: hidden;
-            `;
+            // 静的な部分（サイズ・既定の罫線・背景・レイアウト）は.mapCell系のCSSクラスに
+            // 任せ、ここでは「このマスにどのクラスが当てはまるか」を選ぶだけにする
+            // （以前はマスごとに大きなcssText文字列を組み立てて代入しており、マス数が
+            // 多いとその文字列生成＋CSSパースのコストが無視できなかった）
+            const classes = ["mapCell"];
+            if (!isSeparator) classes.push("mapCell--content");
+            if (skipRightBorder) classes.push("mapCell--noRightBorder");
+            if (skipBottomBorder) classes.push("mapCell--noBottomBorder");
+            if (showLeftBorder) classes.push("mapCell--showLeftBorder");
+            if (showTopBorder) classes.push("mapCell--showTopBorder");
 
             if (!isSeparator && data) {
                 if (data.type === "rail") {
-                    cell.style.background = RAIL_GRADIENT_IDLE;
-                    cell.style.boxShadow = CELL_INSET_SHADOW;
+                    classes.push("mapCell--rail");
                     // 向きに応じた線を描画（将来画像に置き換え予定）
                     const line = document.createElement("div");
                     const isVert = data.direction === "vertical";
-                    line.style.cssText = `
-                        width: ${isVert ? "30%" : "100%"};
-                        height: ${isVert ? "100%" : "30%"};
-                        background: #999;
-                        border-radius: 2px;
-                        box-shadow: 0 1px 1px rgba(0,0,0,0.3);
-                    `;
+                    line.className = `mapRailLine ${isVert ? "mapRailLine--vertical" : "mapRailLine--horizontal"}`;
                     // data-direction属性で向きを保持（将来の画像置換用）
                     cell.dataset.direction = data.direction;
                     cell.dataset.cellType = "rail";
                     cell.dataset.railStep = data.railStep;
                     cell.appendChild(line);
                 } else if (data.type === "sensor") {
-                    cell.style.background = "linear-gradient(135deg, #ea6b6b, #d03f3f)";
-                    cell.style.boxShadow = CELL_INSET_SHADOW;
-                    cell.style.color = "#fff";
+                    classes.push("mapCell--sensor");
                     // data-direction属性で向きを保持（将来の画像置換用）
                     cell.dataset.direction = data.direction;
                     cell.dataset.cellType = "sensor";
@@ -2166,25 +2374,21 @@ function renderMap() {
                     // 桁数が増えるほど1文字あたりの幅が必要になり、マス幅に対して
                     // 文字がはみ出して見切れてしまう（実測: 3桁だとcellSize*0.5程度が限界）。
                     // 桁数に応じて比率を下げることで、マスサイズに関わらず見切れないようにしつつ、
-                    // できるだけ大きい文字サイズにする
+                    // できるだけ大きい文字サイズにする（マスごとに桁数が違いうるため、これだけは
+                    // クラス化できず引き続きinline styleで扱う）
                     const digits = String(data.beatNum).length;
                     const fontRatio = digits <= 2 ? 0.5 : 0.4 * 3 / digits;
                     cell.style.fontSize = `${cellSize * fontRatio}px`;
                 } else if (data.type === "panel") {
                     const file = PITCH_TO_FILE[toCanonicalPitch(data.pitch)];
                     if (file) {
-                        cell.style.background = "radial-gradient(circle, #fbfbfb, #e8e8e8)";
-                        cell.style.boxShadow = "inset 0 1px 2px rgba(0,0,0,0.12)";
+                        classes.push("mapCell--panel");
                         const img = document.createElement("img");
                         img.src = `img/${file}`;
                         img.alt = data.pitch;
-                        img.style.cssText = `
-                            width: ${imageSize}px;
-                            height: ${imageSize}px;
-                            object-fit: contain;
-                            filter: drop-shadow(0 1px 1px rgba(0,0,0,0.25));
-                        `;
-                        // コンパス方向を反映（将来の画像置換用）
+                        img.className = "mapCellPanelImg";
+                        // コンパス方向を反映（将来の画像置換用、マスごとに角度が違いうるので
+                        // これだけは引き続きinline styleで扱う）
                         img.style.transform = `rotate(${northDirection * 90}deg)`;
                         img.dataset.cellType = "panel";
                         img.dataset.pitch = data.pitch;
@@ -2196,10 +2400,12 @@ function renderMap() {
                 // （五線譜タブの選択と相互連携、実際のドラッグ処理はsetupMapAreaDrag()側）
                 if (data.measureIndex !== undefined) {
                     cell.dataset.measureIndex = data.measureIndex;
-                    cell.style.cursor = "pointer";
+                    classes.push("mapCell--clickable");
                     if (data.band !== undefined) cell.dataset.mapBand = data.band;
                 }
             }
+
+            cell.className = classes.join(" ");
 
             gridDiv.appendChild(cell);
         }
@@ -3035,25 +3241,9 @@ function drawOverlayGhost(context, stave, notesArray, overlayGhost, color) {
     }
 }
 
-function renderScore() {
-    const scrollY = window.scrollY;
-    notePositions = [];
-    measureNoteAreaRanges = [];
-
-    const scoreElement = document.getElementById("score");
-    scoreElement.innerHTML = "";
-
-    const measuresPerRow = getMeasuresPerRow();
-
-    const rows = [];
-    for (let i = 0; i < score.measures.length; i += measuresPerRow) {
-        rows.push(score.measures.slice(i, i + measuresPerRow).map((m, j) => ({
-            measure: m,
-            measureIndex: i + j
-        })));
-    }
-
-    rows.forEach((rowMeasures, rowIndex) => {
+// 1行分（複数小節）をVexFlowで構築し、rowDiv（未アペンド）を返す。
+// renderScore()（全体再描画）とupdateHoverRows()（該当行だけの軽量再描画）の両方から呼ばれる共通ロジック
+function buildRow(rowMeasures, rowIndex) {
         const isFirstRow = rowIndex === 0;
 
         const firstMeasureExtra = isFirstRow ? FIRST_MEASURE_EXTRA : 0;
@@ -3062,7 +3252,6 @@ function renderScore() {
         const rowDiv = document.createElement("div");
         rowDiv.style.position = "relative";
         rowDiv.dataset.rowIndex = rowIndex;
-        scoreElement.appendChild(rowDiv);
 
         const renderer = new VF.Renderer(rowDiv, VF.Renderer.Backends.SVG);
         const rowBottom = score.grandStaff ? STAVE_TOP_LOWER + 150 : STAVE_TOP_BASE + 150;
@@ -3295,6 +3484,31 @@ function renderScore() {
                 stableNotePositions.set(`${measureIndex}:lower`, notePositions.filter(p => p.measureIndex === measureIndex && p.staff === "lower"));
             }
         });
+
+    return rowDiv;
+}
+
+function renderScore() {
+    const scrollY = window.scrollY;
+    notePositions = [];
+    measureNoteAreaRanges = [];
+
+    const scoreElement = document.getElementById("score");
+    scoreElement.innerHTML = "";
+
+    const measuresPerRow = getMeasuresPerRow();
+
+    const rows = [];
+    for (let i = 0; i < score.measures.length; i += measuresPerRow) {
+        rows.push(score.measures.slice(i, i + measuresPerRow).map((m, j) => ({
+            measure: m,
+            measureIndex: i + j
+        })));
+    }
+
+    rows.forEach((rowMeasures, rowIndex) => {
+        const rowDiv = buildRow(rowMeasures, rowIndex);
+        scoreElement.appendChild(rowDiv);
     });
 
     updateCountsBar();
@@ -3946,6 +4160,8 @@ function handleNoteEdit(e, svg, rowDiv) {
                         saveHistory();
                         renderScore();
                         if (activeTab === "both") renderMap();
+                        // 音を設置した瞬間に、その音を鳴らして確認できるようにする
+                        playNote(pitch, getAudioContext().currentTime, 0.3);
                     }
                 }
             } else {
@@ -3974,6 +4190,10 @@ function handleNoteEdit(e, svg, rowDiv) {
                 saveHistory();
                 renderScore();
                 if (activeTab === "both") renderMap();
+                // 音を設置した瞬間に、その音を鳴らして確認できるようにする（休符の場合は鳴らさない）
+                if (centerEntry.pitches) {
+                    playNote(centerEntry.pitches[0], getAudioContext().currentTime, 0.3);
+                }
             }
         }
 
@@ -4004,61 +4224,99 @@ function handleNoteEdit(e, svg, rowDiv) {
     }
 }
 
+// 1つのsvg（1行分）に対するイベント配線。setupSVGEvents()（全行に配線）と、
+// updateHoverRows()（差し替えた行だけに配線し直す軽量パス）の両方から呼ばれる
+function setupSVGEventsForRow(svg, rowDiv) {
+    svg.setAttribute("pointer-events", "all");
+    // カーソルはデフォルトのまま（変更しない）
+
+    svg.addEventListener("contextmenu", e => e.preventDefault());
+
+    svg.addEventListener("mousemove", e => {
+        // ドラッグ中はホバー処理をスキップ（座標更新はdocument mousemoveで行う）
+        if (dragState && dragState.isDragging) return;
+        if (dragState) return;
+
+        const rect = svg.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top + rowDiv.offsetTop;
+
+        const measureIndex = getMeasureIndexFromXY(mouseX, mouseY);
+
+        if (measureIndex < 0 || measureIndex >= score.measures.length) {
+            if (hoveredPos !== null) {
+                updateHoverRows(hoveredPos, null);
+                hoveredPos = null;
+            }
+            return;
+        }
+
+        const pitch = yToPitch(e.clientY - rect.top, false);
+        const staff = staffForClick(e.clientY - rect.top);
+        const hitNote = findNoteAt(measureIndex, mouseX, mouseY);
+        const hitNoteX = findNoteAtX(measureIndex, mouseX);
+
+        const newHovered = pitch
+            ? { measureIndex, x: mouseX, y: mouseY, pitch, staff, hitNoteIndex: hitNote ? hitNote.noteIndex : (hitNoteX ? hitNoteX.noteIndex : null), directHit: !!hitNote }
+            : null;
+
+        const changed = JSON.stringify(newHovered) !== JSON.stringify(hoveredPos);
+        if (changed) {
+            updateHoverRows(hoveredPos, newHovered);
+            hoveredPos = newHovered;
+        }
+    });
+
+    svg.addEventListener("mouseleave", () => {
+        if (dragState) return;
+        if (hoveredPos !== null) {
+            updateHoverRows(hoveredPos, null);
+            hoveredPos = null;
+        }
+    });
+}
+
 function setupSVGEvents() {
     const scoreElement = document.getElementById("score");
     const svgs = scoreElement.querySelectorAll("svg");
-    const wrapper = document.getElementById("scoreWrapper");
 
-    svgs.forEach((svg, rowIndex) => {
+    svgs.forEach(svg => {
         const rowDiv = svg.parentElement;
+        setupSVGEventsForRow(svg, rowDiv);
+    });
+}
 
-        svg.setAttribute("pointer-events", "all");
-        // カーソルはデフォルトのまま（変更しない）
+// hoveredPosが変わった時、影響を受ける行（変化前後のmeasureIndexが属する行、最大2行）だけを
+// buildRow()で作り直し、他の行はそのままにする（renderScore()の全体再描画を避けるための軽量パス）
+function rowIndexForMeasure(measureIndex) {
+    return Math.floor(measureIndex / getMeasuresPerRow());
+}
 
-        svg.addEventListener("contextmenu", e => e.preventDefault());
+function updateHoverRows(prevHoveredPos, newHoveredPos) {
+    const scoreElement = document.getElementById("score");
+    const measuresPerRow = getMeasuresPerRow();
+    const affectedRows = new Set();
+    if (prevHoveredPos) affectedRows.add(rowIndexForMeasure(prevHoveredPos.measureIndex));
+    if (newHoveredPos) affectedRows.add(rowIndexForMeasure(newHoveredPos.measureIndex));
 
-        svg.addEventListener("mousemove", e => {
-            // ドラッグ中はホバー処理をスキップ（座標更新はdocument mousemoveで行う）
-            if (dragState && dragState.isDragging) return;
-            if (dragState) return;
+    affectedRows.forEach(rowIndex => {
+        const oldRowDiv = scoreElement.children[rowIndex];
+        if (!oldRowDiv) return;
 
-            const rect = svg.getBoundingClientRect();
-            const mouseX = e.clientX - rect.left;
-            const mouseY = e.clientY - rect.top + rowDiv.offsetTop;
+        const startMeasureIndex = rowIndex * measuresPerRow;
+        const rowMeasures = score.measures
+            .slice(startMeasureIndex, startMeasureIndex + measuresPerRow)
+            .map((m, j) => ({ measure: m, measureIndex: startMeasureIndex + j }));
+        if (rowMeasures.length === 0) return;
 
-            const measureIndex = getMeasureIndexFromXY(mouseX, mouseY);
+        const endMeasureIndex = startMeasureIndex + rowMeasures.length - 1;
+        notePositions = notePositions.filter(p => p.measureIndex < startMeasureIndex || p.measureIndex > endMeasureIndex);
 
-            if (measureIndex < 0 || measureIndex >= score.measures.length) {
-                if (hoveredPos !== null) {
-                    hoveredPos = null;
-                    renderScore();
-                }
-                return;
-            }
+        const newRowDiv = buildRow(rowMeasures, rowIndex);
+        scoreElement.replaceChild(newRowDiv, oldRowDiv);
 
-            const pitch = yToPitch(e.clientY - rect.top, false);
-            const staff = staffForClick(e.clientY - rect.top);
-            const hitNote = findNoteAt(measureIndex, mouseX, mouseY);
-            const hitNoteX = findNoteAtX(measureIndex, mouseX);
-
-            const newHovered = pitch
-                ? { measureIndex, x: mouseX, y: mouseY, pitch, staff, hitNoteIndex: hitNote ? hitNote.noteIndex : (hitNoteX ? hitNoteX.noteIndex : null), directHit: !!hitNote }
-                : null;
-
-            const changed = JSON.stringify(newHovered) !== JSON.stringify(hoveredPos);
-            if (changed) {
-                hoveredPos = newHovered;
-                renderScore();
-            }
-        });
-
-        svg.addEventListener("mouseleave", () => {
-            if (dragState) return;
-            if (hoveredPos !== null) {
-                hoveredPos = null;
-                renderScore();
-            }
-        });
+        const svg = newRowDiv.querySelector("svg");
+        if (svg) setupSVGEventsForRow(svg, newRowDiv);
     });
 }
 
@@ -5054,6 +5312,8 @@ async function main() {
     setupDrawer();
     setupHelpPopover();
     setupMapCornerOverlayScrollSync();
+    setupAbLoopStrip();
+    updateAbLoopStripGeometry();
 
     // モード切替ボタンの初期状態を反映
     updateEditModeButtons();
@@ -5198,6 +5458,7 @@ async function main() {
         renderScore();
         setupDeleteButtons();
         setupInsertButtons();
+        updateAbLoopStripGeometry();
     });
 
     document.getElementById("addMeasureBtn")
@@ -5391,11 +5652,18 @@ async function main() {
         isSeekDragging = true;
     });
     seekBar.addEventListener("input", (e) => {
-        const ratio = parseFloat(e.target.value);
-        document.getElementById("seekTimeCurrent").textContent =
-            formatPlaybackTime(ratio * getPlaybackRangeDuration());
-        updateSliderFill(e.target);
+        let ratio = parseFloat(e.target.value);
         const previewMeasureIndex = getMeasureIndexForRatio(ratio);
+        // A-B区間ループ中は、getMeasureIndexForRatio()が区間内にクランプした結果を
+        // つまみ自体の値にも反映し直し、区間の外へドラッグしても見た目上つまみが
+        // 区間の境界より外へ出ないようにする（表示中の秒数ともズレないように揃える）
+        if (abLoopRange && previewMeasureIndex !== null) {
+            ratio = previewMeasureIndex / score.measures.length;
+            e.target.value = ratio;
+        }
+        document.getElementById("seekTimeCurrent").textContent =
+            formatPlaybackTime(ratio * getFullSongDuration());
+        updateSliderFill(e.target);
         if (previewMeasureIndex !== null) previewSeekHighlight(previewMeasureIndex);
     });
     seekBar.addEventListener("change", (e) => {

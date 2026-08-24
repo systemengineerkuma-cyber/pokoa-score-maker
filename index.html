@@ -81,10 +81,11 @@
             color: var(--text);
             min-height: 100vh;
             user-select: none;
-            /* 画面下部固定の#playbackBar(シークバー行上部余白8px+20px+操作行40px+上境界1px=69px)と
-               #statusBar(高さ26px+上境界1px=27px)、合わせて96pxぶんにコンテンツ末尾が
-               隠れないよう、その分だけ下に余白を確保する */
-            padding-bottom: 96px;
+            /* 画面下部固定の#playbackBar(シークバー行28px+A-B区間帯行26px+操作行40px+上境界1px=95px)と
+               #statusBar(全体でborder-top込み26px。* {box-sizing:border-box}のため、境界線は
+               heightに食い込む形で含まれる＝26px+1pxではなく26pxそのもの)、合わせて121pxぶんに
+               コンテンツ末尾が隠れないよう、その分だけ下に余白を確保する */
+            padding-bottom: 121px;
         }
 
         /* Spotifyのようなミニプレイヤー風の再生バー。#statusBarのすぐ上に固定する。
@@ -94,7 +95,7 @@
             position: fixed;
             left: 0;
             right: 0;
-            bottom: 27px;
+            bottom: 26px;
             display: flex;
             flex-direction: column;
             background: var(--surface);
@@ -337,12 +338,14 @@
 
         /* 左からスライドしてくるドロワーメニュー。ヘッダーは常に全幅の土台として
            固定し、ドロワーはヘッダーの高さぶん(30px)下から始めることで、
-           ヘッダーには一切かぶらないようにする */
+           ヘッダーには一切かぶらないようにする。bottomの値は#playbackBar+#statusBarの
+           合計高さ（bodyのpadding-bottomと同じ121px、上のコメント参照）に揃えており、
+           両者を変える時はセットで直すこと */
         .drawer {
             position: fixed;
             top: 30px;
             left: 0;
-            bottom: 96px;
+            bottom: 121px;
             width: var(--drawer-width);
             max-width: 85vw;
             background: var(--surface);
@@ -736,6 +739,100 @@
             min-width: 0;
         }
 
+        /* A-B区間ループ用の帯。#seekBarRowと同じmax-width/margin/paddingにして、
+           このコンテナ自体の左右端は#seekBarRowと揃う。ただし#seekBarの実際の
+           トラック位置（左右の時刻表示スパンの分だけ内側に寄る）とはCSSのflexだけでは
+           厳密に一致させにくいため、#abLoopStrip自体のleft/widthはJS側
+           （updateAbLoopStripGeometry）で#seekBarの実測位置に合わせてpxで都度設定する。
+           A/Bラベルを帯の上に出す分、行の高さは#seekBarRowより少し高くしてある */
+        #abLoopStripRow {
+            position: relative;
+            width: 100%;
+            max-width: 640px;
+            margin: 0 auto;
+            padding: 0 16px;
+            height: 26px;
+        }
+
+        /* トラックの太さ（4px）は#seekBarのトラック（::-webkit-slider-runnable-track、
+           下記参照）と揃えている */
+        #abLoopStrip {
+            position: absolute;
+            top: 18px;
+            height: 4px;
+            border-radius: var(--radius-pill);
+            background: var(--border);
+            opacity: 0.6;
+            cursor: pointer;
+        }
+
+        #abLoopBand {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            left: 0;
+            border-radius: var(--radius-pill);
+            background: rgba(74, 108, 247, 0.3);
+            border: 1px solid rgba(74, 108, 247, 0.65);
+            box-sizing: border-box;
+            pointer-events: none;
+        }
+
+        /* A/Bであることを示すラベル。帯の左右端の真上に出す。
+           下のハンドル（丸、11px＋枠線）と縦に重ならないよう、handle上端より
+           上に十分な隙間を空けている（隙間が足りないと文字が丸にかぶって見える） */
+        #abLoopLabelA, #abLoopLabelB {
+            position: absolute;
+            top: -15px;
+            font-size: 9px;
+            font-weight: 700;
+            color: var(--accent);
+            line-height: 1;
+            pointer-events: none;
+        }
+        #abLoopLabelA { left: 0; }
+        #abLoopLabelB { left: 100%; transform: translateX(-100%); }
+
+        /* 開始/終了をつまんで動かすためのハンドル。トラック自体（4px）より大きめの
+           丸にして掴みやすくする。帯自体はpointer-events:noneだが、ハンドルだけ
+           autoに戻して個別にドラッグできるようにする */
+        #abLoopHandleA, #abLoopHandleB {
+            position: absolute;
+            top: 50%;
+            width: 11px;
+            height: 11px;
+            border-radius: 50%;
+            background: var(--accent);
+            border: 2px solid var(--surface);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+            cursor: ew-resize;
+            pointer-events: auto;
+            z-index: 2;
+        }
+        #abLoopHandleA { left: 0; transform: translate(-50%, -50%); }
+        #abLoopHandleB { left: 100%; transform: translate(-50%, -50%); }
+
+        #abLoopClearBtn {
+            position: absolute;
+            right: 16px;
+            top: 12px;
+            width: 16px;
+            height: 16px;
+            border: none;
+            background: none;
+            color: var(--text-faint);
+            cursor: pointer;
+            font-size: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+        }
+
+        #abLoopClearBtn:hover {
+            color: var(--text);
+        }
+
         #zoomSlider::-webkit-slider-runnable-track,
         #volumeSlider::-webkit-slider-runnable-track,
         #seekBar::-webkit-slider-runnable-track {
@@ -743,6 +840,17 @@
             border-radius: var(--radius-pill);
             background: linear-gradient(to right,
                 var(--text) 0%, var(--text) var(--fill, 50%),
+                var(--border) var(--fill, 50%), var(--border) 100%);
+        }
+
+        /* A-Bループ中は、再生済みを示す黒いバー（var(--text)の部分）がA-B区間の外に
+           はみ出さないよう、--fill-start（Aの位置、通常は0%）より左は常にvar(--border)
+           （未再生と同じ色）にする。A-Bが無効な間は--fill-startが0%なので、
+           上の共通ルールと見た目上まったく同じ（border 0%〜0%の区間は幅0で実害なし） */
+        #seekBar::-webkit-slider-runnable-track {
+            background: linear-gradient(to right,
+                var(--border) 0%, var(--border) var(--fill-start, 0%),
+                var(--text) var(--fill-start, 0%), var(--text) var(--fill, 50%),
                 var(--border) var(--fill, 50%), var(--border) 100%);
         }
 
@@ -800,6 +908,14 @@
             height: 4px;
             border-radius: var(--radius-pill);
             background: var(--text);
+        }
+
+        /* Firefoxのネイティブprogress表示は常に0%起点で塗られるため、A-Bループ中は
+           --fill-start（Aの位置）より左をclip-pathで切り取り、下に重なっている
+           ::-moz-range-track（var(--border)色）をそのまま透けて見せることで、
+           webkit版の3色グラデーションと同じ見た目にする */
+        #seekBar::-moz-range-progress {
+            clip-path: inset(0 0 0 var(--fill-start, 0%));
         }
 
         #zoomSlider::-moz-range-thumb,
@@ -1039,6 +1155,72 @@
             min-width: 100%;
             padding: 8px;
             box-shadow: var(--shadow-sm);
+        }
+
+        /* マップのマス目（renderMap()が1マスにつき1つ生成する）。
+           以前は1マスごとにborder等をまとめた大きなcssTextを都度組み立てて
+           style.cssText へ代入していたが、マス数が多い（曲が長い/折り返し値が
+           大きい）と、その文字列生成＋CSSパースのコストが無視できないほど積み
+           上がっていた（40小節・既定設定で約5500マス）。静的な部分（サイズ・既定の
+           罫線・背景・レイアウト）はここでクラスとして持たせ、JS側は
+           className の組み立て（数個のクラス名を選ぶだけ）とビート番号ごとに
+           変わるフォントサイズ・コンパス方向の回転角など、本当に1マスごとに
+           違う値だけをinline styleで扱うようにする。マスのサイズ自体はscale依存
+           のため、#mapGridに設定するCSS変数--cell-sizeで受け渡す */
+        .mapCell {
+            width: var(--cell-size);
+            height: var(--cell-size);
+            background: #fff;
+            box-sizing: border-box;
+            border-right: 1px solid #e0e0e0;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        .mapCell--content {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #555;
+            overflow: hidden;
+        }
+        .mapCell--noRightBorder { border-right: none; }
+        .mapCell--noBottomBorder { border-bottom: none; }
+        .mapCell--showLeftBorder { border-left: 1px solid #e0e0e0; }
+        .mapCell--showTopBorder { border-top: 1px solid #e0e0e0; }
+        .mapCell--rail {
+            background: linear-gradient(135deg, #6b6b6b, #4a4a4a);
+            box-shadow: inset 0 1px 1px rgba(255,255,255,0.15), inset 0 -1px 2px rgba(0,0,0,0.2);
+        }
+        .mapCell--sensor {
+            background: linear-gradient(135deg, #ea6b6b, #d03f3f);
+            box-shadow: inset 0 1px 1px rgba(255,255,255,0.15), inset 0 -1px 2px rgba(0,0,0,0.2);
+            color: #fff;
+        }
+        .mapCell--panel {
+            background: radial-gradient(circle, #fbfbfb, #e8e8e8);
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.12);
+        }
+        .mapCell--clickable {
+            cursor: pointer;
+        }
+
+        /* レール向きを示す線（renderMap()内、レールのマスにだけ追加）。
+           向き別に幅/高さが決まっているだけで値そのものは1マスごとに変わらないため、
+           2種類のクラスとして静的に持たせる（以前はここもcssTextを都度組み立てていた） */
+        .mapRailLine {
+            background: #999;
+            border-radius: 2px;
+            box-shadow: 0 1px 1px rgba(0,0,0,0.3);
+        }
+        .mapRailLine--vertical { width: 30%; height: 100%; }
+        .mapRailLine--horizontal { width: 100%; height: 30%; }
+
+        /* 音符マットの画像（renderMap()内、panelマスにだけ追加）。サイズはマスと同じ
+           --cell-sizeを使い、回転角（コンパス方向）だけ1つずつ違うのでinlineのまま残す */
+        .mapCellPanelImg {
+            width: var(--cell-size);
+            height: var(--cell-size);
+            object-fit: contain;
+            filter: drop-shadow(0 1px 1px rgba(0,0,0,0.25));
         }
 
         .map-resize-handle {
@@ -1695,6 +1877,17 @@
         <span id="seekTimeCurrent">0:00</span>
         <input type="range" id="seekBar" min="0" max="1" step="0.001" value="0" title="再生位置">
         <span id="seekTimeTotal">0:00</span>
+    </div>
+    <div id="abLoopStripRow">
+        <div id="abLoopStrip" title="ドラッグしてA-B区間ループを設定">
+            <div id="abLoopBand" style="display:none;">
+                <span id="abLoopLabelA">A</span>
+                <span id="abLoopLabelB">B</span>
+                <div id="abLoopHandleA" title="開始位置（A）をドラッグして調整"></div>
+                <div id="abLoopHandleB" title="終了位置（B）をドラッグして調整"></div>
+            </div>
+        </div>
+        <button id="abLoopClearBtn" tabindex="-1" title="区間ループを解除" style="display:none;"><i class="fa-solid fa-xmark"></i></button>
     </div>
     <div id="playbackControlsRow">
     <div id="playbackBarCenter">
