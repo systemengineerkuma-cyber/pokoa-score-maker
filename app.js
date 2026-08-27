@@ -320,6 +320,40 @@ function loadSeBuffers() {
     });
 }
 
+// マップの音符マット画像（img/*.jpg）のプリロードキャッシュ。canvasのdrawImage()は
+// 読み込み済みのHTMLImageElementでないと描けない（<img src=...>と違い、ブラウザの
+// 非同期パイプラインに任せて後から自然に表示される、ということが無い）ため、
+// loadSeBuffers()と同様アプリ起動時に先読みしておく
+const MAP_PANEL_IMAGES = {};
+let mapPanelImagesLoadStarted = false;
+
+function loadMapPanelImages() {
+    if (mapPanelImagesLoadStarted) return;
+    mapPanelImagesLoadStarted = true;
+    Object.keys(PITCH_TO_FILE).forEach(pitch => {
+        const img = new Image();
+        img.onload = scheduleMapPanelRedraw;
+        img.src = `img/${PITCH_TO_FILE[pitch]}`;
+        MAP_PANEL_IMAGES[pitch] = img;
+    });
+}
+
+function getMapPanelImage(pitch) {
+    return MAP_PANEL_IMAGES[toCanonicalPitch(pitch)] || null;
+}
+
+// 起動直後、複数の画像がほぼ同時に読み込み完了することが多いため、1枚読み込むごとに
+// 都度キャンバス全体を再描画するのではなく、1フレームにまとめて1回だけ再描画する
+let mapImageRedrawScheduled = false;
+function scheduleMapPanelRedraw() {
+    if (mapImageRedrawScheduled) return;
+    mapImageRedrawScheduled = true;
+    requestAnimationFrame(() => {
+        mapImageRedrawScheduled = false;
+        if ((activeTab === "map" || activeTab === "both") && mapRenderState) drawMapCanvas(mapRenderState);
+    });
+}
+
 function playNote(pitch, startTime, duration) {
     const ctx = getAudioContext();
     const buffer = SE_BUFFERS[toCanonicalPitch(pitch)];
@@ -1038,9 +1072,14 @@ function drawMapPlayLine(beatIndex, t) {
     document.querySelectorAll(".mapPlayLine").forEach(el => el.remove());
     if (beatIndex == null) return;
 
-    const gridDiv = document.getElementById("mapGrid");
+    // #mapGridはcanvas化されており、その子としてDOMをappendしても描画されない
+    // （canvasの子ノードはフォールバックコンテンツ扱いで画面には出ない）ため、
+    // 選択ハイライト（drawMapSelectionOverlays）と同様に#mapAreaWrapperへ追加し、
+    // canvasの実際の画面位置ぶんを座標に加算する
+    const canvas = document.getElementById("mapGrid");
+    const wrapper = document.getElementById("mapAreaWrapper");
     const posA = mapBeatPositions[beatIndex];
-    if (!gridDiv || !posA) return;
+    if (!canvas || !wrapper || !posA) return;
     let posB = mapBeatPositions[beatIndex + 1] || posA;
 
     // 段の折り返し（wrapValueごとの改行）をまたぐ瞬間は、beatIndexとbeatIndex+1が
@@ -1056,8 +1095,18 @@ function drawMapPlayLine(beatIndex, t) {
         }
     }
 
-    const x = posA.x + (posB.x - posA.x) * t;
-    const y = posA.y + (posB.y - posA.y) * t;
+    // posA/posBはcanvasローカル座標（canvasの左上を原点とするpx）。#mapAreaWrapper基準の
+    // 座標に変換するため、canvasの実際の表示位置とwrapperのスクロール量を加算する
+    // （選択ハイライトのcreateMapOverlayEl()と同じ変換パターン）
+    const canvasRect = canvas.getBoundingClientRect();
+    const wrapperRect = wrapper.getBoundingClientRect();
+    const offsetX = canvasRect.left - wrapperRect.left + wrapper.scrollLeft;
+    const offsetY = canvasRect.top - wrapperRect.top + wrapper.scrollTop;
+
+    const localX = posA.x + (posB.x - posA.x) * t;
+    const localY = posA.y + (posB.y - posA.y) * t;
+    const x = localX + offsetX;
+    const y = localY + offsetY;
 
     const w = mapRailIsVertical ? mapRailCellSize * 0.4 : mapRailCellSize * 0.9;
     const h = mapRailIsVertical ? mapRailCellSize * 0.9 : mapRailCellSize * 0.4;
@@ -1075,7 +1124,7 @@ function drawMapPlayLine(beatIndex, t) {
         pointer-events: none;
         z-index: 8;
     `;
-    gridDiv.appendChild(line);
+    wrapper.appendChild(line);
 }
 
 function drawPlayLine(x, rowIndex) {
@@ -2234,10 +2283,15 @@ function repositionMapResizeHandle(gridDiv) {
     corner.style.top = `${gBottom - corner.offsetHeight}px`;
 }
 
+// renderMap()が呼ばれるたびに1回だけ再構築し、以降のポインタイベント（クリック/ドラッグ）は
+// これを読むだけにする（buildMapGrid()をmousemoveのたびに呼び直すのは無駄なため、
+// 「レンダリング時に1回」という従来の頻度を保つ）。
+// 空スコア等でマップが無い時はnull。
+let mapRenderState = null;
+
 function renderMap() {
     const mapArea = document.getElementById("mapArea");
     if (!mapArea) return;
-    mapArea.innerHTML = "";
 
     const cellSize = Math.round(42 * scale * 0.5);
     mapRailCellSize = cellSize;
@@ -2251,6 +2305,11 @@ function renderMap() {
             if (handle) handle.style.display = "none";
         });
         mapBeatPositions = [];
+        mapRenderState = null;
+        // 以前はgridDiv（canvas化前は#mapGrid自身）ごと消えていたので暗黙に片付いていたが、
+        // 選択ハイライト/再生マーカーは今は#mapAreaWrapperの子として存在するため、
+        // ここで明示的に消さないと空スコアに切り替えても残骸が浮いたままになる
+        document.querySelectorAll(".mapSelectionOverlay, .mapPlayLine").forEach(el => el.remove());
         updateCountsBar();
         return;
     }
@@ -2289,134 +2348,33 @@ function renderMap() {
     // 表示する層（中間層/上位層/下位層）に応じたzを選ぶ
     const z = MAP_LAYER_Z[mapSettings.activeLayer] ?? 0;
 
-    // グリッド線はcontainerのgapではなく、セル1つ1つが右端・下端の罫線を自分で持つ方式にする
-    // （段の区切りマスだけ罫線を消して背景になじませたいが、gap方式だと特定セルだけ線を
-    // 消すことができない＝ネガティブマージンで隙間を塗りつぶす方式を試したところ見た目が
-    // ボコついてしまったため、この罫線持ち回し方式に変更した）
-    const gridDiv = document.createElement("div");
-    gridDiv.id = "mapGrid";
-    gridDiv.style.cssText = `
-        position: relative;
-        display: grid;
-        grid-template-columns: repeat(${gridW}, ${cellSize}px);
-        grid-template-rows: repeat(${gridH}, ${cellSize}px);
-        background: #fff;
-        width: fit-content;
-        --cell-size: ${cellSize}px;
-    `;
-
-    // 折り返し軸方向の座標が区切りマスかどうか
-    const isSepCoord = (c) => separatorCoords.has(c);
-
-    for (let gy = 0; gy < gridH; gy++) {
-        for (let gx = 0; gx < gridW; gx++) {
-            const ax = gx + minX;
-            const ay = gy + minY;
-            const key = `${ax},${ay},${z}`;
-            const data = grid.get(key);
-
-            const ownWrapCoord = isVertical ? ax : ay;
-            const isSeparator = isSepCoord(ownWrapCoord);
-            // 区切りマスは、折り返し軸と同じ向きの罫線（内部を細切れに見せてしまう側）だけを消す。
-            // 折り返し軸と垂直な向きの罫線（区切りの手前・奥どちらの境界か）は区切りかどうかに
-            // 関わらず常に描く。これにより区切り自体は内部の線が無い1本の帯として見えつつ、
-            // 前後どちらの本物のコンテンツ行/列との境界線も消えずに残る
-            const skipRightBorder = isVertical ? false : isSeparator;
-            const skipBottomBorder = isVertical ? isSeparator : false;
-            // グリッド全体の外枠（左端・上端）はコンテナのborderではなく先頭行/列のセルが
-            // 自分で持つ。区切りマス（帯）の先頭行/列では、内部の継ぎ目と同じ理由でこの外枠線も
-            // 消す（そうしないと帯の左端・上端だけ短い線が飛び出て見えてしまう）
-            const skipLeftBorder = isVertical ? false : isSeparator;
-            const skipTopBorder = isVertical ? isSeparator : false;
-            const showLeftBorder = gx === 0 && !skipLeftBorder;
-            const showTopBorder = gy === 0 && !skipTopBorder;
-
-            const cell = document.createElement("div");
-            // 見た目の余白のためだけに追加した1マス分のマージン（どの小節にも属さない）、および
-            // 最後の段の理論上の最大フットプリントのうち実際にはビートが存在しない末尾部分
-            // （deadZoneCoords）は、どちらもクリック/ドラッグの判定から除外する
-            // （getMapMeasureIndexAtPoint参照）
-            if (ax < extMinX || ax > extMaxX || ay < extMinY || ay > extMaxY || deadZoneCoords.has(`${ax},${ay}`)) {
-                cell.dataset.outsideExtent = "1";
-            }
-            // 静的な部分（サイズ・既定の罫線・背景・レイアウト）は.mapCell系のCSSクラスに
-            // 任せ、ここでは「このマスにどのクラスが当てはまるか」を選ぶだけにする
-            // （以前はマスごとに大きなcssText文字列を組み立てて代入しており、マス数が
-            // 多いとその文字列生成＋CSSパースのコストが無視できなかった）
-            const classes = ["mapCell"];
-            if (!isSeparator) classes.push("mapCell--content");
-            if (skipRightBorder) classes.push("mapCell--noRightBorder");
-            if (skipBottomBorder) classes.push("mapCell--noBottomBorder");
-            if (showLeftBorder) classes.push("mapCell--showLeftBorder");
-            if (showTopBorder) classes.push("mapCell--showTopBorder");
-
-            if (!isSeparator && data) {
-                if (data.type === "rail") {
-                    classes.push("mapCell--rail");
-                    // 向きに応じた線を描画（将来画像に置き換え予定）
-                    const line = document.createElement("div");
-                    const isVert = data.direction === "vertical";
-                    line.className = `mapRailLine ${isVert ? "mapRailLine--vertical" : "mapRailLine--horizontal"}`;
-                    // data-direction属性で向きを保持（将来の画像置換用）
-                    cell.dataset.direction = data.direction;
-                    cell.dataset.cellType = "rail";
-                    cell.dataset.railStep = data.railStep;
-                    cell.appendChild(line);
-                } else if (data.type === "sensor") {
-                    classes.push("mapCell--sensor");
-                    // data-direction属性で向きを保持（将来の画像置換用）
-                    cell.dataset.direction = data.direction;
-                    cell.dataset.cellType = "sensor";
-                    // センサーのレーザー方向（レールに対して直角）
-                    const isVert = data.direction === "vertical";
-                    cell.dataset.laserDirection = isVert ? "horizontal" : "vertical";
-                    cell.textContent = data.beatNum;
-                    // 桁数が増えるほど1文字あたりの幅が必要になり、マス幅に対して
-                    // 文字がはみ出して見切れてしまう（実測: 3桁だとcellSize*0.5程度が限界）。
-                    // 桁数に応じて比率を下げることで、マスサイズに関わらず見切れないようにしつつ、
-                    // できるだけ大きい文字サイズにする（マスごとに桁数が違いうるため、これだけは
-                    // クラス化できず引き続きinline styleで扱う）
-                    const digits = String(data.beatNum).length;
-                    const fontRatio = digits <= 2 ? 0.5 : 0.4 * 3 / digits;
-                    cell.style.fontSize = `${cellSize * fontRatio}px`;
-                } else if (data.type === "panel") {
-                    const file = PITCH_TO_FILE[toCanonicalPitch(data.pitch)];
-                    if (file) {
-                        classes.push("mapCell--panel");
-                        const img = document.createElement("img");
-                        img.src = `img/${file}`;
-                        img.alt = data.pitch;
-                        img.className = "mapCellPanelImg";
-                        // コンパス方向を反映（将来の画像置換用、マスごとに角度が違いうるので
-                        // これだけは引き続きinline styleで扱う）
-                        img.style.transform = `rotate(${northDirection * 90}deg)`;
-                        img.dataset.cellType = "panel";
-                        img.dataset.pitch = data.pitch;
-                        cell.appendChild(img);
-                    }
-                }
-
-                // クリック/ドラッグでそのマスが属する小節を選択できるようにする
-                // （五線譜タブの選択と相互連携、実際のドラッグ処理はsetupMapAreaDrag()側）
-                if (data.measureIndex !== undefined) {
-                    cell.dataset.measureIndex = data.measureIndex;
-                    classes.push("mapCell--clickable");
-                    if (data.band !== undefined) cell.dataset.mapBand = data.band;
-                }
-            }
-
-            cell.className = classes.join(" ");
-
-            gridDiv.appendChild(cell);
-        }
+    // マス数ぶんのDOM要素を毎回作り直す代わりに、1枚のcanvasにピクセルとして描く
+    // （長い曲ではマス数が数万に達し、DOM生成コストがタブ切り替え等のもたつきの
+    // 主因になっていたため）。canvas要素自体は使い回し、破棄/再生成しない
+    let canvas = document.getElementById("mapGrid");
+    if (!canvas || canvas.tagName !== "CANVAS") {
+        mapArea.innerHTML = "";
+        canvas = document.createElement("canvas");
+        canvas.id = "mapGrid";
+        mapArea.appendChild(canvas);
     }
+    setupCanvasForDPI(canvas, gridW * cellSize, gridH * cellSize);
 
-    mapArea.appendChild(gridDiv);
+    // クリック/ドラッグでのヒットテスト用データを、描画そのものより先に用意しておく
+    // （画像の遅延読み込み等で描画が後から差し替わっても、クリック判定は常に最新の
+    // ジオメトリを参照できるようにするため）
+    mapRenderState = buildMapRenderState({
+        canvas, grid, z, isVertical, cellSize, minX, minY, gridW, gridH,
+        extMinX, extMaxX, extMinY, extMaxY, deadZoneCoords, separatorCoords
+    });
+
+    drawMapCanvas(mapRenderState);
+
     ["mapResizeHandleRight", "mapResizeHandleBottom", "mapResizeHandleCorner"].forEach((id) => {
         const handle = document.getElementById(id);
         if (handle) handle.style.display = "";
     });
-    repositionMapResizeHandle(gridDiv);
+    repositionMapResizeHandle(canvas);
     drawMapSelectionOverlays();
     updateCountsBar();
 
@@ -2424,6 +2382,232 @@ function renderMap() {
     if (playState !== "stopped" && currentHighlightBeatIndex !== null) {
         drawMapPlayLine(currentHighlightBeatIndex, currentHighlightBeatT);
     }
+}
+
+// canvasのCSS表示サイズ(cssW/cssH)と、実ピクセル数（devicePixelRatio倍）を分離して設定する。
+// 高DPI環境で描画がぼやけないようにするための標準的な手法（このアプリでは初めての導入 —
+// 従来はVexFlow(SVG)ベースで解像度非依存だったため、DPI対応は今回が初）
+function setupCanvasForDPI(canvas, cssW, cssH) {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.style.width = `${cssW}px`;
+    canvas.style.height = `${cssH}px`;
+    canvas.width = Math.max(1, Math.round(cssW * dpr));
+    canvas.height = Math.max(1, Math.round(cssH * dpr));
+    canvas._mapDPR = dpr;
+}
+
+// renderMap()のたびに1回構築され、以降のヒットテスト（findNearestMapCell等）・
+// 選択ハイライト（drawMapSelectionOverlays）から参照される。
+// clickableByCoordはmeasureIndexを持つ全セル（rail/sensor/panelいずれも）を
+// "x,y" -> measureIndexで引けるようにしたもの（直撃判定をO(1)にする）。
+// railOnlyはrailセルだけを抜き出した配列（クリック位置が直撃しなかった時の
+// 最近傍探索=mapCellWeightedDistance用、railセルのみが対象なのは元のDOM版と同じ）
+function buildMapRenderState({ canvas, grid, z, isVertical, cellSize, minX, minY, gridW, gridH,
+                                extMinX, extMaxX, extMinY, extMaxY, deadZoneCoords, separatorCoords }) {
+    const clickableByCoord = new Map();
+    const railOnly = [];
+    for (const [key, data] of grid) {
+        if (data.measureIndex === undefined) continue;
+        const parts = key.split(",");
+        if (Number(parts[2]) !== z) continue; // 現在表示中の層のセルだけが対象（従来もDOMは現在層のぶんしか作られていなかった）
+        const x = Number(parts[0]), y = Number(parts[1]);
+        clickableByCoord.set(`${x},${y}`, data.measureIndex);
+        if (data.type === "rail") railOnly.push({ measureIndex: data.measureIndex, band: data.band, x, y });
+    }
+    return { canvas, grid, z, isVertical, cellSize, minX, minY, gridW, gridH,
+             extMinX, extMaxX, extMinY, extMaxY, deadZoneCoords, separatorCoords,
+             clickableByCoord, railOnly };
+}
+
+// canvasのグリッド全体をピクセルとして描き直す（renderMap()と、パネル画像の遅延読み込み
+// 完了時から呼ばれる）。1マスずつdrawMapCell()に委譲する
+function drawMapCanvas(state) {
+    const { canvas, grid, z, isVertical, cellSize, minX, minY, gridW, gridH, separatorCoords } = state;
+    const ctx = canvas.getContext("2d");
+    const dpr = canvas._mapDPR || 1;
+    const cssW = gridW * cellSize, cssH = gridH * cellSize;
+
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, cssW, cssH);
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, cssW, cssH);
+
+    const isSepCoord = (c) => separatorCoords.has(c);
+
+    // 罫線は1マスごとにstroke()を呼ぶと（マス数が多い時に）呼び出し回数自体がボトルネックに
+    // なるため、全マス分の線分を1つのPath2Dにまとめておき、最後に1回だけstroke()する
+    const borderPath = new Path2D();
+
+    for (let gy = 0; gy < gridH; gy++) {
+        for (let gx = 0; gx < gridW; gx++) {
+            const ax = gx + minX;
+            const ay = gy + minY;
+            const data = grid.get(`${ax},${ay},${z}`);
+            const ownWrapCoord = isVertical ? ax : ay;
+            const isSeparator = isSepCoord(ownWrapCoord);
+            drawMapCell(ctx, borderPath, { px: gx * cellSize, py: gy * cellSize, cellSize, gx, gy, isSeparator, isVertical, data });
+        }
+    }
+
+    ctx.strokeStyle = "#e0e0e0";
+    ctx.lineWidth = 1;
+    ctx.stroke(borderPath);
+
+    ctx.restore();
+}
+
+// 1マス分の描画。区切りマスの罫線スキップロジックは元のDOM版（renderMap()旧実装）と
+// 一字一句同じ条件式を保っている。罫線はctx.stroke()を都度呼ばず、呼び出し元が持つ
+// 1本のPath2Dに線分を足しこむだけにする（drawMapCanvas()参照）
+function drawMapCell(ctx, borderPath, { px, py, cellSize, gx, gy, isSeparator, isVertical, data }) {
+    // --- 背景 ---
+    if (!isSeparator && data && data.type === "rail") {
+        drawMapGradientRect(ctx, px, py, cellSize, "rail");
+    } else if (!isSeparator && data && data.type === "sensor") {
+        drawMapGradientRect(ctx, px, py, cellSize, "sensor");
+    } else if (!isSeparator && data && data.type === "panel" && PITCH_TO_FILE[toCanonicalPitch(data.pitch)]) {
+        drawMapGradientRect(ctx, px, py, cellSize, "panel");
+    } else {
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(px, py, cellSize, cellSize);
+    }
+
+    // --- 罫線（元のskip*/show*ロジックをそのまま踏襲） ---
+    const skipRightBorder = isVertical ? false : isSeparator;
+    const skipBottomBorder = isVertical ? isSeparator : false;
+    const skipLeftBorder = isVertical ? false : isSeparator;
+    const skipTopBorder = isVertical ? isSeparator : false;
+    const showLeftBorder = gx === 0 && !skipLeftBorder;
+    const showTopBorder = gy === 0 && !skipTopBorder;
+
+    if (!skipRightBorder) addMapBorderLine(borderPath, px + cellSize, py, px + cellSize, py + cellSize);
+    if (!skipBottomBorder) addMapBorderLine(borderPath, px, py + cellSize, px + cellSize, py + cellSize);
+    if (showLeftBorder) addMapBorderLine(borderPath, px, py, px, py + cellSize);
+    if (showTopBorder) addMapBorderLine(borderPath, px, py, px + cellSize, py);
+
+    // --- 種別ごとの中身 ---
+    if (!isSeparator && data) {
+        if (data.type === "rail") {
+            drawMapRailLine(ctx, px, py, cellSize, data.direction);
+        } else if (data.type === "sensor") {
+            drawMapSensorText(ctx, px, py, cellSize, data.beatNum);
+        } else if (data.type === "panel") {
+            drawMapPanelImage(ctx, px, py, cellSize, data.pitch);
+        }
+    }
+}
+
+// canvasの1pxストロークは整数座標だと2デバイスピクセルにまたがってにじむため、
+// 0.5だけずらして1本の線がくっきり乗るようにする。実際のstroke()はdrawMapCanvas()側で
+// 全マスぶんまとめて1回だけ呼ぶため、ここではpathに線分を足しこむだけ
+function addMapBorderLine(path, x1, y1, x2, y2) {
+    if (x1 === x2) {
+        const x = Math.round(x1) + 0.5;
+        path.moveTo(x, y1);
+        path.lineTo(x, y2);
+    } else {
+        const y = Math.round(y1) + 0.5;
+        path.moveTo(x1, y);
+        path.lineTo(x2, y);
+    }
+}
+
+// rail/sensor/panelの背景グラデーション（CSSの.mapCell--rail/--sensor/--panelと同じ配色）＋
+// inset box-shadowの近似（canvasにはinset shadowの直接的な相当機能が無いため、端に薄い
+// 明暗の帯を描いて立体感を模す。ぼかしの無い分だけCSS版とは厳密には一致しない）
+function drawMapGradientRect(ctx, px, py, size, kind) {
+    let grad;
+    if (kind === "rail") {
+        grad = ctx.createLinearGradient(px, py, px + size, py + size);
+        grad.addColorStop(0, "#6b6b6b");
+        grad.addColorStop(1, "#4a4a4a");
+    } else if (kind === "sensor") {
+        grad = ctx.createLinearGradient(px, py, px + size, py + size);
+        grad.addColorStop(0, "#ea6b6b");
+        grad.addColorStop(1, "#d03f3f");
+    } else {
+        grad = ctx.createRadialGradient(
+            px + size / 2, py + size / 2, 0,
+            px + size / 2, py + size / 2, size / 2 * Math.SQRT2
+        );
+        grad.addColorStop(0, "#fbfbfb");
+        grad.addColorStop(1, "#e8e8e8");
+    }
+    ctx.fillStyle = grad;
+    ctx.fillRect(px, py, size, size);
+
+    if (kind === "rail" || kind === "sensor") {
+        ctx.fillStyle = "rgba(255,255,255,0.15)";
+        ctx.fillRect(px, py, size, 1);
+        ctx.fillStyle = "rgba(0,0,0,0.2)";
+        ctx.fillRect(px, py + size - 2, size, 2);
+    } else {
+        ctx.fillStyle = "rgba(0,0,0,0.12)";
+        ctx.fillRect(px, py, size, 2);
+    }
+}
+
+// レールの向きを示す線（.mapRailLine相当）。角丸矩形＋軽いドロップシャドウ
+function drawMapRailLine(ctx, px, py, size, direction) {
+    const isVert = direction === "vertical";
+    const w = isVert ? size * 0.3 : size;
+    const h = isVert ? size : size * 0.3;
+    const x = px + (size - w) / 2;
+    const y = py + (size - h) / 2;
+    const r = Math.min(2, w / 2, h / 2);
+
+    ctx.save();
+    ctx.shadowColor = "rgba(0,0,0,0.3)";
+    ctx.shadowBlur = 1;
+    ctx.shadowOffsetY = 1;
+    ctx.fillStyle = "#999";
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+}
+
+// センサーの拍番号（.mapCell--sensorのcolor:#fffが.mapCell--contentのcolor:#555より
+// 後のCSS定義で勝っていたのと同じ色を使う）
+function drawMapSensorText(ctx, px, py, size, beatNum) {
+    const text = String(beatNum);
+    const digits = text.length;
+    const fontRatio = digits <= 2 ? 0.5 : 0.4 * 3 / digits;
+    const fontSize = size * fontRatio;
+
+    ctx.save();
+    ctx.fillStyle = "#fff";
+    ctx.font = `${fontSize}px 'Noto Sans JP', 'Meiryo', 'メイリオ', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, px + size / 2, py + size / 2);
+    ctx.restore();
+}
+
+// 音符マットの画像（プリロード済みキャッシュから取得、未読込ならこの回は何も描かない——
+// 読み込み完了時にscheduleMapPanelRedraw()が呼ばれて再描画される）
+function drawMapPanelImage(ctx, px, py, size, pitch) {
+    const file = PITCH_TO_FILE[toCanonicalPitch(pitch)];
+    if (!file) return;
+    const img = getMapPanelImage(pitch);
+    if (!img || !img.complete || img.naturalWidth === 0) return;
+
+    ctx.save();
+    ctx.translate(px + size / 2, py + size / 2);
+    ctx.rotate(northDirection * 90 * Math.PI / 180);
+    ctx.shadowColor = "rgba(0,0,0,0.25)";
+    ctx.shadowBlur = 1;
+    ctx.shadowOffsetY = 1;
+    // PITCH_TO_FILEの画像は全て100x100pxの正方形（実測確認済み）なので、
+    // object-fit:containと等価な単純な引き伸ばし描画でよい
+    ctx.drawImage(img, -size / 2, -size / 2, size, size);
+    ctx.restore();
 }
 
 // マップ上の選択ハイライト（.mapSelectionOverlay）を描き直す。renderMap()の全再構築を
@@ -2481,28 +2665,37 @@ function drawMapSelectionOverlays(previewSet, animate = false) {
     // 折り返し（改行）をまたぐ小節はレールが離れた場所に分かれるため、1つの四角にまとめると
     // 間の無関係な領域まで囲ってしまう。段（data-map-band）ごとにグループ分けし、
     // 段ごとに別々の四角を描くことで、それぞれのレール区間だけをタイトに囲む
+    // マップはcanvas化されており個別マスのDOM要素が存在しないため、対象小節のrailセルは
+    // renderMap()が構築したmapRenderState.railOnlyから拾い、そのグリッド座標×cellSizeから
+    // ビューポート座標のボックスを算出する（DOM要素のgetBoundingClientRect()を集計していた
+    // 従来のロジックと、算出結果は同じになるよう設計している）
     const targets = new Map(); // "measureIndex:band" -> {left,top,right,bottom}
-    effective.forEach(measureIndex => {
-        const cells = document.querySelectorAll(`#mapArea [data-measure-index="${measureIndex}"][data-cell-type="rail"]`);
-        if (!cells.length) return;
+    if (mapRenderState) {
+        const { railOnly, minX, minY, cellSize, canvas } = mapRenderState;
+        const canvasRect = canvas.getBoundingClientRect();
+        effective.forEach(measureIndex => {
+            const bands = new Map(); // band -> {left,top,right,bottom}
+            railOnly.forEach(c => {
+                if (c.measureIndex !== measureIndex) return;
+                const band = c.band ?? "";
+                const left = (c.x - minX) * cellSize + canvasRect.left;
+                const top = (c.y - minY) * cellSize + canvasRect.top;
+                const right = left + cellSize;
+                const bottom = top + cellSize;
+                let box = bands.get(band);
+                if (!box) {
+                    box = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity };
+                    bands.set(band, box);
+                }
+                box.left = Math.min(box.left, left);
+                box.top = Math.min(box.top, top);
+                box.right = Math.max(box.right, right);
+                box.bottom = Math.max(box.bottom, bottom);
+            });
 
-        const bands = new Map(); // band -> {left,top,right,bottom}
-        cells.forEach(cell => {
-            const band = cell.dataset.mapBand ?? "";
-            const r = cell.getBoundingClientRect();
-            let box = bands.get(band);
-            if (!box) {
-                box = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity };
-                bands.set(band, box);
-            }
-            box.left = Math.min(box.left, r.left);
-            box.top = Math.min(box.top, r.top);
-            box.right = Math.max(box.right, r.right);
-            box.bottom = Math.max(box.bottom, r.bottom);
+            bands.forEach((box, band) => targets.set(`${measureIndex}:${band}`, box));
         });
-
-        bands.forEach((box, band) => targets.set(`${measureIndex}:${band}`, box));
-    });
+    }
 
     if (!animate) {
         document.querySelectorAll(".mapSelectionOverlay").forEach(el => el.remove());
@@ -2553,28 +2746,38 @@ function mapCellWeightedDistance(cx, cy, x, y) {
 // 常に自分のビート位置ぴったり（±1の連続する帯）にしか存在せず、小節番号の並び順と
 // 進行軸方向の位置が必ず一致するため、フォールバックの基準として安全に使える
 function findNearestMapCell(x, y) {
-    const allCells = document.querySelectorAll("#mapArea [data-measure-index]");
-    let directHitIndex = null;
-    allCells.forEach(cell => {
-        if (directHitIndex !== null) return;
-        const r = cell.getBoundingClientRect();
-        if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
-            directHitIndex = parseInt(cell.dataset.measureIndex, 10);
-        }
-    });
-    if (directHitIndex !== null) return directHitIndex;
+    if (!mapRenderState) return null;
+    const { canvas, clickableByCoord, railOnly, minX, minY, cellSize, gridW, gridH } = mapRenderState;
+    const canvasRect = canvas.getBoundingClientRect();
 
-    const railCells = document.querySelectorAll('#mapArea [data-measure-index][data-cell-type="rail"]');
+    // 直撃判定：座標からグリッド上の論理マス座標を直接算出し、そのマスにmeasureIndexが
+    // あるかをO(1)で調べる（マップはcanvas化されておりマス単位のDOM要素が存在しないため、
+    // 以前のようにgetBoundingClientRect()をマスごとに回す必要はない）
+    const localX = x - canvasRect.left;
+    const localY = y - canvasRect.top;
+    if (localX >= 0 && localY >= 0) {
+        // グリッド右端/下端ちょうどの座標（canvasRect.right/bottom上のピクセル）は
+        // Math.floorだけだと1つ外側（範囲外）のマス番号になってしまうため、
+        // 最終列/行にクランプする（DOM要素のgetBoundingClientRect()が右端/下端を
+        // 含める形で判定していた従来の挙動に合わせるため）
+        const gx = Math.min(gridW - 1, Math.floor(localX / cellSize));
+        const gy = Math.min(gridH - 1, Math.floor(localY / cellSize));
+        const ax = gx + minX, ay = gy + minY;
+        const hit = clickableByCoord.get(`${ax},${ay}`);
+        if (hit !== undefined) return hit;
+    }
+
+    // 直撃が無ければ、レールセルだけを対象に重み付き距離が最も近いものにフォールバックする
+    // （mapCellWeightedDistanceの意図・レールに絞る理由は同関数のコメント参照）
     let nearestIndex = null;
     let nearestDist = Infinity;
-    railCells.forEach(cell => {
-        const r = cell.getBoundingClientRect();
-        const cx = r.left + r.width / 2;
-        const cy = r.top + r.height / 2;
+    railOnly.forEach(c => {
+        const cx = (c.x - minX) * cellSize + cellSize / 2 + canvasRect.left;
+        const cy = (c.y - minY) * cellSize + cellSize / 2 + canvasRect.top;
         const dist = mapCellWeightedDistance(cx, cy, x, y);
         if (dist < nearestDist) {
             nearestDist = dist;
-            nearestIndex = parseInt(cell.dataset.measureIndex, 10);
+            nearestIndex = c.measureIndex;
         }
     });
     return nearestIndex;
@@ -2584,24 +2787,31 @@ function findNearestMapCell(x, y) {
 // 座標を直接含むマスがあればそれを、無ければ最も近いマスの小節にフォールバックする
 // （マップは隙間だらけのグリッドなので、ドラッグ中の座標がマスの真上とは限らないため）
 function getMapMeasureIndexAtPoint(x, y) {
-    // グリッド本体（#mapGrid）の外側（背景を埋めるために広げた白い余白部分や、ページの
-    // 他の場所）を押しても選択が始まらないようにする
-    const gridDiv = document.getElementById("mapGrid");
-    if (!gridDiv) return null;
-    const gridRect = gridDiv.getBoundingClientRect();
-    if (x < gridRect.left || x > gridRect.right || y < gridRect.top || y > gridRect.bottom) {
+    if (!mapRenderState) return null;
+    // グリッド本体（canvas化された#mapGrid）の外側（背景を埋めるために広げた白い余白部分や、
+    // ページの他の場所）を押しても選択が始まらないようにする
+    const { canvas, minX, minY, gridW, gridH, cellSize, extMinX, extMaxX, extMinY, extMaxY, deadZoneCoords } = mapRenderState;
+    const canvasRect = canvas.getBoundingClientRect();
+    if (x < canvasRect.left || x > canvasRect.right || y < canvasRect.top || y > canvasRect.bottom) {
         return null;
     }
 
     // どの小節にも属さない「見た目用の余白マス」（renderMap()が表示範囲の端に追加する
-    // 1マス分のマージン、cell.dataset.outsideExtentが立っている）を直接クリックした場合は
-    // 選択しない。レール/センサー/音符マットが無い普通の空白マス（小節の実測範囲内にあり、
-    // たまたまその位置に何も配置されていないだけのマス）はここでは対象外で、
+    // 1マス分のマージン）や、末尾の未使用フットプリント（deadZoneCoords）を直接クリック
+    // した場合は選択しない。レール/センサー/音符マットが無い普通の空白マス（小節の実測
+    // 範囲内にあり、たまたまその位置に何も配置されていないだけのマス）はここでは対象外で、
     // 従来通り下の「最も近いセルへのフォールバック」で選択できる
-    const marginCells = document.querySelectorAll("#mapArea [data-outside-extent]");
-    for (const marginCell of marginCells) {
-        const r = marginCell.getBoundingClientRect();
-        if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+    // （以前はcell.dataset.outsideExtentが立ったDOM要素をクリック判定していたが、
+    // canvas化により座標からextent/deadZoneCoordsへの直接判定に置き換えている）
+    const localX = x - canvasRect.left;
+    const localY = y - canvasRect.top;
+    // グリッド右端/下端ちょうどの座標は最終列/行にクランプする（findNearestMapCell側と
+    // 同じ理由。上のcanvasRect境界チェックでは右端/下端ぴったりを「内側」として通しているため）
+    const gx = Math.min(gridW - 1, Math.floor(localX / cellSize));
+    const gy = Math.min(gridH - 1, Math.floor(localY / cellSize));
+    if (gx >= 0 && gx < gridW && gy >= 0 && gy < gridH) {
+        const ax = gx + minX, ay = gy + minY;
+        if (ax < extMinX || ax > extMaxX || ay < extMinY || ay > extMaxY || deadZoneCoords.has(`${ax},${ay}`)) {
             return null;
         }
     }
@@ -3123,6 +3333,7 @@ function buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap, ho
 // buildStaffNotesの結果（1段分）について、notePositions（クリック判定用）を記録する。
 // staffは"upper"|"lower"のタグで、編集操作がどちらの配列を書き換えるべきか判定するのに使う
 function recordNotePositionsForStaff(notesArray, measureIndex, rowIndex, rowDiv, staffResult, centerShiftPx, staff) {
+    const countBefore = notePositions.length;
     staffResult.notes.forEach((staveNote, renderIdx) => {
         const m = staffResult.meta[renderIdx];
         if (m.realNoteIndex === null) return; // プレビュー用のダミーはクリック判定に含めない
@@ -3169,6 +3380,17 @@ function recordNotePositionsForStaff(notesArray, measureIndex, rowIndex, rowDiv,
             });
         });
     });
+
+    // この小節・この段について1件も記録できなかった場合（プレビューが小節の中身を
+    // 丸ごと置き換え、実データにマッピングし直せる要素が1つも残らなかった場合——
+    // 空の小節に最初の1音を置こうとホバーした時など、1個しか要素が無い小節で起こりうる）、
+    // 次のmousemoveでのヒットテスト（findNoteAt/findNoteAtX）が完全に空振りし続けてしまう。
+    // 直前の非プレビュー時点のスナップショット（stableNotePositions）で補っておくことで、
+    // ホバー中も「本来そこに何があったか」の判定材料を失わないようにする
+    if (notePositions.length === countBefore) {
+        const cached = stableNotePositions.get(`${measureIndex}:${staff}`);
+        if (cached) notePositions.push(...cached);
+    }
 }
 
 // 小節の中身が休符1つだけ（例: 全休符）の場合、そのまま描画すると音符エリアの先頭に
@@ -3673,6 +3895,10 @@ function setupDeleteButtons() {
     const wrapper = document.getElementById("scoreWrapper");
     const scoreElement = document.getElementById("score");
     const measuresPerRow = getMeasuresPerRow();
+    // 行のDOM要素一覧はループ内では変化しないため、小節数ぶん毎回クエリし直さず1回だけ取得する
+    // （以前は小節ごとにquerySelectorAllを呼んでおり、小節数が多いと無駄なDOM検索の
+    // 積み重ねがボタン再構築のコストの大半を占めていた）
+    const rowDivs = scoreElement.querySelectorAll("div[data-row-index]");
 
     score.measures.forEach((_, measureIndex) => {
         if (score.measures.length <= 1) return;
@@ -3694,7 +3920,6 @@ function setupDeleteButtons() {
         }
 
         const measureWidth = isFirstMeasure ? STAVE_WIDTH_BASE + FIRST_MEASURE_EXTRA : STAVE_WIDTH_BASE;
-        const rowDivs = scoreElement.querySelectorAll("div[data-row-index]");
         const rowDiv = rowDivs[rowIndex];
         const rowOffsetTop = rowDiv ? rowDiv.offsetTop : 0;
 
@@ -3729,6 +3954,8 @@ function setupInsertButtons() {
     const wrapper = document.getElementById("scoreWrapper");
     const scoreElement = document.getElementById("score");
     const measuresPerRow = getMeasuresPerRow();
+    // setupDeleteButtons()と同様、行のDOM要素一覧は1回だけ取得してループ内で使い回す
+    const rowDivs = scoreElement.querySelectorAll("div[data-row-index]");
 
     score.measures.forEach((_, measureIndex) => {
         const btn = document.createElement("button");
@@ -3747,7 +3974,6 @@ function setupInsertButtons() {
             sx = 20 + indexInRow * STAVE_WIDTH_BASE;
         }
 
-        const rowDivs = scoreElement.querySelectorAll("div[data-row-index]");
         const rowDiv = rowDivs[rowIndex];
         const rowOffsetTop = rowDiv ? rowDiv.offsetTop : 0;
 
@@ -4482,14 +4708,30 @@ function reflowForDrawerToggle() {
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
-    if (activeTab === "map" || activeTab === "both") renderMap();
+    // マップは呼び直さない：ドロワーの開閉で変わるのは#mapAreaWrapperの「表示幅」
+    // （＝スクロールして見える範囲）だけで、マップの中身（canvasの実サイズ・グリッド
+    // の内容・クリック判定用データ）はwrapValueやscale等に依存しwrapper幅には依存しない
+    // ため、再構築の必要が無い（「並べて」タブの左右入れ替え最適化と同じ考え方。
+    // window resizeハンドラも元々renderMap()を呼んでおらず、この関数だけ取り残されていた）。
+    // 選択ハイライト・リサイズハンドル・コーナーオーバーレイもcanvas/wrapper基準の
+    // 相対位置で決まるため、wrapper自体がCSSで押しやられるだけなら自動的に追従する
 }
 
 function setDrawerOpen(open) {
     localStorage.setItem("drawerOpen", open ? "true" : "false");
     document.getElementById("drawer").classList.toggle("open", open);
     document.body.classList.toggle("drawer-pinned", open);
-    reflowForDrawerToggle();
+    // reflowForDrawerToggle()（renderScore()の全体再描画等）は小節数が多いと数百msかかる
+    // ことがあり、クリック直後に同期実行すると、ブラウザは次の描画までクラス切り替えの
+    // 反映すら止めてしまう（＝クリックしてから一瞬固まったように見えてからドロワーが
+    // 開閉する）。setTimeout(fn,0)は次の描画より先にマクロタスクが実行されてしまうことが
+    // あり確実ではないため、二重のrequestAnimationFrameを使う：1回目のコールバックが
+    // 戻った時点でブラウザは「今のクラス変更を含む1フレーム」を実際に描画し、
+    // その次のフレームで2回目のコールバック（実際の再計算）が走る、という形で
+    // 「ドロワー自体の開閉が先に画面に映ってから、続きの再計算が行われる」ことを保証する
+    requestAnimationFrame(() => {
+        requestAnimationFrame(reflowForDrawerToggle);
+    });
 }
 
 function setupDrawer() {
@@ -5246,6 +5488,7 @@ function applyLoadedScore({ score: loadedScore, title, bpm, northDirection: load
 async function main() {
 
     loadSeBuffers();
+    loadMapPanelImages();
 
     // タブUIの生成は取得したデータに依存しないため、fetch完了を待たず先に行う。
     // これをfetchの後に回すと、通信が終わるまでタブが1つも表示されない
