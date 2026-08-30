@@ -395,16 +395,33 @@ function playNote(pitch, startTime, duration) {
 // 再生は基本的に曲全体を対象とする（小節選択は編集用の状態であり、シークバー等の
 // 再生系操作を巻き込まないよう独立させている）が、A-B区間ループ（abLoopRange）が
 // 設定されている間はその区間だけを対象にする。scheduleMeasuresFrom()がこの関数を
-// 直接呼んでスケジュールの終端を決めているため、区間の反映はここで行う
-let abLoopRange = null; // { startMeasureIndex, endMeasureIndex } | null（#abLoopStripで設定）
+// 直接呼んでスケジュールの終端を決めているため、区間の反映はここで行う。
+// abLoopRangeは常に値を持ち（デフォルトは曲の端から端まで）、nullにはならない
+// （resetAbLoopRangeToFull参照）
+let abLoopRange = null; // { startMeasureIndex, endMeasureIndex }（#abLoopStripで設定）
+// A-B区間ループの有効/無効トグル（#abLoopToggleBtn）がOFFの間は区間を無視して曲全体を
+// 対象にする。区間自体（abLoopRange）はOFFにしても保持したままにし、再度ONにすれば
+// 同じ区間がすぐ復活するようにする（毎回帯をドラッグし直さずに済むように）。
+// デフォルトはOFF（区間は端から端までだが、明示的にONにするまでは効かない）
+let abLoopEnabled = false;
+
+// abLoopRangeを現在の曲の先頭〜末尾（デフォルトの範囲）にリセットする。新規作成・
+// 読み込み直後の初期状態と、帯を単発クリックした時のリセット操作の両方から使う。
+// 有効/無効トグルもデフォルトのOFFに戻す
+function resetAbLoopRangeToFull() {
+    abLoopRange = score.measures.length > 0
+        ? { startMeasureIndex: 0, endMeasureIndex: score.measures.length - 1 }
+        : null;
+    abLoopEnabled = false;
+}
 
 function getPlaybackEndMeasureIndex() {
-    if (abLoopRange) return abLoopRange.endMeasureIndex;
+    if (abLoopRange && abLoopEnabled) return abLoopRange.endMeasureIndex;
     return score.measures.length - 1;
 }
 
 function getPlaybackRangeMeasures() {
-    if (abLoopRange) return { startMeasureIndex: abLoopRange.startMeasureIndex, endMeasureIndex: abLoopRange.endMeasureIndex };
+    if (abLoopRange && abLoopEnabled) return { startMeasureIndex: abLoopRange.startMeasureIndex, endMeasureIndex: abLoopRange.endMeasureIndex };
     return { startMeasureIndex: 0, endMeasureIndex: getPlaybackEndMeasureIndex() };
 }
 
@@ -610,7 +627,7 @@ function finishPlayback() {
     // 全曲ループ（isLooping）とA-B区間ループ（abLoopRange）は独立した別概念だが、
     // どちらか一方でも有効なら「最後まで来たら再生対象範囲の先頭へ戻って続ける」
     // という動作自体は共通なので、ここではORで判定する
-    if (isLooping || abLoopRange) {
+    if (isLooping || (abLoopRange && abLoopEnabled)) {
         playScore();
         return;
     }
@@ -735,7 +752,7 @@ function updateSeekBar() {
 function updateSeekBarFillStart() {
     const bar = document.getElementById("seekBar");
     if (!bar || !score) return;
-    const startRatio = (abLoopRange && score.measures.length > 0)
+    const startRatio = (abLoopRange && abLoopEnabled && score.measures.length > 0)
         ? abLoopRange.startMeasureIndex / score.measures.length
         : 0;
     bar.style.setProperty("--fill-start", `${startRatio * 100}%`);
@@ -779,7 +796,7 @@ function restartPlaybackFromMeasure(measureIndex) {
 function getMeasureIndexForRatio(ratio) {
     const measureIndex = measureIndexForFullSongRatio(ratio);
     if (measureIndex === null) return null;
-    if (abLoopRange) {
+    if (abLoopRange && abLoopEnabled) {
         return Math.min(abLoopRange.endMeasureIndex, Math.max(abLoopRange.startMeasureIndex, measureIndex));
     }
     return measureIndex;
@@ -813,8 +830,6 @@ function measureIndexForFullSongRatio(ratio) {
     return Math.min(measureCount - 1, Math.max(0, Math.floor(ratio * measureCount)));
 }
 
-const AB_LOOP_DRAG_THRESHOLD_PX = 4;
-
 // #abLoopStripの表示位置・幅を#seekBarの実測位置に揃える（#seekBarRowと
 // #abLoopStripRowはCSS上同じmax-width/paddingだが、#seekBar自体は左右の
 // 時刻表示スパンの分だけ内側に寄っているため、flexだけでは厳密に一致しない）
@@ -829,19 +844,26 @@ function updateAbLoopStripGeometry() {
     strip.style.width = `${seekRect.width}px`;
 }
 
-// abLoopRangeの有無に応じて帯・クリアボタンの表示を更新する
+// abLoopRange（常に値を持つ、デフォルトは曲の端から端まで）に応じて帯の表示を更新する。
+// あわせて#abLoopToggleBtn（有効/無効トグル）の見た目もここで同期する
 function renderAbLoopBand() {
     const band = document.getElementById("abLoopBand");
-    const clearBtn = document.getElementById("abLoopClearBtn");
-    if (!band || !clearBtn) return;
+    const toggleBtn = document.getElementById("abLoopToggleBtn");
+    if (!band) return;
 
     updateSeekBarFillStart();
 
+    if (toggleBtn) {
+        toggleBtn.style.color = abLoopEnabled ? "#4a6cf7" : "#ccc";
+    }
+
     if (!abLoopRange) {
         band.style.display = "none";
-        clearBtn.style.display = "none";
         return;
     }
+
+    // トグルOFF中は、区間自体は保持しつつも「今は効いていない」ことが分かるよう帯を薄くする
+    band.style.opacity = abLoopEnabled ? "1" : "0.4";
 
     const measureCount = score.measures.length;
     const startRatio = abLoopRange.startMeasureIndex / measureCount;
@@ -849,105 +871,16 @@ function renderAbLoopBand() {
     band.style.display = "";
     band.style.left = `${startRatio * 100}%`;
     band.style.width = `${(endRatio - startRatio) * 100}%`;
-    clearBtn.style.display = "flex";
 }
 
-function clearAbLoopRange() {
-    abLoopRange = null;
-    renderAbLoopBand();
-    updateSeekBar();
-}
-
+// A/Bの位置調整は、帯の上のどこをドラッグしても新しい区間を引き直せる方式だと、
+// 「何もない場所」をドラッグしただけでも区間が変わってしまい紛らわしいため廃止した。
+// 位置調整は開始（A）/終了（B）の各ハンドルを個別につまむ操作のみで行う
 function setupAbLoopStrip() {
     const strip = document.getElementById("abLoopStrip");
-    const clearBtn = document.getElementById("abLoopClearBtn");
-    if (!strip || !clearBtn) return;
-
-    let dragging = false;
-    let startX = 0;
-    let startMeasureIndex = null;
-    let hasMoved = false;
-
-    strip.addEventListener("pointerdown", (e) => {
-        // 開始/終了ハンドルの上から始まったドラッグは、こちら（区間の引き直し）ではなく
-        // setupAbLoopHandle側の個別ドラッグに任せる
-        if (e.target.closest("#abLoopHandleA, #abLoopHandleB")) return;
-        dragging = true;
-        hasMoved = false;
-        startX = e.clientX;
-        startMeasureIndex = null;
-        e.preventDefault();
-    });
-
-    document.addEventListener("pointermove", (e) => {
-        if (!dragging) return;
-        const dx = e.clientX - startX;
-        if (!hasMoved) {
-            if (Math.abs(dx) < AB_LOOP_DRAG_THRESHOLD_PX) return;
-            hasMoved = true;
-            const rect = strip.getBoundingClientRect();
-            const startRatio = (startX - rect.left) / rect.width;
-            startMeasureIndex = measureIndexForFullSongRatio(startRatio);
-        }
-        if (startMeasureIndex === null) return;
-
-        const rect = strip.getBoundingClientRect();
-        const currentRatio = (e.clientX - rect.left) / rect.width;
-        const currentMeasureIndex = measureIndexForFullSongRatio(currentRatio);
-        if (currentMeasureIndex === null) return;
-
-        // ドラッグ中のライブプレビュー（まだ確定していない、指を離すまでabLoopRangeは変更しない）
-        const previewStart = Math.min(startMeasureIndex, currentMeasureIndex);
-        const previewEnd = Math.max(startMeasureIndex, currentMeasureIndex);
-        const measureCount = score.measures.length;
-        const band = document.getElementById("abLoopBand");
-        const clearBtnEl = document.getElementById("abLoopClearBtn");
-        if (band) {
-            band.style.display = "";
-            band.style.left = `${(previewStart / measureCount) * 100}%`;
-            band.style.width = `${((previewEnd + 1 - previewStart) / measureCount) * 100}%`;
-        }
-        if (clearBtnEl) clearBtnEl.style.display = "flex";
-    });
-
-    document.addEventListener("pointerup", (e) => {
-        if (!dragging) return;
-        dragging = false;
-
-        if (!hasMoved) {
-            // ほぼ動かさないクリック＝区間があればクリア、無ければ何もしない
-            if (abLoopRange) clearAbLoopRange();
-            return;
-        }
-
-        const rect = strip.getBoundingClientRect();
-        const endRatio = (e.clientX - rect.left) / rect.width;
-        const endMeasureIndex = measureIndexForFullSongRatio(endRatio);
-        if (startMeasureIndex === null || endMeasureIndex === null) {
-            renderAbLoopBand(); // プレビューを確定前の状態に戻す
-            return;
-        }
-
-        const newStart = Math.min(startMeasureIndex, endMeasureIndex);
-        const newEnd = Math.max(startMeasureIndex, endMeasureIndex);
-        if (newEnd - newStart < 1) {
-            // 1小節未満の区間は誤操作とみなして不成立にする（元の状態に戻す）
-            renderAbLoopBand();
-            return;
-        }
-
-        abLoopRange = { startMeasureIndex: newStart, endMeasureIndex: newEnd };
-        renderAbLoopBand();
-        updateSeekBar();
-        // 一時停止中も含め、既に再生スケジュール済み（playState !== "stopped"）の場合は
-        // 新しい区間の先頭へ即座に組み直す。一時停止中はスケジュールだけが古い区間のまま
-        // 残っており、そのまま再開すると新しい区間の外（旧区間の続き）が鳴ってしまうため
-        if (playState === "playing" || playState === "paused") {
-            restartPlaybackFromMeasure(abLoopRange.startMeasureIndex);
-        }
-    });
-
-    clearBtn.addEventListener("click", () => clearAbLoopRange());
+    if (!strip) return;
+    resetAbLoopRangeToFull();
+    renderAbLoopBand();
 
     setupAbLoopHandle(document.getElementById("abLoopHandleA"), "start");
     setupAbLoopHandle(document.getElementById("abLoopHandleB"), "end");
@@ -1633,7 +1566,15 @@ function getAllBeats() {
         const l = lowerBeats[i];
         const upperPitches = (u.isFirst && u.note && !u.note.rest && u.note.pitches) ? u.note.pitches : [];
         const lowerPitches = (l.isFirst && l.note && !l.note.rest && l.note.pitches) ? l.note.pitches : [];
-        const pitches = [...upperPitches, ...lowerPitches];
+        // 上段・下段で同じ音（異名同音表記の違いも含む）が同時に鳴っている場合、
+        // 物理的には同じ音符マット1枚で表現できるため、重複を1つにまとめる
+        const seenCanonical = new Set();
+        const pitches = [...upperPitches, ...lowerPitches].filter(p => {
+            const key = toCanonicalPitch(p);
+            if (seenCanonical.has(key)) return false;
+            seenCanonical.add(key);
+            return true;
+        });
         return {
             measureIndex: u.measureIndex,
             note: pitches.length ? { pitches, rest: false } : { rest: true },
@@ -2878,6 +2819,12 @@ function setupMapAreaDrag() {
         // 音符/休符グループ（#toolbarDuration）のグリップハンドルをドラッグして移動する際、
         // フローティング中にマップ領域と重なっていても小節選択を巻き込まないよう除外する
         if (e.target.closest("#toolbarDuration")) return;
+        // 下部の再生バー（曲名・BPM・音量・シークバー・A-B帯・再生ボタン等）からドラッグを
+        // 始めても、小節選択を巻き込まないよう除外する
+        if (e.target.closest("#playbackBar")) return;
+        // ドロワー（調号・移調・マップ設定・音符グループ等）からドラッグを始めても、
+        // 同様に小節選択を巻き込まないよう除外する
+        if (e.target.closest("#drawer")) return;
         // 単発クリック（ドラッグに発展しなかった場合）用に、グリッド外・余白を除外する
         // 厳密な判定も別途取っておく。実際にドラッグに発展した場合は、開始点がグリッド外/
         // 余白上でも（＝マウスを下ろした瞬間はまだ厳密な判定で無効でも）、そこから実際に
@@ -4471,8 +4418,13 @@ function setupSVGEventsForRow(svg, rowDiv) {
 
         if (measureIndex < 0 || measureIndex >= score.measures.length) {
             if (hoveredPos !== null) {
-                updateHoverRows(hoveredPos, null);
+                // updateHoverRows()内でbuildRow()が読むのはグローバルhoveredPosのため、
+                // 呼び出す前に更新しておく（後から更新すると、再構築時にまだ古いホバー位置の
+                // ままプレビューが描かれてしまい、次のmousemoveが来ないケース（このまま
+                // マウスがスコア外へ抜ける等）ではプレビューが消えずに残り続けてしまう）
+                const prevHovered = hoveredPos;
                 hoveredPos = null;
+                updateHoverRows(prevHovered, null);
             }
             return;
         }
@@ -4488,16 +4440,18 @@ function setupSVGEventsForRow(svg, rowDiv) {
 
         const changed = JSON.stringify(newHovered) !== JSON.stringify(hoveredPos);
         if (changed) {
-            updateHoverRows(hoveredPos, newHovered);
+            const prevHovered = hoveredPos;
             hoveredPos = newHovered;
+            updateHoverRows(prevHovered, newHovered);
         }
     });
 
     svg.addEventListener("mouseleave", () => {
         if (dragState) return;
         if (hoveredPos !== null) {
-            updateHoverRows(hoveredPos, null);
+            const prevHovered = hoveredPos;
             hoveredPos = null;
+            updateHoverRows(prevHovered, null);
         }
     });
 }
@@ -4971,6 +4925,12 @@ function setupGlobalEvents() {
         // 音符/休符グループ（#toolbarDuration）のグリップハンドルをドラッグして移動する際も、
         // 同様に五線譜の小節選択を巻き込んでしまわないよう除外する
         if (e.target.closest("#toolbarDuration")) return;
+        // 下部の再生バー（曲名・BPM・音量・シークバー・A-B帯・再生ボタン等）からドラッグを
+        // 始めても、小節選択を巻き込まないよう除外する
+        if (e.target.closest("#playbackBar")) return;
+        // ドロワー（調号・移調・マップ設定・音符グループ等）からドラッグを始めても、
+        // 同様に小節選択を巻き込まないよう除外する
+        if (e.target.closest("#drawer")) return;
 
         // 右クリック・Shift・Ctrl は音符モード時のみSVG上で音符編集
         if (e.button !== 0 || e.shiftKey || e.ctrlKey) {
@@ -5455,6 +5415,8 @@ function musicXMLToScore(xmlString) {
 // 読み込み完了後の共通後処理（JSON/MusicXMLどちらの読み込み結果もここに渡す）
 function applyLoadedScore({ score: loadedScore, title, bpm, northDirection: loadedNorthDirection, mapSettings: loadedMapSettings }) {
     score = loadedScore;
+    resetAbLoopRangeToFull();
+    renderAbLoopBand();
 
     if (title != null) {
         document.getElementById("scoreTitleInput").value = title;
@@ -5827,6 +5789,8 @@ async function main() {
             score.measures = [makeEmptyMeasure()];
             document.getElementById("scoreTitleInput").value = "NewScore";
             selectedMeasures.clear();
+            resetAbLoopRangeToFull();
+            renderAbLoopBand();
             saveHistory();
             renderScore();
             setupDeleteButtons();
@@ -5857,6 +5821,16 @@ async function main() {
 
     document.getElementById("restartBtn")
         .addEventListener("click", () => restartScore());
+
+    // A-B区間ループの有効/無効トグル（区間自体はabLoopRangeに保持したまま、
+    // 再生への反映だけをON/OFFする。#abLoopStripでの区間の描画・調整はそのまま）
+    document.getElementById("abLoopToggleBtn")
+        .addEventListener("click", () => {
+            abLoopEnabled = !abLoopEnabled;
+            renderAbLoopBand();
+            updateSeekBar();
+            rescheduleFromCurrentPosition();
+        });
 
     document.getElementById("loopBtn")
         .addEventListener("click", () => {
@@ -5900,7 +5874,7 @@ async function main() {
         // A-B区間ループ中は、getMeasureIndexForRatio()が区間内にクランプした結果を
         // つまみ自体の値にも反映し直し、区間の外へドラッグしても見た目上つまみが
         // 区間の境界より外へ出ないようにする（表示中の秒数ともズレないように揃える）
-        if (abLoopRange && previewMeasureIndex !== null) {
+        if (abLoopRange && abLoopEnabled && previewMeasureIndex !== null) {
             ratio = previewMeasureIndex / score.measures.length;
             e.target.value = ratio;
         }

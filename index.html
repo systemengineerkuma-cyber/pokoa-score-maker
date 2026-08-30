@@ -196,6 +196,16 @@
             transform: translateY(-50%);
         }
 
+        #abLoopToggleBtn {
+            position: absolute;
+            left: calc(50% - 88px); /* 最初に戻すボタン左端(-52px) - gap(10px) - 自身の幅(26px) */
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 10px;
+            font-weight: 700;
+            color: #ccc;
+        }
+
         #stopBtn {
             position: absolute;
             left: calc(50% + 26px); /* 再生ボタン右端(+16px) + gap(10px) */
@@ -755,22 +765,32 @@
         }
 
         /* トラックの太さ（4px）は#seekBarのトラック（::-webkit-slider-runnable-track、
-           下記参照）と揃えている */
+           下記参照）と揃えている。left/rightは#seekBarRowの内側にある時刻表示スパン
+           （#abLoopStripRowのpadding16px + span幅30px + gap8px = 54px）ぶんの静的な
+           既定値で、JS側（updateAbLoopStripGeometry）が#seekBarの実測位置に合わせて
+           都度補正するが、この既定値自体が実測値と一致するため、JS実行前
+           （リロード直後の初回描画）でも位置がズレて見えてちらつくことがない */
         #abLoopStrip {
             position: absolute;
             top: 18px;
+            left: 54px;
+            right: 54px;
             height: 4px;
             border-radius: var(--radius-pill);
             background: var(--border);
             opacity: 0.6;
-            cursor: pointer;
         }
 
+        /* abLoopRangeの既定値（曲の端から端まで）・abLoopEnabledの既定値（OFF）と
+           一致する見た目を最初から静的CSSで表現しておく（JS実行前の初回描画でも
+           正しい状態のまま出るようにし、リロード時のちらつきを防ぐ） */
         #abLoopBand {
             position: absolute;
             top: 0;
             bottom: 0;
             left: 0;
+            width: 100%;
+            opacity: 0.4;
             border-radius: var(--radius-pill);
             background: rgba(74, 108, 247, 0.3);
             border: 1px solid rgba(74, 108, 247, 0.65);
@@ -811,27 +831,6 @@
         }
         #abLoopHandleA { left: 0; transform: translate(-50%, -50%); }
         #abLoopHandleB { left: 100%; transform: translate(-50%, -50%); }
-
-        #abLoopClearBtn {
-            position: absolute;
-            right: 16px;
-            top: 12px;
-            width: 16px;
-            height: 16px;
-            border: none;
-            background: none;
-            color: var(--text-faint);
-            cursor: pointer;
-            font-size: 10px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 0;
-        }
-
-        #abLoopClearBtn:hover {
-            color: var(--text);
-        }
 
         #zoomSlider::-webkit-slider-runnable-track,
         #volumeSlider::-webkit-slider-runnable-track,
@@ -1820,18 +1819,18 @@
         <span id="seekTimeTotal">0:00</span>
     </div>
     <div id="abLoopStripRow">
-        <div id="abLoopStrip" title="ドラッグしてA-B区間ループを設定">
-            <div id="abLoopBand" style="display:none;">
+        <div id="abLoopStrip">
+            <div id="abLoopBand">
                 <span id="abLoopLabelA">A</span>
                 <span id="abLoopLabelB">B</span>
                 <div id="abLoopHandleA" title="開始位置（A）をドラッグして調整"></div>
                 <div id="abLoopHandleB" title="終了位置（B）をドラッグして調整"></div>
             </div>
         </div>
-        <button id="abLoopClearBtn" tabindex="-1" title="区間ループを解除" style="display:none;"><i class="fa-solid fa-xmark"></i></button>
     </div>
     <div id="playbackControlsRow">
     <div id="playbackBarCenter">
+        <button id="abLoopToggleBtn" class="playback-ctrl-btn" tabindex="-1" title="A-B区間ループの有効/無効">AB</button>
         <button id="restartBtn" class="playback-ctrl-btn" tabindex="-1" title="最初に戻す" style="opacity:0.4;" disabled><i class="fa-solid fa-backward-step"></i></button>
         <button id="playBtn" class="playback-play-btn" tabindex="-1" title="再生/一時停止"><i class="fa-solid fa-play"></i></button>
         <button id="stopBtn" class="playback-ctrl-btn" tabindex="-1" title="停止" style="opacity:0.4;" disabled><i class="fa-solid fa-stop"></i></button>
