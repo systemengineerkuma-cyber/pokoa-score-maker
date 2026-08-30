@@ -81,7 +81,7 @@ const TABS = [
     { id: "score",    label: "五線譜",           icon: "fa-music" },
     { id: "map",      label: "マップ",            icon: "fa-map" },
     { id: "both",     label: "並べて",            icon: "fa-table-columns" },
-    { id: "assembly", label: "組み立てプレビュー", icon: "fa-cube" },
+    { id: "assembly", label: "プレビュー",         icon: "fa-cube" },
 ];
 let activeTab = localStorage.getItem("activeTab") || "score";
 // 廃止済みタブ（例: 旧パネル楽譜タブ）がlocalStorageに残っていた場合のフォールバック
@@ -636,7 +636,7 @@ function finishPlayback() {
     currentHighlightBeatIndex = null;
     cancelAnimationFrame(animFrameId);
     highlightMeasure(-1);
-    drawMapPlayLine(null);
+    updatePlaybackMarkers(null);
     document.querySelectorAll(".playLine").forEach(el => el.remove());
     updatePlaybackButtons();
     updateSeekBar();
@@ -649,7 +649,7 @@ function stopScore() {
     currentHighlightBeatIndex = null;
     cancelAnimationFrame(animFrameId);
     highlightMeasure(-1);
-    drawMapPlayLine(null);
+    updatePlaybackMarkers(null);
     document.querySelectorAll(".playLine").forEach(el => el.remove());
     if (audioCtx) {
         audioCtx.close();
@@ -773,7 +773,7 @@ function syncHighlightToMeasureStart(measureIndex) {
     if (beatSchedule.length > 0) {
         currentHighlightBeatIndex = beatSchedule[0].beatIndex;
         currentHighlightBeatT = 0;
-        drawMapPlayLine(currentHighlightBeatIndex, 0);
+        updatePlaybackMarkers(currentHighlightBeatIndex, 0);
     }
 }
 
@@ -814,7 +814,7 @@ function seekToRatio(ratio) {
 function previewSeekHighlight(measureIndex) {
     highlightMeasure(measureIndex);
     const beatIndex = measureIndex * getBeatsPerMeasure() * 4;
-    drawMapPlayLine(beatIndex, 0);
+    updatePlaybackMarkers(beatIndex, 0);
     const { left, rowIndex } = getMeasureXRange(measureIndex);
     drawPlayLine(left, rowIndex);
 }
@@ -962,7 +962,7 @@ function trackPlayback() {
             const beatT = (now - currentBeat.startTime) / (currentBeat.endTime - currentBeat.startTime);
             currentHighlightBeatIndex = currentBeat.beatIndex;
             currentHighlightBeatT = beatT;
-            drawMapPlayLine(currentBeat.beatIndex, beatT);
+            updatePlaybackMarkers(currentBeat.beatIndex, beatT);
         }
 
         for (let i = 0; i < noteTimeMap.length; i++) {
@@ -1059,6 +1059,14 @@ function drawMapPlayLine(beatIndex, t) {
         z-index: 8;
     `;
     wrapper.appendChild(line);
+}
+
+// 2Dマップ・プレビュー(3D)どちらでも再生中のトロッコ位置を表示する共通ヘルパー。
+// updateAssemblyPlayMarker()はプレビュー用のThree.jsシーンがまだ無い（一度もタブを
+// 開いていない）場合は内部で何もしない
+function updatePlaybackMarkers(beatIndex, t = 0) {
+    drawMapPlayLine(beatIndex, t);
+    updateAssemblyPlayMarker(beatIndex, t);
 }
 
 function drawPlayLine(x, rowIndex) {
@@ -2595,8 +2603,11 @@ let assemblyRailMesh = null, assemblySensorMesh = null;
 let assemblyPanelMeshes = {};   // canonical pitch -> InstancedMesh
 let assemblyLayerGrids = [];    // 3層それぞれの床グリッド（THREE.GridHelper）
 let assemblyGridVisible = true; // #assemblyGridToggleBtnで切り替える、rebuildAssemblyMeshes()を跨いで保持する
+let assemblyPlayMarker = null;  // 再生中のトロッコ位置を示す球（initAssemblyScene()で1回だけ作成し使い回す）
+let assemblyBeatCenters = [];   // ビートごとのレール中心のワールド座標（updateAssemblyPlayMarker用、rebuildAssemblyMeshes()のたびに作り直す）
 const ASSEMBLY_CELL_SIZE = 1;
-const ASSEMBLY_LAYER_HEIGHT = 3;
+// 層の間隔はマス目の縦横と同じ長さにする（＝1マスぶんが縦横高さとも等しい立方体になる）
+const ASSEMBLY_LAYER_HEIGHT = ASSEMBLY_CELL_SIZE;
 
 const MAP_PANEL_MATERIALS = {}; // canonical pitch -> [6面ぶんのMeshStandardMaterial]（BoxGeometry用）
 let assemblyRailMaterial = null, assemblySensorMaterial = null, assemblyPanelSideMaterial = null, assemblyUnitBoxGeometry = null;
@@ -2649,6 +2660,13 @@ function initAssemblyScene() {
     assemblyRailMaterial = new THREE.MeshStandardMaterial({ color: 0x585858, roughness: 0.65, metalness: 0.35 });
     assemblySensorMaterial = new THREE.MeshStandardMaterial({ color: 0xd94f4f, roughness: 0.5, metalness: 0.1, emissive: 0x330000, emissiveIntensity: 0.15 });
     assemblyPanelSideMaterial = new THREE.MeshStandardMaterial({ color: 0xefefef, roughness: 0.8 });
+
+    // 再生中のトロッコ位置マーカー（2Dマップのdraw MapPlayLineの黄色いマーカーと同系色）。
+    // rebuildAssemblyMeshes()では破棄されず使い回すので、ここで1回だけ作る
+    const markerMaterial = new THREE.MeshStandardMaterial({ color: 0xffd100, emissive: 0xffd100, emissiveIntensity: 0.5, roughness: 0.4 });
+    assemblyPlayMarker = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.3, 0.6), markerMaterial);
+    assemblyPlayMarker.visible = false;
+    assemblyScene.add(assemblyPlayMarker);
 
     assemblySceneReady = true;
 }
@@ -2732,9 +2750,11 @@ function rebuildAssemblyMeshes() {
     assemblyLayerGrids.forEach(g => assemblyScene.remove(g));
     assemblyLayerGrids = [];
 
-    const { grid, extent } = buildMapGrid();
+    const { grid, extent, beatCenters } = buildMapGrid();
     if (!extent) {
         updateAssemblyEmptyState(true);
+        assemblyBeatCenters = [];
+        if (assemblyPlayMarker) assemblyPlayMarker.visible = false;
         assemblyRenderer.render(assemblyScene, assemblyCamera);
         return;
     }
@@ -2747,6 +2767,11 @@ function rebuildAssemblyMeshes() {
         gz * ASSEMBLY_LAYER_HEIGHT,
         (gy - centerY) * ASSEMBLY_CELL_SIZE
     );
+
+    // 再生中のトロッコ位置マーカー（updateAssemblyPlayMarker）用に、ビートごとのレール
+    // 中心座標をワールド座標へ変換しておく。トロッコは物理的な中間層のレール上しか
+    // 走らないためz=0固定でよい（2DマップのmapBeatPositionsと同じ役割）
+    assemblyBeatCenters = beatCenters.map(c => toWorld(c.x, c.y, 0));
 
     const railPositions = [];
     const sensorPositions = [];
@@ -2786,9 +2811,25 @@ function rebuildAssemblyMeshes() {
     // 3層を視覚的に伝える床グリッド（半透明の板は重なった面同士の深度ソート問題があるため
     // 使わず、不透明な線だけのGridHelperにする）
     const gridSize = Math.max(extent.maxX - extent.minX, extent.maxY - extent.minY) + 4;
+
+    // GridHelperは自身のposition(既定は原点)を中心に、gridSizeの偶奇に応じて線の位置が
+    // 整数(偶数)または0.5ズレた半整数(奇数)のどちらかに揃う。一方、実際のマスはtoWorld()で
+    // (gx-centerX)というワールド座標に置かれ、そのマスの境界線はcenterXが整数か半整数かで
+    // 整数位置/半整数位置のどちらかになる。一列の最大センサー数（wrapValue）を変えると
+    // 総マス数が変わりcenterX/centerYの偶奇も変わるため、この2つがたまたま噛み合わない
+    // 組み合わせになると、線がマスの境界ではなく真ん中を通ってしまう。X軸・Y(奥行き)軸は
+    // それぞれ独立にズレうるので、両方について必要な補正量を求めてposition.x/zに反映する
+    const nativeLineFrac = gridSize % 2 !== 0 ? 0.5 : 0;
+    const boundaryFracFor = (centerSum) => ((((centerSum % 2) + 2) % 2) === 0 ? 0.5 : 0);
+    const offsetX = boundaryFracFor(extent.minX + extent.maxX) === nativeLineFrac ? 0 : ASSEMBLY_CELL_SIZE / 2;
+    const offsetZ = boundaryFracFor(extent.minY + extent.maxY) === nativeLineFrac ? 0 : ASSEMBLY_CELL_SIZE / 2;
     [-1, 0, 1].forEach(layer => {
-        const helper = new THREE.GridHelper(gridSize * ASSEMBLY_CELL_SIZE, gridSize, 0xaaaaaa, 0xd8d8d8);
-        helper.position.y = layer * ASSEMBLY_LAYER_HEIGHT - 0.15;
+        // GridHelperは本来「中心を通る2本の線だけ濃い色にする」機能を持つが、これは
+        // gridSize（マス数）の偶奇でその中心線が実在するかどうかが決まる仕様のため、
+        // マス数が変わるだけで「濃い線が出たり消えたりする」意図しない見た目のブレになる。
+        // このプレビューに中心線を強調したい意図は無いため、2色を同じ色にして常に均一にする
+        const helper = new THREE.GridHelper(gridSize * ASSEMBLY_CELL_SIZE, gridSize, 0xd8d8d8, 0xd8d8d8);
+        helper.position.set(offsetX, layer * ASSEMBLY_LAYER_HEIGHT - 0.15, offsetZ);
         helper.visible = assemblyGridVisible; // #assemblyGridToggleBtnでの設定を再構築後も保つ
         assemblyScene.add(helper);
         assemblyLayerGrids.push(helper);
@@ -2798,6 +2839,30 @@ function rebuildAssemblyMeshes() {
         frameAssemblyCamera(extent);
         assemblyCameraFramed = true;
     }
+
+    // 再生中/一時停止中にグリッドが再構築された場合、現在位置のマーカーを再適用する
+    // （2DマップのrenderMap()末尾にある同趣旨の処理と同じ理由）
+    if (playState !== "stopped" && currentHighlightBeatIndex !== null) {
+        updateAssemblyPlayMarker(currentHighlightBeatIndex, currentHighlightBeatT);
+    }
+}
+
+// 再生中のトロッコ位置を、プレビュー(3D)の球マーカーで示す。drawMapPlayLine()の3D版で、
+// ロジックは同じ（beatIndexとbeatIndex+1の間をtで補間、段の折り返しをまたぐ大きな
+// 移動だけは瞬時に切り替える）だが、対象がDOM要素ではなくThree.jsのメッシュな点が異なる
+function updateAssemblyPlayMarker(beatIndex, t) {
+    if (!assemblyPlayMarker) return;
+    const posA = beatIndex == null ? null : assemblyBeatCenters[beatIndex];
+    if (!posA) {
+        assemblyPlayMarker.visible = false;
+        return;
+    }
+    let posB = assemblyBeatCenters[beatIndex + 1] || posA;
+    if (posA.distanceTo(posB) > ASSEMBLY_CELL_SIZE * 1.5) posB = posA;
+
+    assemblyPlayMarker.position.lerpVectors(posA, posB, t);
+    assemblyPlayMarker.position.y += 0.4; // レール/センサーの高さより少し上に浮かせて見やすくする
+    assemblyPlayMarker.visible = true;
 }
 
 // 内容の大きさに合わせてカメラの初期位置・ズーム範囲を決める。初回ビルド時のみ呼ばれる
@@ -5924,59 +5989,59 @@ async function main() {
         const idx = MAP_LAYER_ORDER.indexOf(mapSettings.activeLayer);
         if (idx <= 0) return;
         mapSettings.activeLayer = MAP_LAYER_ORDER[idx - 1];
-        saveMapSettings(); updateMapToolbarUI(); renderMap();
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
     });
     document.getElementById("mapLayerDown")?.addEventListener("click", () => {
         const idx = MAP_LAYER_ORDER.indexOf(mapSettings.activeLayer);
         if (idx === -1 || idx >= MAP_LAYER_ORDER.length - 1) return;
         mapSettings.activeLayer = MAP_LAYER_ORDER[idx + 1];
-        saveMapSettings(); updateMapToolbarUI(); renderMap();
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
     });
     document.getElementById("mapRailVertical")?.addEventListener("click", () => {
         mapSettings.railDirection = "vertical";
-        saveMapSettings(); updateMapToolbarUI(); renderMap();
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
     });
     document.getElementById("mapRailHorizontal")?.addEventListener("click", () => {
         mapSettings.railDirection = "horizontal";
-        saveMapSettings(); updateMapToolbarUI(); renderMap();
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
     });
     ["top-left","top-right","bottom-left","bottom-right"].forEach(corner => {
         document.getElementById(`mapCorner-${corner}`)?.addEventListener("click", () => {
             mapSettings.startCorner = corner;
-            saveMapSettings(); updateMapToolbarUI(); renderMap();
+            saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
         });
     });
     document.getElementById("mapSideLeft")?.addEventListener("click", () => {
         mapSettings.sideFirst = "left";
-        saveMapSettings(); updateMapToolbarUI(); renderMap();
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
     });
     document.getElementById("mapSideRight")?.addEventListener("click", () => {
         mapSettings.sideFirst = "right";
-        saveMapSettings(); updateMapToolbarUI(); renderMap();
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
     });
     document.getElementById("mapWrapValue")?.addEventListener("change", e => {
         mapSettings.wrapValue = Math.max(1, parseInt(e.target.value) || 1);
-        saveMapSettings(); renderMap();
+        saveMapSettings(); refreshMapAndAssemblyIfVisible();
     });
     document.getElementById("mapWrapDown")?.addEventListener("click", () => {
         mapSettings.wrapValue = Math.max(1, mapSettings.wrapValue - 1);
         const el = document.getElementById("mapWrapValue");
         if (el) el.value = mapSettings.wrapValue;
-        saveMapSettings(); renderMap();
+        saveMapSettings(); refreshMapAndAssemblyIfVisible();
     });
     document.getElementById("mapWrapUp")?.addEventListener("click", () => {
         mapSettings.wrapValue = mapSettings.wrapValue + 1;
         const el = document.getElementById("mapWrapValue");
         if (el) el.value = mapSettings.wrapValue;
-        saveMapSettings(); renderMap();
+        saveMapSettings(); refreshMapAndAssemblyIfVisible();
     });
     document.getElementById("mapShowUnusedSensors")?.addEventListener("click", () => {
         mapSettings.hideUnusedSensors = false;
-        saveMapSettings(); updateMapToolbarUI(); renderMap();
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
     });
     document.getElementById("mapHideUnusedSensors")?.addEventListener("click", () => {
         mapSettings.hideUnusedSensors = true;
-        saveMapSettings(); updateMapToolbarUI(); renderMap();
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
     });
     updateMapToolbarUI();
 
