@@ -971,6 +971,57 @@
             position: relative;
         }
 
+        /* 組み立てプレビュー（Three.js）。#mapAreaWrapperと違い、内容はスクロールする
+           大きな画像ではなくカメラ駆動のビューポートなので、幅いっぱい・自身の高さで
+           埋める形にする。canvasのheight:100%が効くには親に明確な高さ(min-heightではなく
+           height)が必要なため、その値はJS側（resizeAssemblyRenderer）で都度設定する */
+        #assemblyAreaWrapper {
+            position: relative;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            overflow: hidden;
+        }
+        #assemblyCanvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            cursor: grab;
+        }
+        #assemblyCanvas:active {
+            cursor: grabbing;
+        }
+        #assemblyHint {
+            position: absolute;
+            top: 8px;
+            left: 8px;
+            font-size: 11px;
+            color: var(--text-faint);
+            background: rgba(255, 255, 255, 0.75);
+            padding: 3px 8px;
+            border-radius: var(--radius-pill);
+            pointer-events: none;
+            opacity: 0.7;
+        }
+        /* マップタブの#mapCornerOverlayと同じ右上の定位置に、コンパス・グリッド線トグルを
+           縦に並べる（層切替は、このプレビューでは3層とも常に表示済みのため不要） */
+        #assemblyCornerOverlay {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            z-index: 10;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 8px;
+        }
+        /* コンパスボタンは他のツールバーボタンと違いアイコン+文字ラベルを横並びで持つため、
+           固定28px幅ではなく内容に合わせた幅にする（#mapCompassOverlayと同じ理由） */
+        #assemblyCompassOverlay button {
+            width: auto;
+            padding: 0 6px;
+        }
+
         /* 「両方」タブ：五線譜とマップを同時表示する際のレイアウト。ボタンで左右2パターンを
            ローテーション切り替えできる（DOM順は常にscoreWrapper→mapAreaWrapperのまま、
            gridの列指定だけで並び順を入れ替える）。単体タブ表示時は.bothTabActiveが
@@ -1111,8 +1162,10 @@
             padding: 0 6px;
         }
         /* 矢印の向き（↑↓→←）ごとにグリフの実測幅が微妙に異なり、切り替えるたびに
-           ボタン全体の幅がわずかにブレて見えてしまうため、ラベル部分の幅を固定して吸収する */
-        #compassLabel {
+           ボタン全体の幅がわずかにブレて見えてしまうため、ラベル部分の幅を固定して吸収する。
+           マップタブ用（#compassLabel）・組み立てプレビュー用（#assemblyCompassLabel）の
+           2箇所で共通のクラスを使う */
+        .compass-label {
             display: inline-block;
             width: 14px;
             text-align: center;
@@ -1773,7 +1826,7 @@
                 <div id="mapCompassOverlay" class="toolbar">
                     <button id="compassBtn" tabindex="-1" title="北の向きを変える">
                         <i class="fa-solid fa-compass"></i>
-                        <span id="compassLabel" style="font-size:12px; margin-left:2px;">N↑</span>
+                        <span id="compassLabel" class="compass-label" style="font-size:12px; margin-left:2px;">N↑</span>
                     </button>
                 </div>
                 <div id="mapLayerOverlay" class="toolbar">
@@ -1793,6 +1846,21 @@
         </div>
     </div>
 
+    <div id="assemblyAreaWrapper" style="display:none;">
+        <div id="assemblyHint">ドラッグで回転・スクロールでズーム（Shift/Ctrl+ドラッグで平行移動）</div>
+        <div id="assemblyCornerOverlay">
+            <div id="assemblyCompassOverlay" class="toolbar">
+                <button id="assemblyCompassBtn" tabindex="-1" title="北の向きを変える">
+                    <i class="fa-solid fa-compass"></i>
+                    <span id="assemblyCompassLabel" class="compass-label" style="font-size:12px; margin-left:2px;">N↑</span>
+                </button>
+            </div>
+            <div class="toolbar">
+                <button id="assemblyGridToggleBtn" tabindex="-1" title="グリッド線の表示/非表示"><i class="fa-solid fa-table-cells"></i></button>
+            </div>
+        </div>
+        <canvas id="assemblyCanvas"></canvas>
+    </div>
 
 </div>
 
@@ -1961,6 +2029,27 @@
 <script src="https://cdn.jsdelivr.net/npm/vexflow@5.0.0/build/cjs/vexflow.js"></script>
 <!-- .mxl（ZIP圧縮MusicXML）を読み込むためのZIP解凍ライブラリ -->
 <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
+<!-- Three.js（組み立てプレビュー用）。r161以降はESモジュール専用ビルドしか無いため、
+     importmap + type="module" のブリッジでwindow.THREE / window.OrbitControlsという
+     従来通りのグローバル変数として公開し、app.js側は他のライブラリ（VexFlow等）と
+     同じ感覚でグローバル参照できるようにする。ただしモジュールスクリプトの実行完了は
+     app.jsの実行開始より後になる可能性があるため、app.js側では
+     window.THREEをトップレベルで即参照せず、必ずensureThreeLoaded()経由でアクセスする -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    window.THREE = THREE;
+    window.OrbitControls = OrbitControls;
+    window.dispatchEvent(new Event("three-ready"));
+</script>
 <script>
     const s = document.createElement("script");
     s.src = "app.js?v=" + Date.now();

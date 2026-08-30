@@ -78,9 +78,10 @@ let isCtrlHeldForRestPreview = false;
 
 // タブ定義（将来タブを追加する場合はここに追記する）
 const TABS = [
-    { id: "score",  label: "五線譜", icon: "fa-music" },
-    { id: "map",    label: "マップ", icon: "fa-map" },
-    { id: "both",   label: "並べて", icon: "fa-table-columns" },
+    { id: "score",    label: "五線譜",           icon: "fa-music" },
+    { id: "map",      label: "マップ",            icon: "fa-map" },
+    { id: "both",     label: "並べて",            icon: "fa-table-columns" },
+    { id: "assembly", label: "組み立てプレビュー", icon: "fa-cube" },
 ];
 let activeTab = localStorage.getItem("activeTab") || "score";
 // 廃止済みタブ（例: 旧パネル楽譜タブ）がlocalStorageに残っていた場合のフォールバック
@@ -1098,6 +1099,14 @@ const durationBeats = { "w": 4, "h": 2, "q": 1, "8": 0.5, "16": 0.25 };
 const DURATION_LABELS = { "w": "全音符", "h": "2分音符", "q": "4分音符", "8": "8分音符", "16": "16分音符" };
 const COMPASS_LABELS = ["N↑", "N→", "N↓", "N←"];
 
+// コンパスボタンはマップタブ用（#compassLabel）と組み立てプレビュー用
+// （#assemblyCompassLabel）の2箇所にあるため、.compass-labelクラスでまとめて更新する
+function updateCompassLabels() {
+    document.querySelectorAll(".compass-label").forEach(el => {
+        el.textContent = COMPASS_LABELS[northDirection];
+    });
+}
+
 // MusicXML書き出し/読み込み用。4分音符=8単位とすると、5音価×付点あり/なしの
 // 全10通り（最小0.25拍〜最大6拍）がすべて整数になる（最小のdivisions値）
 const MUSICXML_DIVISIONS = 8;
@@ -1415,6 +1424,10 @@ function applyTabVisibility() {
     const mapToolbar = document.getElementById("mapToolbar");
     if (mapToolbar) mapToolbar.style.display = showMap ? "flex" : "none";
 
+    // 組み立てプレビュー（Three.js）エリア
+    const assemblyAreaWrapper = document.getElementById("assemblyAreaWrapper");
+    if (assemblyAreaWrapper) assemblyAreaWrapper.style.display = activeTab === "assembly" ? "" : "none";
+
     // コンパス・「表示する層」ボタンは、マップ専用ツールバーではなく音符マットエリア上に
     // 浮かせて表示する独立したオーバーレイなので、別途表示切替する
     const mapCornerOverlay = document.getElementById("mapCornerOverlay");
@@ -1473,6 +1486,7 @@ function switchTab(tabId) {
         if (tabId === "both") rotateBothTabLayout();
         return;
     }
+    const previousTab = activeTab;
     activeTab = tabId;
     localStorage.setItem("activeTab", activeTab);
     applyTabVisibility();
@@ -1486,6 +1500,14 @@ function switchTab(tabId) {
     }
     if (activeTab === "map" || activeTab === "both") {
         renderMap();
+    }
+    if (activeTab === "assembly") {
+        renderAssemblyPreview();
+    }
+    // 組み立てプレビューから離れる時は、見えていない間ムダにフレームを描き続けないよう
+    // レンダーループを止める（戻ってきた時はrenderAssemblyPreview()が再開する）
+    if (previousTab === "assembly" && activeTab !== "assembly") {
+        stopAssemblyRenderLoop();
     }
     playTabSwitchAnimation();
 }
@@ -2551,6 +2573,302 @@ function drawMapPanelImage(ctx, px, py, size, pitch) {
     ctx.restore();
 }
 
+// ===== 組み立てプレビュー（Three.js製の3D表示） =====
+// 2Dマップ（canvas）とは独立したビュー。buildMapGrid()が返すgridは3層（上位/中間/下位）
+// 全部を同時に含んでいるため、ここでは層を切り替えず、3層まとめて縦に積んで表示する。
+// レール/センサー/音符マットはそれぞれInstancedMeshにまとめて描画する（1マス=1メッシュだと
+// 長い曲でメッシュ数が数千〜数万になり得るため。以前DOM方式のマップが同種の理由で遅かった
+// 前例があるので、最初から避ける）
+
+// window.THREEはESモジュール側（index.html）が非同期で公開するグローバルなので、
+// app.js側ではトップレベルで直接参照せず、必ずこの関数経由でアクセスする
+function ensureThreeLoaded(callback) {
+    if (window.THREE && window.OrbitControls) { callback(); return; }
+    window.addEventListener("three-ready", () => callback(), { once: true });
+}
+
+let assemblyScene = null, assemblyCamera = null, assemblyRenderer = null, assemblyControls = null;
+let assemblySceneReady = false;
+let assemblyAnimFrameId = null;
+let assemblyCameraFramed = false; // 初回のみカメラを内容に合わせてフレーミングする（編集のたびに視点をリセットしないため）
+let assemblyRailMesh = null, assemblySensorMesh = null;
+let assemblyPanelMeshes = {};   // canonical pitch -> InstancedMesh
+let assemblyLayerGrids = [];    // 3層それぞれの床グリッド（THREE.GridHelper）
+let assemblyGridVisible = true; // #assemblyGridToggleBtnで切り替える、rebuildAssemblyMeshes()を跨いで保持する
+const ASSEMBLY_CELL_SIZE = 1;
+const ASSEMBLY_LAYER_HEIGHT = 3;
+
+const MAP_PANEL_MATERIALS = {}; // canonical pitch -> [6面ぶんのMeshStandardMaterial]（BoxGeometry用）
+let assemblyRailMaterial = null, assemblySensorMaterial = null, assemblyPanelSideMaterial = null, assemblyUnitBoxGeometry = null;
+
+// 初回のタブ切り替え時にだけ呼ばれる。renderer/scene/camera/ライト/OrbitControls/
+// 共有ジオメトリ・マテリアルを1回だけ構築する
+function initAssemblyScene() {
+    if (assemblySceneReady) return;
+    const canvas = document.getElementById("assemblyCanvas");
+    if (!canvas) return;
+
+    assemblyRenderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    assemblyRenderer.setPixelRatio(window.devicePixelRatio || 1);
+    assemblyRenderer.shadowMap.enabled = true;
+    assemblyRenderer.outputColorSpace = THREE.SRGBColorSpace;
+    assemblyRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+    assemblyRenderer.toneMappingExposure = 1.1;
+
+    assemblyScene = new THREE.Scene();
+    assemblyScene.background = new THREE.Color(0xe9ecf1);
+
+    assemblyCamera = new THREE.PerspectiveCamera(50, 1, 0.1, 500);
+    assemblyCamera.position.set(12, 12, 12); // 内容に応じてframeAssemblyCamera()が上書きする
+
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x8a8f98, 0.9);
+    assemblyScene.add(hemi);
+    const sun = new THREE.DirectionalLight(0xffffff, 1.4);
+    sun.position.set(10, 18, 8);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    assemblyScene.add(sun);
+    assemblyScene.add(sun.target);
+
+    assemblyControls = new OrbitControls(assemblyCamera, assemblyRenderer.domElement);
+    assemblyControls.enableDamping = true;
+    assemblyControls.dampingFactor = 0.08;
+    assemblyControls.zoomToCursor = true; // マウス（タッチ）位置を中心にズームする
+    // 右ドラッグは常に平行移動。左ドラッグは通常は回転だが、OrbitControls標準の挙動として
+    // Shift/Ctrl/Metaを押しながらだと自動的に平行移動に切り替わる（mouseButtons.LEFTを
+    // ROTATEのままにしておくだけでよく、こちらで手動切り替えする必要はない）
+    assemblyControls.enablePan = true;
+    assemblyControls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+    assemblyControls.minDistance = 3;
+    assemblyControls.maxDistance = 200; // frameAssemblyCamera()で曲ごとに調整
+    canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+    // 使い回す共有ジオメトリ・マテリアル（2Dマップの色使いに合わせる: レール=ダークグレー、
+    // センサー=赤、音符マット側面=白系。音符マットの上面だけピッチごとの写真テクスチャを貼る）
+    assemblyUnitBoxGeometry = new THREE.BoxGeometry(1, 1, 1);
+    assemblyRailMaterial = new THREE.MeshStandardMaterial({ color: 0x585858, roughness: 0.65, metalness: 0.35 });
+    assemblySensorMaterial = new THREE.MeshStandardMaterial({ color: 0xd94f4f, roughness: 0.5, metalness: 0.1, emissive: 0x330000, emissiveIntensity: 0.15 });
+    assemblyPanelSideMaterial = new THREE.MeshStandardMaterial({ color: 0xefefef, roughness: 0.8 });
+
+    assemblySceneReady = true;
+}
+
+// ピッチごとのテクスチャ+マテリアル（BoxGeometryの6面ぶん）を遅延生成する。
+// 既にloadMapPanelImages()がプリロード中のHTMLImageElement（MAP_PANEL_IMAGES）を
+// そのまま流用し、二重に画像を取得しない
+function getAssemblyPanelMaterials(pitch) {
+    const canon = toCanonicalPitch(pitch);
+    if (MAP_PANEL_MATERIALS[canon]) return MAP_PANEL_MATERIALS[canon];
+
+    const img = getMapPanelImage(canon);
+    const tex = new THREE.Texture(img || undefined);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    if (img) {
+        if (img.complete && img.naturalWidth > 0) {
+            tex.needsUpdate = true;
+        } else {
+            // 既存のimg.onload（2DマップのscheduleMapPanelRedraw）を上書きしないよう、
+            // addEventListenerで別リスナーとして追加するだけにする
+            img.addEventListener("load", () => { tex.needsUpdate = true; }, { once: true });
+        }
+    }
+
+    const top = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.85 });
+    // BoxGeometryの面順序は [+x, -x, +y, -y, +z, -z]。+y（上面）だけ写真テクスチャ、他は側面色
+    MAP_PANEL_MATERIALS[canon] = [
+        assemblyPanelSideMaterial, assemblyPanelSideMaterial,
+        top, assemblyPanelSideMaterial,
+        assemblyPanelSideMaterial, assemblyPanelSideMaterial,
+    ];
+    return MAP_PANEL_MATERIALS[canon];
+}
+
+// 位置の配列から1つのInstancedMeshを組み立てる共通処理
+function buildAssemblyInstancedMesh(positions, geometry, material, sx, sy, sz, rotY) {
+    const mesh = new THREE.InstancedMesh(geometry, material, Math.max(positions.length, 1));
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    const m = new THREE.Matrix4();
+    const scale = new THREE.Vector3(sx, sy, sz);
+    const quat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), rotY);
+    positions.forEach((pos, i) => {
+        m.compose(pos, quat, scale);
+        mesh.setMatrixAt(i, m);
+    });
+    mesh.count = positions.length;
+    mesh.instanceMatrix.needsUpdate = true;
+    return mesh;
+}
+
+// 曲が空の時に表示する簡単な案内文（2Dマップの「音符がありません」と同趣旨）
+function updateAssemblyEmptyState(isEmpty) {
+    const canvas = document.getElementById("assemblyCanvas");
+    let hint = document.getElementById("assemblyEmptyHint");
+    if (isEmpty) {
+        if (canvas) canvas.style.display = "none";
+        if (!hint) {
+            hint = document.createElement("p");
+            hint.id = "assemblyEmptyHint";
+            hint.style.cssText = "color:var(--text-faint); padding:16px;";
+            hint.textContent = "音符がありません";
+            document.getElementById("assemblyAreaWrapper").appendChild(hint);
+        }
+    } else {
+        if (canvas) canvas.style.display = "";
+        if (hint) hint.remove();
+    }
+}
+
+// buildMapGrid()の結果を元に、3層ぶんのInstancedMeshを作り直す。renderMap()と同様、
+// 曲やマップ設定が変わるたびに丸ごと呼び直す（ジオメトリ/マテリアルは使い回し、
+// 前回分のInstancedMeshだけ破棄して作り直す）
+function rebuildAssemblyMeshes() {
+    [assemblyRailMesh, assemblySensorMesh, ...Object.values(assemblyPanelMeshes)].forEach(m => {
+        if (m) assemblyScene.remove(m);
+    });
+    assemblyRailMesh = null;
+    assemblySensorMesh = null;
+    assemblyPanelMeshes = {};
+    assemblyLayerGrids.forEach(g => assemblyScene.remove(g));
+    assemblyLayerGrids = [];
+
+    const { grid, extent } = buildMapGrid();
+    if (!extent) {
+        updateAssemblyEmptyState(true);
+        assemblyRenderer.render(assemblyScene, assemblyCamera);
+        return;
+    }
+    updateAssemblyEmptyState(false);
+
+    const centerX = (extent.minX + extent.maxX) / 2;
+    const centerY = (extent.minY + extent.maxY) / 2;
+    const toWorld = (gx, gy, gz) => new THREE.Vector3(
+        (gx - centerX) * ASSEMBLY_CELL_SIZE,
+        gz * ASSEMBLY_LAYER_HEIGHT,
+        (gy - centerY) * ASSEMBLY_CELL_SIZE
+    );
+
+    const railPositions = [];
+    const sensorPositions = [];
+    const panelPositionsByPitch = {}; // canonical pitch -> Vector3[]
+    const rotY = northDirection * Math.PI / 2;
+
+    for (const [key, data] of grid) {
+        const parts = key.split(",").map(Number);
+        const pos = toWorld(parts[0], parts[1], parts[2]);
+        if (data.type === "rail") {
+            // レールはgrid上では上位層/中間層/下位層の3つに同じものが複製されている
+            // （2Dマップはどの層を見てもレールの通り道が分かるようにするための仕掛け）が、
+            // 3層を同時に表示するこのプレビューではそのまま描くとレールが3本重なって見えて
+            // しまう。実際のレールは1本しか無いので、中間層（z===0）ぶんだけ描画する
+            if (parts[2] !== 0) continue;
+            railPositions.push(pos);
+        } else if (data.type === "sensor") {
+            sensorPositions.push(pos);
+        } else if (data.type === "panel") {
+            const canon = toCanonicalPitch(data.pitch);
+            if (!PITCH_TO_FILE[canon]) continue; // 2D版と同じ「対応画像が無ければ描かない」ガード
+            if (!panelPositionsByPitch[canon]) panelPositionsByPitch[canon] = [];
+            panelPositionsByPitch[canon].push(pos);
+        }
+    }
+
+    assemblyRailMesh = buildAssemblyInstancedMesh(railPositions, assemblyUnitBoxGeometry, assemblyRailMaterial, 1, 0.2, 1, 0);
+    assemblyScene.add(assemblyRailMesh);
+    assemblySensorMesh = buildAssemblyInstancedMesh(sensorPositions, assemblyUnitBoxGeometry, assemblySensorMaterial, 0.9, 0.25, 0.9, 0);
+    assemblyScene.add(assemblySensorMesh);
+    Object.entries(panelPositionsByPitch).forEach(([pitch, positions]) => {
+        const mesh = buildAssemblyInstancedMesh(positions, assemblyUnitBoxGeometry, getAssemblyPanelMaterials(pitch), 0.95, 0.15, 0.95, rotY);
+        assemblyPanelMeshes[pitch] = mesh;
+        assemblyScene.add(mesh);
+    });
+
+    // 3層を視覚的に伝える床グリッド（半透明の板は重なった面同士の深度ソート問題があるため
+    // 使わず、不透明な線だけのGridHelperにする）
+    const gridSize = Math.max(extent.maxX - extent.minX, extent.maxY - extent.minY) + 4;
+    [-1, 0, 1].forEach(layer => {
+        const helper = new THREE.GridHelper(gridSize * ASSEMBLY_CELL_SIZE, gridSize, 0xaaaaaa, 0xd8d8d8);
+        helper.position.y = layer * ASSEMBLY_LAYER_HEIGHT - 0.15;
+        helper.visible = assemblyGridVisible; // #assemblyGridToggleBtnでの設定を再構築後も保つ
+        assemblyScene.add(helper);
+        assemblyLayerGrids.push(helper);
+    });
+
+    if (!assemblyCameraFramed) {
+        frameAssemblyCamera(extent);
+        assemblyCameraFramed = true;
+    }
+}
+
+// 内容の大きさに合わせてカメラの初期位置・ズーム範囲を決める。初回ビルド時のみ呼ばれる
+// （毎回呼ぶと編集のたびにユーザーがせっかく回転させた視点がリセットされてしまうため）
+function frameAssemblyCamera(extent) {
+    const gridW = (extent.maxX - extent.minX + 1) * ASSEMBLY_CELL_SIZE;
+    const gridH = (extent.maxY - extent.minY + 1) * ASSEMBLY_CELL_SIZE;
+    const footprint = Math.max(gridW, gridH, 4);
+    const dist = footprint * 1.1 + ASSEMBLY_LAYER_HEIGHT * 2;
+
+    assemblyCamera.position.set(dist * 0.7, dist * 0.6, dist * 0.7);
+    assemblyControls.target.set(0, 0, 0);
+    assemblyControls.minDistance = Math.max(3, footprint * 0.15);
+    assemblyControls.maxDistance = footprint * 4 + 40;
+    assemblyControls.update();
+}
+
+function startAssemblyRenderLoop() {
+    if (assemblyAnimFrameId !== null) return;
+    const tick = () => {
+        assemblyAnimFrameId = requestAnimationFrame(tick);
+        assemblyControls.update();
+        assemblyRenderer.render(assemblyScene, assemblyCamera);
+    };
+    tick();
+}
+
+function stopAssemblyRenderLoop() {
+    if (assemblyAnimFrameId !== null) cancelAnimationFrame(assemblyAnimFrameId);
+    assemblyAnimFrameId = null;
+}
+
+// #assemblyAreaWrapperの実際の表示サイズにrenderer/cameraを合わせる。
+// #assemblyCanvasのheight:100%が効くには親に明確な高さ（min-heightではなくheight）が
+// 要るため、updateContentAreaMinHeights()と同じ「ヘッダー等を除いた残り高さ」の考え方で
+// ここではheightを直接指定する
+function resizeAssemblyRenderer() {
+    if (!assemblySceneReady) return;
+    const wrapper = document.getElementById("assemblyAreaWrapper");
+    if (!wrapper) return;
+    const docTop = wrapper.getBoundingClientRect().top + window.scrollY;
+    wrapper.style.height = `${Math.max(window.innerHeight - docTop, 100)}px`;
+
+    const w = wrapper.clientWidth, h = wrapper.clientHeight;
+    if (w === 0 || h === 0) return;
+    assemblyRenderer.setSize(w, h, false);
+    assemblyCamera.aspect = w / h;
+    assemblyCamera.updateProjectionMatrix();
+    if (assemblyAnimFrameId !== null) assemblyRenderer.render(assemblyScene, assemblyCamera);
+}
+
+// 組み立てプレビュータブのエントリポイント。タブ切り替え時・曲やマップ設定の変更時に
+// 呼ばれる（renderMap()と同じ立ち位置）
+function renderAssemblyPreview() {
+    ensureThreeLoaded(() => {
+        initAssemblyScene();
+        resizeAssemblyRenderer();
+        rebuildAssemblyMeshes();
+        startAssemblyRenderLoop();
+    });
+}
+
+// 曲やマップ設定の変更のたびに、今見えているのがマップ/並べて/組み立てプレビューの
+// どれであっても、そのタブだけを再描画する共通ヘルパー（2Dマップ側は元々
+// 「if (activeTab === "map" || activeTab === "both") renderMap();」を編集のたびに
+// 個別に書いていたが、組み立てプレビューでも同じことが必要になったためまとめた）
+function refreshMapAndAssemblyIfVisible() {
+    if (activeTab === "map" || activeTab === "both") renderMap();
+    if (activeTab === "assembly") renderAssemblyPreview();
+}
+
 // マップ上の選択ハイライト（.mapSelectionOverlay）を描き直す。renderMap()の全再構築を
 // 経由しない軽量な処理なので、ドラッグ中のライブプレビュー表示にも使える。
 // previewSetを渡すとそちらを優先表示し（ドラッグ中の暫定選択）、省略時はselectedMeasuresを使う。
@@ -3024,7 +3342,7 @@ function undo() {
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
-    if (activeTab === "map" || activeTab === "both") renderMap();
+    refreshMapAndAssemblyIfVisible();
     rescheduleFromCurrentPosition();
     showToast("元に戻しました", "fa-rotate-left");
 }
@@ -3038,7 +3356,7 @@ function redo() {
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
-    if (activeTab === "map" || activeTab === "both") renderMap();
+    refreshMapAndAssemblyIfVisible();
     rescheduleFromCurrentPosition();
     showToast("やり直しました", "fa-rotate-right");
 }
@@ -3887,7 +4205,7 @@ function setupDeleteButtons() {
             renderScore();
             setupDeleteButtons();
             setupInsertButtons();
-            if (activeTab === "map" || activeTab === "both") renderMap();
+            refreshMapAndAssemblyIfVisible();
             rescheduleFromCurrentPosition();
         });
 
@@ -3941,7 +4259,7 @@ function setupInsertButtons() {
             renderScore();
             setupDeleteButtons();
             setupInsertButtons();
-            if (activeTab === "map" || activeTab === "both") renderMap();
+            refreshMapAndAssemblyIfVisible();
             rescheduleFromCurrentPosition();
         });
 
@@ -4669,6 +4987,11 @@ function reflowForDrawerToggle() {
     // window resizeハンドラも元々renderMap()を呼んでおらず、この関数だけ取り残されていた）。
     // 選択ハイライト・リサイズハンドル・コーナーオーバーレイもcanvas/wrapper基準の
     // 相対位置で決まるため、wrapper自体がCSSで押しやられるだけなら自動的に追従する
+
+    // 組み立てプレビューは2Dマップと違い、renderer/カメラのアスペクト比がラッパーの
+    // 実サイズに直接依存するカメラ駆動ビューポートなので、ドロワー開閉でも明示的に
+    // リサイズが必要（window resizeイベントはドロワー開閉では発火しないため）
+    if (activeTab === "assembly") resizeAssemblyRenderer();
 }
 
 function setDrawerOpen(open) {
@@ -5038,7 +5361,7 @@ function updateZoom(newScale) {
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
-    if (activeTab === "map" || activeTab === "both") renderMap();
+    refreshMapAndAssemblyIfVisible();
     if (playState !== "stopped") {
         rebuildNoteTimeMap();
     }
@@ -5069,7 +5392,7 @@ function cutSelectedMeasures() {
     setupDeleteButtons();
     setupInsertButtons();
     updateClipboardButtons();
-    if (activeTab === "map" || activeTab === "both") renderMap();
+    refreshMapAndAssemblyIfVisible();
     rescheduleFromCurrentPosition();
 }
 
@@ -5089,7 +5412,7 @@ function pasteSelectedMeasures() {
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
-    if (activeTab === "map" || activeTab === "both") renderMap();
+    refreshMapAndAssemblyIfVisible();
     rescheduleFromCurrentPosition();
 }
 
@@ -5131,7 +5454,7 @@ function deleteSelectedMeasures() {
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
-    if (activeTab === "map" || activeTab === "both") renderMap();
+    refreshMapAndAssemblyIfVisible();
     rescheduleFromCurrentPosition();
 }
 
@@ -5426,7 +5749,7 @@ function applyLoadedScore({ score: loadedScore, title, bpm, northDirection: load
     }
     if (loadedNorthDirection != null) {
         northDirection = loadedNorthDirection;
-        document.getElementById("compassLabel").textContent = COMPASS_LABELS[northDirection];
+        updateCompassLabels();
     }
     if (loadedMapSettings) {
         Object.assign(mapSettings, loadedMapSettings);
@@ -5444,7 +5767,7 @@ function applyLoadedScore({ score: loadedScore, title, bpm, northDirection: load
     renderScore();
     setupDeleteButtons();
     setupInsertButtons();
-    if (activeTab === "map" || activeTab === "both") renderMap();
+    refreshMapAndAssemblyIfVisible();
 }
 
 async function main() {
@@ -5493,7 +5816,7 @@ async function main() {
     }
     if (data.northDirection != null) {
         northDirection = data.northDirection;
-        document.getElementById("compassLabel").textContent = COMPASS_LABELS[northDirection];
+        updateCompassLabels();
     }
     if (data.mapSettings) {
         Object.assign(mapSettings, data.mapSettings);
@@ -5508,7 +5831,7 @@ async function main() {
     setupDeleteButtons();
     setupInsertButtons();
     // localStorageに保存されたタブが「五線譜」以外の場合、そのタブの中身も初期描画する
-    if (activeTab === "map" || activeTab === "both") renderMap();
+    refreshMapAndAssemblyIfVisible();
     setupGlobalEvents(); // document/wrapperイベントは一度だけ登録
     setupMapResizeHandle();
     setupBothTabDivider();
@@ -5565,7 +5888,7 @@ async function main() {
             score.keySignature = e.target.value;
             saveHistory();
             renderScore();
-            if (activeTab === "map" || activeTab === "both") renderMap();
+            refreshMapAndAssemblyIfVisible();
         });
 
     document.getElementById("transposeUp")
@@ -5574,7 +5897,7 @@ async function main() {
             updateKeySignatureUI();
             saveHistory();
             renderScore();
-            if (activeTab === "map" || activeTab === "both") renderMap();
+            refreshMapAndAssemblyIfVisible();
             rescheduleFromCurrentPosition();
         });
     document.getElementById("transposeDown")
@@ -5583,7 +5906,7 @@ async function main() {
             updateKeySignatureUI();
             saveHistory();
             renderScore();
-            if (activeTab === "map" || activeTab === "both") renderMap();
+            refreshMapAndAssemblyIfVisible();
             rescheduleFromCurrentPosition();
         });
 
@@ -5664,6 +5987,7 @@ async function main() {
         setupDeleteButtons();
         setupInsertButtons();
         updateAbLoopStripGeometry();
+        if (activeTab === "assembly") resizeAssemblyRenderer();
     });
 
     document.getElementById("addMeasureBtn")
@@ -5677,7 +6001,7 @@ async function main() {
             setupDeleteButtons();
             setupInsertButtons();
             window.scrollTo(0, scrollY);
-            if (activeTab === "map" || activeTab === "both") renderMap();
+            refreshMapAndAssemblyIfVisible();
             rescheduleFromCurrentPosition();
         });
 
@@ -5747,13 +6071,30 @@ async function main() {
             updateZoom(parseFloat(e.target.value));
         });
 
-    document.getElementById("compassBtn")
-        .addEventListener("click", () => {
-            northDirection = (northDirection + 1) % 4;
-            document.getElementById("compassLabel").textContent = COMPASS_LABELS[northDirection];
-            updateCountsBar();
-            if (activeTab === "map" || activeTab === "both") renderMap();
+    function toggleNorthDirection() {
+        northDirection = (northDirection + 1) % 4;
+        updateCompassLabels();
+        updateCountsBar();
+        refreshMapAndAssemblyIfVisible();
+    }
+    document.getElementById("compassBtn")?.addEventListener("click", toggleNorthDirection);
+    document.getElementById("assemblyCompassBtn")?.addEventListener("click", toggleNorthDirection);
+
+    // 組み立てプレビューのグリッド線ON/OFF
+    const assemblyGridToggleBtn = document.getElementById("assemblyGridToggleBtn");
+    if (assemblyGridToggleBtn) {
+        const applyAssemblyGridToggleStyle = () => {
+            const icon = assemblyGridToggleBtn.querySelector("i");
+            if (icon) icon.style.color = assemblyGridVisible ? "#4a6cf7" : "#ccc";
+        };
+        applyAssemblyGridToggleStyle();
+        assemblyGridToggleBtn.addEventListener("click", () => {
+            assemblyGridVisible = !assemblyGridVisible;
+            assemblyLayerGrids.forEach(g => { g.visible = assemblyGridVisible; });
+            applyAssemblyGridToggleStyle();
+            if (assemblyRenderer && assemblyCamera) assemblyRenderer.render(assemblyScene, assemblyCamera);
         });
+    }
 
     document.getElementById("newScoreBtn")
         .addEventListener("click", () => openNewScoreModal());
@@ -5795,7 +6136,7 @@ async function main() {
             renderScore();
             setupDeleteButtons();
             setupInsertButtons();
-            if (activeTab === "map" || activeTab === "both") renderMap();
+            refreshMapAndAssemblyIfVisible();
             closeNewScoreModal();
         });
 
