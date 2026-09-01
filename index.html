@@ -1086,15 +1086,22 @@
         }
         #bothTabContainer.bothTabActive.layout-left-right > #scoreWrapper,
         #bothTabContainer.bothTabActive.layout-left-right > #mapAreaWrapper,
+        #bothTabContainer.bothTabActive.layout-left-right > #assemblyAreaWrapper,
         #bothTabContainer.bothTabActive.layout-left-right > #bothTabDivider,
         #bothTabContainer.bothTabActive.layout-right-left > #scoreWrapper,
         #bothTabContainer.bothTabActive.layout-right-left > #mapAreaWrapper,
+        #bothTabContainer.bothTabActive.layout-right-left > #assemblyAreaWrapper,
         #bothTabContainer.bothTabActive.layout-right-left > #bothTabDivider {
             grid-row: 1;
         }
         #bothTabContainer.bothTabActive.layout-left-right > #scoreWrapper { grid-column: 1; }
-        #bothTabContainer.bothTabActive.layout-left-right > #mapAreaWrapper { grid-column: 3; }
-        #bothTabContainer.bothTabActive.layout-right-left > #mapAreaWrapper { grid-column: 1; }
+        /* マップ(2D)とプレビュー(3D)は同じマップタブ内の表示モード違いのため、
+           「並べて」タブでも同じ列（右側/左側）を共有する。片方しか表示されない
+           （どちらもmapViewModeで排他的にdisplay:none/flexが切り替わる）ので問題ない */
+        #bothTabContainer.bothTabActive.layout-left-right > #mapAreaWrapper,
+        #bothTabContainer.bothTabActive.layout-left-right > #assemblyAreaWrapper { grid-column: 3; }
+        #bothTabContainer.bothTabActive.layout-right-left > #mapAreaWrapper,
+        #bothTabContainer.bothTabActive.layout-right-left > #assemblyAreaWrapper { grid-column: 1; }
         #bothTabContainer.bothTabActive.layout-right-left > #scoreWrapper { grid-column: 3; }
         #bothTabContainer.bothTabActive > #bothTabDivider {
             grid-column: 2;
@@ -1105,6 +1112,13 @@
             min-width: 0;
             min-height: 0;
             overflow: auto;
+        }
+        /* プレビュー(3D)はThree.jsのカメラ駆動ビューポートで内容がスクロールする類のものでは
+           ないため、overflow:autoにはせず#assemblyAreaWrapper自身のoverflow:hiddenのままにする。
+           grid内で正しく縮む/伸びるためのmin-width/height:0だけ必要 */
+        #bothTabContainer.bothTabActive > #assemblyAreaWrapper {
+            min-width: 0;
+            min-height: 0;
         }
 
         /* 「並べて」タブでのみ表示する、五線譜/マップの幅比率を調整するための境界線。
@@ -1823,6 +1837,10 @@
 
         <div id="mapAreaWrapper" style="display:none;">
             <div id="mapCornerOverlay" style="display:none;">
+                <div class="toolbar map-view-mode-toggle">
+                    <button class="map-view-mode-btn text-btn" data-map-view-mode="2d" tabindex="-1" title="2Dマップ表示">2D</button>
+                    <button class="map-view-mode-btn text-btn" data-map-view-mode="3d" tabindex="-1" title="3Dプレビュー表示">3D</button>
+                </div>
                 <div id="mapCompassOverlay" class="toolbar">
                     <button id="compassBtn" tabindex="-1" title="北の向きを変える">
                         <i class="fa-solid fa-compass"></i>
@@ -1838,30 +1856,36 @@
                     </div>
                     <button id="mapLayerDown" tabindex="-1" title="下の層へ"><i class="fa-solid fa-chevron-down"></i></button>
                 </div>
+                <div class="toolbar">
+                    <button id="mapGridToggleBtn" tabindex="-1" title="グリッド線の表示/非表示"><i class="fa-solid fa-table-cells"></i></button>
+                </div>
             </div>
             <div id="mapArea"></div>
             <div id="mapResizeHandleRight" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
             <div id="mapResizeHandleBottom" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
             <div id="mapResizeHandleCorner" class="map-resize-handle" title="ドラッグしてマス数を変更"></div>
         </div>
-    </div>
 
-    <div id="assemblyAreaWrapper" style="display:none;">
-        <div id="assemblyHint">ドラッグで回転・スクロールでズーム（Shift/Ctrl+ドラッグで平行移動）</div>
-        <div id="assemblyCornerOverlay">
-            <div id="assemblyCompassOverlay" class="toolbar">
-                <button id="assemblyCompassBtn" tabindex="-1" title="北の向きを変える">
-                    <i class="fa-solid fa-compass"></i>
-                    <span id="assemblyCompassLabel" class="compass-label" style="font-size:12px; margin-left:2px;">N↑</span>
-                </button>
+        <div id="assemblyAreaWrapper" style="display:none;">
+            <div id="assemblyHint">ドラッグで回転・スクロールでズーム（Shift/Ctrl+ドラッグで平行移動）</div>
+            <div id="assemblyCornerOverlay">
+                <div class="toolbar map-view-mode-toggle">
+                    <button class="map-view-mode-btn text-btn" data-map-view-mode="2d" tabindex="-1" title="2Dマップ表示">2D</button>
+                    <button class="map-view-mode-btn text-btn" data-map-view-mode="3d" tabindex="-1" title="3Dプレビュー表示">3D</button>
+                </div>
+                <div id="assemblyCompassOverlay" class="toolbar">
+                    <button id="assemblyCompassBtn" tabindex="-1" title="北の向きを変える">
+                        <i class="fa-solid fa-compass"></i>
+                        <span id="assemblyCompassLabel" class="compass-label" style="font-size:12px; margin-left:2px;">N↑</span>
+                    </button>
+                </div>
+                <div class="toolbar">
+                    <button id="assemblyGridToggleBtn" tabindex="-1" title="グリッド線の表示/非表示"><i class="fa-solid fa-table-cells"></i></button>
+                </div>
             </div>
-            <div class="toolbar">
-                <button id="assemblyGridToggleBtn" tabindex="-1" title="グリッド線の表示/非表示"><i class="fa-solid fa-table-cells"></i></button>
-            </div>
+            <canvas id="assemblyCanvas"></canvas>
         </div>
-        <canvas id="assemblyCanvas"></canvas>
     </div>
-
 </div>
 
 <div id="playbackBar">
@@ -2046,8 +2070,17 @@
 <script type="module">
     import * as THREE from "three";
     import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    // 音符マットのふちの線を、通常のLineBasicMaterial（linewidthがほぼ全ブラウザで
+    // 無視され常に1pxになってしまうWebGLの既知の制約がある）ではなく、ピクセル単位で
+    // 太さを実際に制御できる「太い線」実装（fat lines）で描くために使う
+    import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
+    import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
+    import { LineMaterial } from "three/addons/lines/LineMaterial.js";
     window.THREE = THREE;
     window.OrbitControls = OrbitControls;
+    window.LineSegmentsGeometry = LineSegmentsGeometry;
+    window.LineSegments2 = LineSegments2;
+    window.LineMaterial = LineMaterial;
     window.dispatchEvent(new Event("three-ready"));
 </script>
 <script>

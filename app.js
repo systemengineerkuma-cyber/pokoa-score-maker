@@ -57,6 +57,10 @@ let animFrameId = null;
 let mapBeatPositions = [];
 let mapRailIsVertical = false;
 let mapRailCellSize = 0;
+// beatIndex -> [{px,py}]（現在表示中の層にある音符マットのセル左上、canvasローカル座標）。
+// 「トロッコ通過時に音符マットを凹ませる」演出（2D版）用、renderMap()のたびに作り直す
+let mapPanelPositionsByBeat = new Map();
+let mapGridVisible = true; // #mapGridToggleBtnで切り替える、renderMap()を跨いで保持する（3Dプレビュー側のassemblyGridVisibleと対になる設定）
 
 // 小節範囲選択用の状態
 let selectedMeasures = new Set();
@@ -81,11 +85,27 @@ const TABS = [
     { id: "score",    label: "五線譜",           icon: "fa-music" },
     { id: "map",      label: "マップ",            icon: "fa-map" },
     { id: "both",     label: "並べて",            icon: "fa-table-columns" },
-    { id: "assembly", label: "プレビュー",         icon: "fa-cube" },
 ];
 let activeTab = localStorage.getItem("activeTab") || "score";
-// 廃止済みタブ（例: 旧パネル楽譜タブ）がlocalStorageに残っていた場合のフォールバック
+// 廃止済みタブ（例: 旧パネル楽譜タブ・独立していた頃の「プレビュー」タブ）が
+// localStorageに残っていた場合のフォールバック
 if (!TABS.some(t => t.id === activeTab)) activeTab = "score";
+
+// マップタブ内での表示モード（2Dマップ / 3Dプレビュー）。マップ単体タブ・「並べて」タブの
+// どちらでも切り替えられる（「マップタブ内で、2Dと3Dを変えられるようにする」との依頼で、
+// 独立した「プレビュー」タブを廃止しマップタブに統合した際に導入。当初は「並べて」タブは
+// 2D固定としていたが、直後に「並べてタブでも、2D3Dボタンはいる」との追加依頼で「並べて」でも
+// 切り替えられるよう拡張した）
+let mapViewMode = localStorage.getItem("mapViewMode") || "2d";
+if (mapViewMode !== "2d" && mapViewMode !== "3d") mapViewMode = "2d";
+// マップエリア（マップタブ・「並べて」タブどちらでも）が3Dプレビュー表示中かどうか
+// （旧`activeTab === "assembly"`相当の判定）
+function isAssemblyActive() {
+    return (activeTab === "map" || activeTab === "both") && mapViewMode === "3d";
+}
+function isMap2DActive() {
+    return (activeTab === "map" || activeTab === "both") && mapViewMode === "2d";
+}
 
 // 「両方」タブ（五線譜+マップ同時表示）のレイアウト。ボタンで左右2パターンをローテーション切替する
 // （上下2パターンは2026-08-04にユーザーの依頼で廃止済み。「レイアウトは左右だけでいいです」）
@@ -147,7 +167,7 @@ function rotateBothTabLayout() {
     // 実際の画面上の位置（列1の幅が変わるため）が動く。ここに含めないと、境界線・
     // 入れ替えボタンだけ即座に新しい位置へスナップし、五線譜/マップ本体がFLIPで
     // 追いつくまでの間、両者のタイミングがズレて見えてしまう
-    const flipEls = [document.getElementById("scoreWrapper"), document.getElementById("mapAreaWrapper"), document.getElementById("bothTabDivider")]
+    const flipEls = [document.getElementById("scoreWrapper"), document.getElementById("mapAreaWrapper"), document.getElementById("assemblyAreaWrapper"), document.getElementById("bothTabDivider")]
         .filter(Boolean);
     const firstRects = new Map(flipEls.map(el => [el, el.getBoundingClientRect()]));
 
@@ -248,7 +268,7 @@ function updateContentAreaMinHeights() {
     const docTop = container.getBoundingClientRect().top + window.scrollY;
     const available = Math.max(window.innerHeight - docTop, 100) + "px";
     scoreWrapper.style.minHeight = activeTab === "score" ? available : "";
-    mapArea.style.minHeight = activeTab === "map" ? available : "";
+    mapArea.style.minHeight = (activeTab === "map" && mapViewMode === "2d") ? available : "";
 }
 
 function getAudioContext() {
@@ -343,6 +363,54 @@ function getMapPanelImage(pitch) {
     return MAP_PANEL_IMAGES[toCanonicalPitch(pitch)] || null;
 }
 
+// 音符マットの「マット」な見た目（brightness/saturateを効かせた版）のキャッシュ。
+// ctx.filterを描画のたび（マス×フレームごと）に適用すると非常に重く
+// （実測でユーザーから「2Dの処理が激重」との報告あり。Chromiumのcanvas filterは
+// 通常のdrawImageよりずっとコストが高い）、ピッチの種類数（26種）分だけ
+// オフスクリーンcanvasへ1回だけ焼き込んでおけば、以降は素のdrawImageで済む
+const MAP_PANEL_FILTERED_IMAGES = {};
+const MAP_PANEL_MATTE_FILTER = "brightness(0.9) saturate(0.92)";
+
+function getMapPanelFilteredImage(pitch) {
+    const key = toCanonicalPitch(pitch);
+    const cached = MAP_PANEL_FILTERED_IMAGES[key];
+    if (cached) return cached;
+    const img = MAP_PANEL_IMAGES[key];
+    if (!img || !img.complete || img.naturalWidth === 0) return null;
+    const off = document.createElement("canvas");
+    off.width = img.naturalWidth;
+    off.height = img.naturalHeight;
+    const offCtx = off.getContext("2d");
+    offCtx.filter = MAP_PANEL_MATTE_FILTER;
+    offCtx.drawImage(img, 0, 0);
+    MAP_PANEL_FILTERED_IMAGES[key] = off;
+    return off;
+}
+
+// 3Dプレビュー用: 音符マットの色味を少し濃く（彩度を上げる）した版のキャッシュ。
+// 「3Dの音符マットをもう少し色味を濃くしたい」との依頼に対応。2Dの「マット化」
+// （brightness/saturateを下げる）とは逆方向・別用途で、元の生画像（MAP_PANEL_IMAGES）
+// を基準にする。ctx.filterを毎フレーム適用すると重い（2D側で実測済みの教訓）ため、
+// 同じくオフスクリーンへ1回だけ焼き込んでキャッシュする
+const MAP_PANEL_VIVID_IMAGES = {};
+const MAP_PANEL_VIVID_FILTER = "saturate(1.35)";
+
+function getMapPanelVividImage(pitch) {
+    const key = toCanonicalPitch(pitch);
+    const cached = MAP_PANEL_VIVID_IMAGES[key];
+    if (cached) return cached;
+    const img = MAP_PANEL_IMAGES[key];
+    if (!img || !img.complete || img.naturalWidth === 0) return null;
+    const off = document.createElement("canvas");
+    off.width = img.naturalWidth;
+    off.height = img.naturalHeight;
+    const offCtx = off.getContext("2d");
+    offCtx.filter = MAP_PANEL_VIVID_FILTER;
+    offCtx.drawImage(img, 0, 0);
+    MAP_PANEL_VIVID_IMAGES[key] = off;
+    return off;
+}
+
 // 起動直後、複数の画像がほぼ同時に読み込み完了することが多いため、1枚読み込むごとに
 // 都度キャンバス全体を再描画するのではなく、1フレームにまとめて1回だけ再描画する
 let mapImageRedrawScheduled = false;
@@ -351,7 +419,7 @@ function scheduleMapPanelRedraw() {
     mapImageRedrawScheduled = true;
     requestAnimationFrame(() => {
         mapImageRedrawScheduled = false;
-        if ((activeTab === "map" || activeTab === "both") && mapRenderState) drawMapCanvas(mapRenderState);
+        if (((activeTab === "map" && mapViewMode === "2d") || activeTab === "both") && mapRenderState) drawMapCanvas(mapRenderState);
     });
 }
 
@@ -582,6 +650,16 @@ function rescheduleFromCurrentPosition() {
 
     const resumeMeasureIndex = currentMeasureEntry.measureIndex;
     const resumeMeasureStartTimeOverride = currentMeasureEntry.startTime;
+
+    // 現在の再生位置が、有効なA-Bループ区間のAより手前になっている場合（例: 区間外を
+    // 再生中にABトグルをONにした、区間を今の再生位置より後ろへドラッグし直した等）、
+    // そのまま続けると区間外（Aより前）を鳴らし続けてしまう。その場合は素直に続きを
+    // 敷き直すのではなく、区間の先頭（A）へ直接ジャンプし直す
+    const { startMeasureIndex: rangeStart } = getPlaybackRangeMeasures();
+    if (resumeMeasureIndex < rangeStart) {
+        restartPlaybackFromMeasure(rangeStart);
+        return;
+    }
 
     // 上段・下段それぞれ独立に「今鳴っている音符」を見つけ、その直後から続きを敷き直す
     // （見つからなければ、その段はこの小節をもう鳴らし終えているので小節の頭から再開する）
@@ -925,12 +1003,22 @@ function setupAbLoopHandle(handle, which) {
         dragging = false;
         if (!abLoopRange) return;
         updateSeekBar();
-        // Aを動かした場合だけ、練習中に今聴いている位置を新しいAへ合わせる
-        // （Bを動かした場合は、次のループの折り返し地点が変わるだけで十分なので
-        // 再生位置をジャンプさせない）。一時停止中も、再開時に古いスケジュールの
-        // ままだと新しいAより前（旧区間側）が鳴ってしまうため、playing同様に組み直す
-        if (which === "start" && (playState === "playing" || playState === "paused")) {
-            restartPlaybackFromMeasure(abLoopRange.startMeasureIndex);
+        // ABがOFFの間はA/Bを動かしても再生には一切影響しないはず（区間はまだ効いていない）
+        // なので、どちらの分岐もabLoopEnabledの時だけ実行する
+        if (abLoopEnabled && (playState === "playing" || playState === "paused")) {
+            if (which === "start") {
+                // Aを動かした場合、練習中に今聴いている位置を新しいAへ合わせる。
+                // 一時停止中も、再開時に古いスケジュールのままだと新しいAより前
+                // （旧区間側）が鳴ってしまうため、playing同様に組み直す
+                restartPlaybackFromMeasure(abLoopRange.startMeasureIndex);
+            } else {
+                // Bを動かした場合は再生位置をジャンプさせる必要は無いが、そのままだと
+                // 「今の再生位置が既に新しいBより後ろ」というケース（区間を今より手前へ
+                // 縮めた場合）で、区間外（Bより後ろ）を鳴らし続けてしまう。
+                // rescheduleFromCurrentPosition()が新しいB以降のスケジュールを
+                // 打ち切ってくれる（現在鳴っている音符はそのまま鳴らし切ったうえで）
+                rescheduleFromCurrentPosition();
+            }
         }
     });
 }
@@ -1061,11 +1149,52 @@ function drawMapPlayLine(beatIndex, t) {
     wrapper.appendChild(line);
 }
 
+// 2Dマップ版の「トロッコ通過時に音符マットを凹ませる」演出。3D版
+// （setAssemblyPanelPressed）と同じ発想だがcanvasを再描画するのではなく、
+// drawMapPlayLineと同じ「#mapAreaWrapperに重ねるDOM要素」方式にする（canvas全体を
+// 毎フレーム再描画するのは長い曲で重くなるため避けたい）。凹み自体はCSSの
+// inset box-shadowで表現し、暖色の半透明の帯を重ねて3D版の発光演出に寄せている
+function updateMapPanelPressOverlays(beatIndex) {
+    document.querySelectorAll(".mapPanelPressOverlay").forEach(el => el.remove());
+    if (beatIndex == null) return;
+    const positions = mapPanelPositionsByBeat.get(beatIndex);
+    if (!positions || !positions.length) return;
+
+    const canvas = document.getElementById("mapGrid");
+    const wrapper = document.getElementById("mapAreaWrapper");
+    if (!canvas || !wrapper) return;
+    const canvasRect = canvas.getBoundingClientRect();
+    const wrapperRect = wrapper.getBoundingClientRect();
+    const offsetX = canvasRect.left - wrapperRect.left + wrapper.scrollLeft;
+    const offsetY = canvasRect.top - wrapperRect.top + wrapper.scrollTop;
+    const size = mapRailCellSize;
+    const shadowSize = Math.max(3, size * 0.22);
+
+    positions.forEach(({ px, py }) => {
+        const overlay = document.createElement("div");
+        overlay.className = "mapPanelPressOverlay";
+        overlay.style.cssText = `
+            position: absolute;
+            left: ${px + offsetX}px;
+            top: ${py + offsetY}px;
+            width: ${size}px;
+            height: ${size}px;
+            border-radius: 3px;
+            background: rgba(255, 176, 40, 0.45);
+            box-shadow: inset 0 ${shadowSize}px ${shadowSize * 1.3}px rgba(0,0,0,0.55);
+            pointer-events: none;
+            z-index: 7;
+        `;
+        wrapper.appendChild(overlay);
+    });
+}
+
 // 2Dマップ・プレビュー(3D)どちらでも再生中のトロッコ位置を表示する共通ヘルパー。
 // updateAssemblyPlayMarker()はプレビュー用のThree.jsシーンがまだ無い（一度もタブを
 // 開いていない）場合は内部で何もしない
 function updatePlaybackMarkers(beatIndex, t = 0) {
     drawMapPlayLine(beatIndex, t);
+    updateMapPanelPressOverlays(beatIndex);
     updateAssemblyPlayMarker(beatIndex, t);
 }
 
@@ -1408,7 +1537,10 @@ const SCORE_ONLY_TOOLBAR_IDS = [
 function applyTabVisibility() {
     const isBoth    = activeTab === "both";
     const showScore = activeTab === "score" || isBoth;
-    const showMap   = activeTab === "map"   || isBoth;
+    // マップ単体タブ・「並べて」タブのどちらでも、mapViewModeに応じて2D/3Dが排他的に見える
+    const showMap2D = isMap2DActive();
+    const showMap3D = isAssemblyActive();
+    const showMap   = showMap2D || showMap3D;
 
     // 「両方」タブの時だけ、五線譜/マップを均等2分割するgridレイアウトを有効にするクラス。
     // 単体タブ表示（子は1つだけ表示）にはこのレイアウトを適用しない
@@ -1424,7 +1556,7 @@ function applyTabVisibility() {
     // マップエリア（リサイズハンドルも含むラッパーごと表示切替）
     const mapAreaWrapper = document.getElementById("mapAreaWrapper");
     if (mapAreaWrapper) {
-        mapAreaWrapper.style.display = showMap ? "" : "none";
+        mapAreaWrapper.style.display = showMap2D ? "" : "none";
         mapAreaWrapper.style.marginTop = "0";
     }
 
@@ -1434,12 +1566,23 @@ function applyTabVisibility() {
 
     // 組み立てプレビュー（Three.js）エリア
     const assemblyAreaWrapper = document.getElementById("assemblyAreaWrapper");
-    if (assemblyAreaWrapper) assemblyAreaWrapper.style.display = activeTab === "assembly" ? "" : "none";
+    if (assemblyAreaWrapper) assemblyAreaWrapper.style.display = showMap3D ? "" : "none";
+
+    // マップエリア内（2D/3Dどちらでも同じ画面位置）に置く2D/3D切替。
+    // どちらのコピー（#mapAreaWrapper内・#assemblyAreaWrapper内）も、今はそれぞれの親と
+    // 全く同じ条件（showMap2D/showMap3D）で表示すればよいので、親のdisplay切替に任せて
+    // 個別のdisplay制御はしない
+    // ボタンの選択状態はDOM上に2組（2D用エリア内・3D用エリア内）あるので両方まとめて更新する
+    document.querySelectorAll(".map-view-mode-btn").forEach(btn => {
+        const active = btn.dataset.mapViewMode === mapViewMode;
+        btn.style.color = active ? "#3451d1" : "#767676";
+        btn.style.background = active ? "#eaefff" : "";
+    });
 
     // コンパス・「表示する層」ボタンは、マップ専用ツールバーではなく音符マットエリア上に
-    // 浮かせて表示する独立したオーバーレイなので、別途表示切替する
+    // 浮かせて表示する独立したオーバーレイなので、別途表示切替する（2Dマップ専用）
     const mapCornerOverlay = document.getElementById("mapCornerOverlay");
-    if (mapCornerOverlay) mapCornerOverlay.style.display = showMap ? "flex" : "none";
+    if (mapCornerOverlay) mapCornerOverlay.style.display = showMap2D ? "flex" : "none";
 
     // 五線譜タブのみで使うツールバー。表示する場合はinline style自体を外し、
     // CSS側のdisplay指定（.toolbarのflex）をそのまま活かす
@@ -1495,6 +1638,9 @@ function switchTab(tabId) {
         return;
     }
     const previousTab = activeTab;
+    // previousTabの時点でassembly(3D)が見えていたかどうかは、activeTabを書き換える前に
+    // 判定しておく必要がある（isAssemblyActive()は現在のactiveTabを見るため）
+    const wasAssemblyActive = isAssemblyActive();
     activeTab = tabId;
     localStorage.setItem("activeTab", activeTab);
     applyTabVisibility();
@@ -1506,15 +1652,18 @@ function switchTab(tabId) {
         setupDeleteButtons();
         setupInsertButtons();
     }
-    if (activeTab === "map" || activeTab === "both") {
+    if (isMap2DActive()) {
         renderMap();
     }
-    if (activeTab === "assembly") {
+    if (isAssemblyActive()) {
         renderAssemblyPreview();
     }
-    // 組み立てプレビューから離れる時は、見えていない間ムダにフレームを描き続けないよう
-    // レンダーループを止める（戻ってきた時はrenderAssemblyPreview()が再開する）
-    if (previousTab === "assembly" && activeTab !== "assembly") {
+    // 組み立てプレビュー（マップタブ・「並べて」タブのどちらかで3Dモード）から完全に離れる時は、
+    // 見えていない間ムダにフレームを描き続けないようレンダーループを止める（戻ってきた時は
+    // renderAssemblyPreview()が再開する）。マップ⇔並べての間を3Dモードのまま行き来した場合は
+    // 引き続き見えているので止めない（マップタブ内のモード切替自体はsetMapViewMode()側で
+    // 同様の処理をしている）
+    if (wasAssemblyActive && !isAssemblyActive()) {
         stopAssemblyRenderLoop();
     }
     playTabSwitchAnimation();
@@ -1883,6 +2032,10 @@ function buildMapGrid() {
                 beatNum: beatIdx + 1,
                 direction: railDirection,
                 measureIndex: beat.measureIndex,
+                // レール中心から見てこのセンサーが外側へ向かう方向（awayVecと同じ、
+                // 音符マットの配置にも使っている値）。マス内でセンサーをレールから
+                // 少し遠ざける表示に使う（drawMapCell/rebuildAssemblyMeshes参照）
+                awayVec,
             });
         }
 
@@ -1903,6 +2056,9 @@ function buildMapGrid() {
                     pitch,
                     direction: northDirection,
                     measureIndex: beat.measureIndex,
+                    // 3Dプレビューで「トロッコ通過時に音符マットを凹ませる」演出のため、
+                    // このマットがどのビートで鳴るかを持たせる（updateAssemblyPlayMarker参照）
+                    beatIndex: beatIdx,
                 });
                 markExtent(px, py);
             });
@@ -2276,11 +2432,12 @@ function renderMap() {
             if (handle) handle.style.display = "none";
         });
         mapBeatPositions = [];
+        mapPanelPositionsByBeat = new Map();
         mapRenderState = null;
         // 以前はgridDiv（canvas化前は#mapGrid自身）ごと消えていたので暗黙に片付いていたが、
         // 選択ハイライト/再生マーカーは今は#mapAreaWrapperの子として存在するため、
         // ここで明示的に消さないと空スコアに切り替えても残骸が浮いたままになる
-        document.querySelectorAll(".mapSelectionOverlay, .mapPlayLine").forEach(el => el.remove());
+        document.querySelectorAll(".mapSelectionOverlay, .mapPlayLine, .mapPanelPressOverlay").forEach(el => el.remove());
         updateCountsBar();
         return;
     }
@@ -2318,6 +2475,20 @@ function renderMap() {
 
     // 表示する層（中間層/上位層/下位層）に応じたzを選ぶ
     const z = MAP_LAYER_Z[mapSettings.activeLayer] ?? 0;
+
+    // 「トロッコ通過時に音符マットを凹ませる」演出（2D版）用に、現在表示中の層にある
+    // 音符マットのセル位置をbeatIndexごとにまとめておく（3D版のassemblyPanelInstancesByBeatと
+    // 同じ発想）。和音の場合は1つのbeatIndexに複数マスが対応する
+    mapPanelPositionsByBeat = new Map();
+    for (const [key, data] of grid) {
+        if (data.type !== "panel") continue;
+        const parts = key.split(",").map(Number);
+        if (parts[2] !== z) continue;
+        const px = (parts[0] - minX) * cellSize;
+        const py = (parts[1] - minY) * cellSize;
+        if (!mapPanelPositionsByBeat.has(data.beatIndex)) mapPanelPositionsByBeat.set(data.beatIndex, []);
+        mapPanelPositionsByBeat.get(data.beatIndex).push({ px, py });
+    }
 
     // マス数ぶんのDOM要素を毎回作り直す代わりに、1枚のcanvasにピクセルとして描く
     // （長い曲ではマス数が数万に達し、DOM生成コストがタブ切り替え等のもたつきの
@@ -2409,6 +2580,8 @@ function drawMapCanvas(state) {
     // 罫線は1マスごとにstroke()を呼ぶと（マス数が多い時に）呼び出し回数自体がボトルネックに
     // なるため、全マス分の線分を1つのPath2Dにまとめておき、最後に1回だけstroke()する
     const borderPath = new Path2D();
+    // センサーの赤外線ビームは隣接マスをまたいで伸びるため、全マス描画後にまとめて上から描く
+    const sensorBeams = [];
 
     for (let gy = 0; gy < gridH; gy++) {
         for (let gx = 0; gx < gridW; gx++) {
@@ -2417,28 +2590,84 @@ function drawMapCanvas(state) {
             const data = grid.get(`${ax},${ay},${z}`);
             const ownWrapCoord = isVertical ? ax : ay;
             const isSeparator = isSepCoord(ownWrapCoord);
-            drawMapCell(ctx, borderPath, { px: gx * cellSize, py: gy * cellSize, cellSize, gx, gy, isSeparator, isVertical, data });
+            drawMapCell(ctx, borderPath, { px: gx * cellSize, py: gy * cellSize, cellSize, gx, gy, isSeparator, isVertical, data, sensorBeams });
         }
     }
 
-    ctx.strokeStyle = "#e0e0e0";
-    ctx.lineWidth = 1;
-    ctx.stroke(borderPath);
+    if (mapGridVisible) {
+        ctx.strokeStyle = "#e0e0e0";
+        ctx.lineWidth = 1;
+        ctx.stroke(borderPath);
+    }
 
+    drawMapSensorBeams(ctx, sensorBeams);
+
+    ctx.restore();
+}
+
+// センサーの、正方形のマスに対する長方形の比率（レールに直角な方向をSENSOR_CROSS_RATIO、
+// レールに沿う方向をSENSOR_ALONG_RATIOにすることで「レールに直角に伸びる方が長い」形にする）
+const SENSOR_CROSS_RATIO = 0.65;
+const SENSOR_ALONG_RATIO = 0.35;
+const SENSOR_AWAY_OFFSET_RATIO = 0.08; // レール（マス中心線）から外側へずらす量（セルサイズに対する比率）
+
+// センサーの「赤外線」ビーム。最初は2マス分の長さにしたが「自分のマスのみ」に
+// 変更してほしいとの依頼で、センサー自身のマスからはみ出さない長さにした。
+// センサーはSENSOR_AWAY_OFFSET_RATIOぶんレールから遠い側へずれているため、
+// センサーからレール側のマス端までの距離はちょうど0.5+SENSOR_AWAY_OFFSET_RATIOになる
+const SENSOR_BEAM_LENGTH_CELLS = 0.5 + SENSOR_AWAY_OFFSET_RATIO;
+function drawMapSensorBeams(ctx, beams) {
+    if (!beams.length) return;
+    ctx.save();
+    ctx.strokeStyle = "rgba(255, 40, 40, 0.55)";
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    beams.forEach(b => {
+        const len = b.cellSize * SENSOR_BEAM_LENGTH_CELLS;
+        ctx.moveTo(b.cx, b.cy);
+        ctx.lineTo(b.cx + b.dx * len, b.cy + b.dy * len);
+    });
+    ctx.stroke();
     ctx.restore();
 }
 
 // 1マス分の描画。区切りマスの罫線スキップロジックは元のDOM版（renderMap()旧実装）と
 // 一字一句同じ条件式を保っている。罫線はctx.stroke()を都度呼ばず、呼び出し元が持つ
 // 1本のPath2Dに線分を足しこむだけにする（drawMapCanvas()参照）
-function drawMapCell(ctx, borderPath, { px, py, cellSize, gx, gy, isSeparator, isVertical, data }) {
+function drawMapCell(ctx, borderPath, { px, py, cellSize, gx, gy, isSeparator, isVertical, data, sensorBeams }) {
     // --- 背景 ---
-    if (!isSeparator && data && data.type === "rail") {
-        drawMapGradientRect(ctx, px, py, cellSize, "rail");
-    } else if (!isSeparator && data && data.type === "sensor") {
-        drawMapGradientRect(ctx, px, py, cellSize, "sensor");
+    // レールは3Dプレビューと合わせた「細い黒レール2本＋幅広いグレーの横木（穴あき）」の
+    // 見た目にするため、単色の塗りつぶし背景は持たない（drawMapRailLine側で直接描く）
+    if (!isSeparator && data && data.type === "sensor") {
+        // センサーは正方形ではなく、レールに直角な方向へ長い長方形にする
+        // （「センサーを縦長に、レールに直角に伸びる方が長くなるように」との依頼）。
+        // isVerticalはレールが画面縦方向に伸びる設定かどうか（drawMapCanvas参照）で、
+        // その場合はレールに直角な画面横方向を長くする（＝isVerticalでない時は画面縦方向が長くなる）
+        const sensorCross = cellSize * SENSOR_CROSS_RATIO, sensorAlong = cellSize * SENSOR_ALONG_RATIO;
+        const sensorW = isVertical ? sensorCross : sensorAlong;
+        const sensorH = isVertical ? sensorAlong : sensorCross;
+        // 「センサーを枠の中で、レールから少し遠ざける」との依頼に対応。data.awayVecは
+        // レール中心から見てこのセンサーが外側へ向かう方向（buildMapGrid参照、音符マットの
+        // 配置にも使っている値と同じ）なので、その方向へマス内で少しずらす
+        const awayVec = data.awayVec || { dx: 0, dy: 0 };
+        const awayOffsetX = awayVec.dx * cellSize * SENSOR_AWAY_OFFSET_RATIO;
+        const awayOffsetY = awayVec.dy * cellSize * SENSOR_AWAY_OFFSET_RATIO;
+        drawMapGradientRect(
+            ctx, px + (cellSize - sensorW) / 2 + awayOffsetX, py + (cellSize - sensorH) / 2 + awayOffsetY,
+            sensorW, sensorH, "sensor"
+        );
+        // 「センサーからレールに向けて赤外線みたいなものを2マス分伸ばして」との依頼に対応。
+        // ここではまだ描かず、全マス描画後にまとめて描く（drawMapCanvas参照）。理由:
+        // ビームは隣接マスにまたがって伸びるため、この時点で描くと後から描かれる隣マスの
+        // 背景（白/グレー等）に上書きされて途中で消えてしまう
+        if (sensorBeams) {
+            sensorBeams.push({
+                cx: px + cellSize / 2, cy: py + cellSize / 2,
+                dx: -awayVec.dx, dy: -awayVec.dy, cellSize,
+            });
+        }
     } else if (!isSeparator && data && data.type === "panel" && PITCH_TO_FILE[toCanonicalPitch(data.pitch)]) {
-        drawMapGradientRect(ctx, px, py, cellSize, "panel");
+        drawMapGradientRect(ctx, px, py, cellSize, cellSize, "panel");
     } else {
         ctx.fillStyle = "#fff";
         ctx.fillRect(px, py, cellSize, cellSize);
@@ -2461,8 +2690,6 @@ function drawMapCell(ctx, borderPath, { px, py, cellSize, gx, gy, isSeparator, i
     if (!isSeparator && data) {
         if (data.type === "rail") {
             drawMapRailLine(ctx, px, py, cellSize, data.direction);
-        } else if (data.type === "sensor") {
-            drawMapSensorText(ctx, px, py, cellSize, data.beatNum);
         } else if (data.type === "panel") {
             drawMapPanelImage(ctx, px, py, cellSize, data.pitch);
         }
@@ -2484,80 +2711,81 @@ function addMapBorderLine(path, x1, y1, x2, y2) {
     }
 }
 
-// rail/sensor/panelの背景グラデーション（CSSの.mapCell--rail/--sensor/--panelと同じ配色）＋
+// sensor/panelの背景グラデーション（CSSの.mapCell--sensor/--panelと同じ配色）＋
 // inset box-shadowの近似（canvasにはinset shadowの直接的な相当機能が無いため、端に薄い
-// 明暗の帯を描いて立体感を模す。ぼかしの無い分だけCSS版とは厳密には一致しない）
-function drawMapGradientRect(ctx, px, py, size, kind) {
+// 明暗の帯を描いて立体感を模す。ぼかしの無い分だけCSS版とは厳密には一致しない）。
+// レール（"rail"）はここでは扱わない（drawMapRailLine側で直接描く、上のdrawMapCell参照）。
+// センサーは正方形とは限らない長方形（w,hが異なりうる）ため、pxRect全体をw/hで受け取る
+function drawMapGradientRect(ctx, px, py, w, h, kind) {
     let grad;
-    if (kind === "rail") {
-        grad = ctx.createLinearGradient(px, py, px + size, py + size);
-        grad.addColorStop(0, "#6b6b6b");
-        grad.addColorStop(1, "#4a4a4a");
-    } else if (kind === "sensor") {
-        grad = ctx.createLinearGradient(px, py, px + size, py + size);
-        grad.addColorStop(0, "#ea6b6b");
-        grad.addColorStop(1, "#d03f3f");
+    if (kind === "sensor") {
+        grad = ctx.createLinearGradient(px, py, px + w, py + h);
+        grad.addColorStop(0, "#333");
+        grad.addColorStop(1, "#000");
     } else {
-        grad = ctx.createRadialGradient(
-            px + size / 2, py + size / 2, 0,
-            px + size / 2, py + size / 2, size / 2 * Math.SQRT2
-        );
+        const r = Math.max(w, h) / 2 * Math.SQRT2;
+        grad = ctx.createRadialGradient(px + w / 2, py + h / 2, 0, px + w / 2, py + h / 2, r);
         grad.addColorStop(0, "#fbfbfb");
         grad.addColorStop(1, "#e8e8e8");
     }
     ctx.fillStyle = grad;
-    ctx.fillRect(px, py, size, size);
+    ctx.fillRect(px, py, w, h);
 
-    if (kind === "rail" || kind === "sensor") {
+    if (kind === "sensor") {
         ctx.fillStyle = "rgba(255,255,255,0.15)";
-        ctx.fillRect(px, py, size, 1);
+        ctx.fillRect(px, py, w, 1);
         ctx.fillStyle = "rgba(0,0,0,0.2)";
-        ctx.fillRect(px, py + size - 2, size, 2);
+        ctx.fillRect(px, py + h - 2, w, 2);
     } else {
         ctx.fillStyle = "rgba(0,0,0,0.12)";
-        ctx.fillRect(px, py, size, 2);
+        ctx.fillRect(px, py, w, 2);
     }
 }
 
-// レールの向きを示す線（.mapRailLine相当）。角丸矩形＋軽いドロップシャドウ
+// レール本体の見た目。3Dプレビュー（assemblyRailSideMesh/assemblyRailRungMesh）と
+// 同じ「細い黒レール2本（マスの全長を貫通）＋幅広いグレーの横木（マス内に周期的に
+// 配置、間は穴＝何も描かない）」というデザインを2Dでも再現する。比率は3D側の
+// RAIL_SIDE_OFFSET/RAIL_SIDE_WIDTH/RAIL_RUNG_WIDTH/RAIL_RUNG_LENGTH/RAIL_RUNG_OFFSETSと
+// 揃えてある。3D側は「黒の方が背が高く、重なった範囲はグレーが黒に隠れる」ことで
+// 黒がグレーの上に乗って見えるが、2Dには奥行きが無いため、単純に横木を先に描いてから
+// 黒を後から重ねて描くことで同じ見た目（黒が優先して見える）を再現している
 function drawMapRailLine(ctx, px, py, size, direction) {
     const isVert = direction === "vertical";
-    const w = isVert ? size * 0.3 : size;
-    const h = isVert ? size : size * 0.3;
-    const x = px + (size - w) / 2;
-    const y = py + (size - h) / 2;
-    const r = Math.min(2, w / 2, h / 2);
+    const SIDE_OFFSET = 0.3, SIDE_WIDTH = 0.15;
+    const RUNG_WIDTH = 0.92, RUNG_LENGTH = 0.22;
+    const RUNG_OFFSETS = [-0.25, 0.25];
+    const cx0 = px + size / 2, cy0 = py + size / 2;
 
     ctx.save();
     ctx.shadowColor = "rgba(0,0,0,0.3)";
     ctx.shadowBlur = 1;
     ctx.shadowOffsetY = 1;
+
+    // 横木（グレー、周期配置）を先に描く
     ctx.fillStyle = "#999";
-    ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.arcTo(x + w, y, x + w, y + h, r);
-    ctx.arcTo(x + w, y + h, x, y + h, r);
-    ctx.arcTo(x, y + h, x, y, r);
-    ctx.arcTo(x, y, x + w, y, r);
-    ctx.closePath();
-    ctx.fill();
-    ctx.restore();
-}
+    const rungCross = size * RUNG_WIDTH, rungAlong = size * RUNG_LENGTH;
+    const rungR = Math.min(2, rungCross / 2, rungAlong / 2);
+    RUNG_OFFSETS.forEach(offset => {
+        const cx = cx0 + (isVert ? 0 : size * offset);
+        const cy = cy0 + (isVert ? size * offset : 0);
+        const w = isVert ? rungCross : rungAlong;
+        const h = isVert ? rungAlong : rungCross;
+        ctx.beginPath();
+        ctx.roundRect(cx - w / 2, cy - h / 2, w, h, rungR);
+        ctx.fill();
+    });
 
-// センサーの拍番号（.mapCell--sensorのcolor:#fffが.mapCell--contentのcolor:#555より
-// 後のCSS定義で勝っていたのと同じ色を使う）
-function drawMapSensorText(ctx, px, py, size, beatNum) {
-    const text = String(beatNum);
-    const digits = text.length;
-    const fontRatio = digits <= 2 ? 0.5 : 0.4 * 3 / digits;
-    const fontSize = size * fontRatio;
-
-    ctx.save();
-    ctx.fillStyle = "#fff";
-    ctx.font = `${fontSize}px 'Noto Sans JP', 'Meiryo', 'メイリオ', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(text, px + size / 2, py + size / 2);
+    // レール本体（黒、マスの全長を貫通）を横木の上に重ねて描く
+    ctx.shadowColor = "transparent";
+    ctx.fillStyle = "#585858";
+    const sideCross = size * SIDE_WIDTH;
+    [-SIDE_OFFSET, SIDE_OFFSET].forEach(offset => {
+        const cx = cx0 + (isVert ? size * offset : 0);
+        const cy = cy0 + (isVert ? 0 : size * offset);
+        const w = isVert ? sideCross : size;
+        const h = isVert ? size : sideCross;
+        ctx.fillRect(cx - w / 2, cy - h / 2, w, h);
+    });
     ctx.restore();
 }
 
@@ -2566,18 +2794,44 @@ function drawMapSensorText(ctx, px, py, size, beatNum) {
 function drawMapPanelImage(ctx, px, py, size, pitch) {
     const file = PITCH_TO_FILE[toCanonicalPitch(pitch)];
     if (!file) return;
-    const img = getMapPanelImage(pitch);
-    if (!img || !img.complete || img.naturalWidth === 0) return;
+    const img = getMapPanelFilteredImage(pitch);
+    if (!img) return;
 
     ctx.save();
     ctx.translate(px + size / 2, py + size / 2);
     ctx.rotate(northDirection * 90 * Math.PI / 180);
+    // 画像は100x100pxだが実際のセルサイズはズームにより10〜20px程度まで縮小されることが多く
+    // （標準ズームでcellSize=16px程度、5倍以上の縮小）、ブラウザ既定の
+    // imageSmoothingQuality（"low"）だと簡易な補間しか行われず、この倍率では
+    // 「輝度が高くくっきり見えずぼやけて見える」（色が薄まり滲んだような見た目になる）
+    // 原因になっていた。"high"にすると縮小時の補間の質が上がりくっきり見える
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
     ctx.shadowColor = "rgba(0,0,0,0.25)";
     ctx.shadowBlur = 1;
     ctx.shadowOffsetY = 1;
     // PITCH_TO_FILEの画像は全て100x100pxの正方形（実測確認済み）なので、
     // object-fit:containと等価な単純な引き伸ばし描画でよい
     ctx.drawImage(img, -size / 2, -size / 2, size, size);
+    ctx.restore();
+
+    // 音符マットの左辺・上辺だけ黒い線を引く（元々は四方を囲む実装のバグで右辺・下辺が
+    // 後から重ねられる薄いグリッド罫線に隠れ、結果的に左辺・上辺の2辺だけ黒く見えていた。
+    // 「2辺が黒だった時が良かった」との要望で、その見た目を意図的に再現する）
+    // 線の中心をpx/pyのちょうど0.5だけずらす（addMapBorderLineと同じクリスプ表示のテクニック）
+    // 位置合わせは、lineWidthが整数の時だけ1本の線が1〜複数pxの境界にぴったり乗って
+    // くっきり見える。0.75や1.25のような半端な太さだと、線がpxグリッドの境界をまたいで
+    // アンチエイリアスの薄い階調が複数pxに広がり「ぼやけて」見えてしまう
+    // （「2Dがぼやけて見える」の原因と判断し、1.25→整数の1に戻した）
+    ctx.save();
+    ctx.strokeStyle = "#000";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(px + 0.5, py);
+    ctx.lineTo(px + 0.5, py + size);
+    ctx.moveTo(px, py + 0.5);
+    ctx.lineTo(px + size, py + 0.5);
+    ctx.stroke();
     ctx.restore();
 }
 
@@ -2591,26 +2845,37 @@ function drawMapPanelImage(ctx, px, py, size, pitch) {
 // window.THREEはESモジュール側（index.html）が非同期で公開するグローバルなので、
 // app.js側ではトップレベルで直接参照せず、必ずこの関数経由でアクセスする
 function ensureThreeLoaded(callback) {
-    if (window.THREE && window.OrbitControls) { callback(); return; }
+    if (window.THREE && window.OrbitControls && window.LineSegments2) { callback(); return; }
     window.addEventListener("three-ready", () => callback(), { once: true });
 }
 
-let assemblyScene = null, assemblyCamera = null, assemblyRenderer = null, assemblyControls = null;
+let assemblyScene = null, assemblyCamera = null, assemblyRenderer = null, assemblyControls = null, assemblySun = null;
 let assemblySceneReady = false;
 let assemblyAnimFrameId = null;
 let assemblyCameraFramed = false; // 初回のみカメラを内容に合わせてフレーミングする（編集のたびに視点をリセットしないため）
-let assemblyRailMesh = null, assemblySensorMesh = null;
+let assemblyRailSideMesh = null, assemblyRailRungMesh = null, assemblySensorMesh = null, assemblySensorBeamMesh = null;
 let assemblyPanelMeshes = {};   // canonical pitch -> InstancedMesh
+let assemblyPanelEdgesGroup = null; // 音符マット1枚ごとの黒ぶち（THREE.LineSegmentsの集合）
 let assemblyLayerGrids = [];    // 3層それぞれの床グリッド（THREE.GridHelper）
 let assemblyGridVisible = true; // #assemblyGridToggleBtnで切り替える、rebuildAssemblyMeshes()を跨いで保持する
 let assemblyPlayMarker = null;  // 再生中のトロッコ位置を示す球（initAssemblyScene()で1回だけ作成し使い回す）
 let assemblyBeatCenters = [];   // ビートごとのレール中心のワールド座標（updateAssemblyPlayMarker用、rebuildAssemblyMeshes()のたびに作り直す）
+// 「トロッコが通過するとき、反応する音符マットをへこます」用。beatIndex -> [{pitch, index}]
+// （そのビートに鳴る音符マットが、assemblyPanelMeshes[pitch]という1つのInstancedMeshの
+// 何番目のインスタンスか）。位置の基準（凹ませる前の元の座標）はassemblyPanelPositionsByPitchに
+// 持たせる。どちらもrebuildAssemblyMeshes()のたびに作り直す
+let assemblyPanelInstancesByBeat = new Map();
+let assemblyPanelPositionsByPitch = {}; // canonical pitch -> Vector3[]（凹ませる前の元の位置）
+let assemblyPanelRotY = 0; // 音符マットの現在の回転（northDirection由来、凹み演出の行列再計算に必要）
+let assemblyPressedBeatIndex = null; // 現在「凹ませている」beatIndex（変化した時だけ再計算する）
+let assemblyPanelEdgeOffsetByPitch = {}; // canonical pitch -> assemblyPanelEdgesGroup.children内での開始インデックス
 const ASSEMBLY_CELL_SIZE = 1;
 // 層の間隔はマス目の縦横と同じ長さにする（＝1マスぶんが縦横高さとも等しい立方体になる）
 const ASSEMBLY_LAYER_HEIGHT = ASSEMBLY_CELL_SIZE;
 
 const MAP_PANEL_MATERIALS = {}; // canonical pitch -> [6面ぶんのMeshStandardMaterial]（BoxGeometry用）
-let assemblyRailMaterial = null, assemblySensorMaterial = null, assemblyPanelSideMaterial = null, assemblyUnitBoxGeometry = null;
+let assemblyRailMaterial = null, assemblyRailRungMaterial = null, assemblySensorMaterial = null, assemblySensorBeamMaterial = null, assemblyPanelSideMaterial = null, assemblyUnitBoxGeometry = null;
+let assemblyPanelEdgesGeometry = null, assemblyPanelEdgesMaterial = null; // 音符マットの黒ぶち用（共有、位置/回転/スケールだけ個別に設定する）
 
 // 初回のタブ切り替え時にだけ呼ばれる。renderer/scene/camera/ライト/OrbitControls/
 // 共有ジオメトリ・マテリアルを1回だけ構築する
@@ -2623,23 +2888,40 @@ function initAssemblyScene() {
     assemblyRenderer.setPixelRatio(window.devicePixelRatio || 1);
     assemblyRenderer.shadowMap.enabled = true;
     assemblyRenderer.outputColorSpace = THREE.SRGBColorSpace;
+    // 「3Dは2Dより暗い気がする」との指摘を受け、一度NoToneMappingに変更してみたが
+    // 実測（キャンバスの平均輝度をWebGLから読み取って比較）するとACESFilmicToneMapping自体は
+    // 明るさにほぼ影響しておらず、むしろ「余計暗くなった」というユーザーの体感の方が正しかった。
+    // ACESFilmicToneMappingへ戻し、明るさに直接効くtoneMappingExposureを1.6まで上げてみたが、
+    // 今度は「色が白飛びしてぼんやりする」との指摘（既に明るい部分＝パネル側面の白系素材や
+    // 画像の明るい部分が先にクリップし、締まりが無くなる）。1.1（暗すぎ）と1.6（白飛び）の
+    // 間を取り、控えめに1.2に設定。
+    // その後「2Dと並べると3Dがくすんで見える、少し明るくすると2Dに近づきそう」との指摘で
+    // 1.35へ再調整（実測ではexposureを上げるほど平均輝度は上がる一方、彩度はわずかに下がる
+    // 傾向があったため、White Balanceの検証と同様に大きく振らず控えめな増分に留めた）
     assemblyRenderer.toneMapping = THREE.ACESFilmicToneMapping;
-    assemblyRenderer.toneMappingExposure = 1.1;
+    assemblyRenderer.toneMappingExposure = 1.35;
 
     assemblyScene = new THREE.Scene();
-    assemblyScene.background = new THREE.Color(0xe9ecf1);
+    assemblyScene.background = new THREE.Color(0xffffff);
 
     assemblyCamera = new THREE.PerspectiveCamera(50, 1, 0.1, 500);
     assemblyCamera.position.set(12, 12, 12); // 内容に応じてframeAssemblyCamera()が上書きする
 
     const hemi = new THREE.HemisphereLight(0xffffff, 0x8a8f98, 0.9);
     assemblyScene.add(hemi);
-    const sun = new THREE.DirectionalLight(0xffffff, 1.4);
-    sun.position.set(10, 18, 8);
-    sun.castShadow = true;
-    sun.shadow.mapSize.set(2048, 2048);
-    assemblyScene.add(sun);
-    assemblyScene.add(sun.target);
+    assemblySun = new THREE.DirectionalLight(0xffffff, 1.4);
+    // 実際の位置（南側から斜めに当たるように）はnorthDirection（コンパスの向き）に応じて
+    // rebuildAssemblyMeshes()のたびにupdateAssemblySunPosition()で設定し直す。ここでは
+    // シーン初期化時点でまだnorthDirection等が読めるので、初期値としても一度呼んでおく
+    assemblySun.castShadow = true;
+    assemblySun.shadow.mapSize.set(2048, 2048);
+    // shadow.cameraの見える範囲（デフォルトは左右上下±5の狭い正方形）は、内容の実際の
+    // 広がりに応じてrebuildAssemblyMeshes()側で毎回サイズを合わせ直す（この初期値のままだと、
+    // 曲が長い/マス数が多いと大半の音符マット・レールが範囲外になり影が出ない、または
+    // 範囲の境界付近で影が不自然に切れる原因になる）
+    assemblyScene.add(assemblySun);
+    assemblyScene.add(assemblySun.target);
+    updateAssemblySunPosition();
 
     assemblyControls = new OrbitControls(assemblyCamera, assemblyRenderer.domElement);
     assemblyControls.enableDamping = true;
@@ -2655,11 +2937,37 @@ function initAssemblyScene() {
     canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
     // 使い回す共有ジオメトリ・マテリアル（2Dマップの色使いに合わせる: レール=ダークグレー、
-    // センサー=赤、音符マット側面=白系。音符マットの上面だけピッチごとの写真テクスチャを貼る）
+    // センサー=黒、音符マット側面=白系。音符マットの上面だけピッチごとの写真テクスチャを貼る）
     assemblyUnitBoxGeometry = new THREE.BoxGeometry(1, 1, 1);
     assemblyRailMaterial = new THREE.MeshStandardMaterial({ color: 0x585858, roughness: 0.65, metalness: 0.35 });
-    assemblySensorMaterial = new THREE.MeshStandardMaterial({ color: 0xd94f4f, roughness: 0.5, metalness: 0.1, emissive: 0x330000, emissiveIntensity: 0.15 });
+    // レール中央の横木（左右のレール本体の間に一定間隔で架かる、梯子の"段"に相当）用。
+    // 2Dマップの中央帯（drawMapRailLine、#999）と同系色（rebuildAssemblyMeshes参照）
+    assemblyRailRungMaterial = new THREE.MeshStandardMaterial({ color: 0x999999, roughness: 0.6, metalness: 0.25 });
+    assemblySensorMaterial = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.5, metalness: 0.1 });
+    // センサーの「赤外線」ビーム（2Dのdraw MapSensorBeamsと同じ発想）。光源の影響を受けず
+    // 常に一定の明るさで光って見えるようMeshBasicMaterialを使い、半透明にしてビームらしさを出す
+    assemblySensorBeamMaterial = new THREE.MeshBasicMaterial({ color: 0xff2828, transparent: true, opacity: 0.55 });
     assemblyPanelSideMaterial = new THREE.MeshStandardMaterial({ color: 0xefefef, roughness: 0.8 });
+    // 音符マットの黒ぶち。単位立方体（assemblyUnitBoxGeometry）の辺だけを取り出したジオメトリを
+    // 1つ共有し、各マットの実際のサイズ・位置・回転はLineSegments2側のscale/position/quaternionで
+    // 個別に与える（InstancedMeshは三角形描画専用でLineSegmentsには使えないため、マット枚数ぶん
+    // 個別のLineSegments2を作る。ジオメトリ/マテリアル自体は共有なので生成コストは小さい）。
+    // 通常のTHREE.LineBasicMaterial+LineSegmentsだとlinewidthがほぼ全ブラウザ（特にWindows Chrome）
+    // で無視され常に1px固定になってしまうWebGL自体の既知の制約があり、「もう少し細く」という
+    // 調整ができなかったため、実際にピクセル単位で太さを制御できるLineSegments2（fat lines、
+    // three/addons/lines/）に置き換えている
+    const edgesPositions = new THREE.EdgesGeometry(assemblyUnitBoxGeometry).attributes.position.array;
+    assemblyPanelEdgesGeometry = new LineSegmentsGeometry();
+    assemblyPanelEdgesGeometry.setPositions(edgesPositions);
+    // linewidthの単位はpx（resolutionは要設定、resizeAssemblyRenderer参照）。
+    // 「ふちの太さを気持ち細く」との依頼で、素の1pxから0.75pxへ少し細くしている
+    assemblyPanelEdgesMaterial = new LineMaterial({ color: 0x000000, linewidth: 0.75 });
+    // fat lines（LineSegments2）は線の太さをシェーダー側の矩形展開で作るため、細い線ほど
+    // 縁がギザギザ（ジャギー）に見えやすい。alphaToCoverageを有効にすると、レンダラーの
+    // MSAA（antialias:true、下のWebGLRenderer生成時に設定済み）を線の縁のカバレッジ計算にも
+    // 使うようになり、輪郭が滑らかになる（three.jsのfat lines公式サンプルでも推奨されている設定）
+    assemblyPanelEdgesMaterial.alphaToCoverage = true;
+    assemblyPanelEdgesMaterial.resolution.set(canvas.clientWidth || 1, canvas.clientHeight || 1);
 
     // 再生中のトロッコ位置マーカー（2Dマップのdraw MapPlayLineの黄色いマーカーと同系色）。
     // rebuildAssemblyMeshes()では破棄されず使い回すので、ここで1回だけ作る
@@ -2671,6 +2979,34 @@ function initAssemblyScene() {
     assemblySceneReady = true;
 }
 
+// コンパスの向き（northDirection、2Dマップの「N↑/N→/N↓/N←」ラベルと同じ意味）に応じた
+// 「南」方向の単位ベクトル（ワールド座標のx,z成分）。2Dマップのコンパスラベルは
+// 画面上の向き（up/right/down/left）を表すだけで実際のグリッド配置自体は回転しないため、
+// 「北がどちらか」の対応もその画面方向のまま据え置く。toWorld()はgx→world x、
+// gy→world zへそのまま対応させているため、画面の上（gyが小さい方向）は
+// world zが小さい方向になる
+// northDirection=0(N↑=北は画面上): 北=-z → 南=+z
+// northDirection=1(N→=北は画面右): 北=+x → 南=-x
+// northDirection=2(N↓=北は画面下): 北=+z → 南=-z
+// northDirection=3(N←=北は画面左): 北=-x → 南=+x
+const ASSEMBLY_SOUTH_VECTOR_BY_NORTH_DIRECTION = [
+    { x: 0, z: 1 },
+    { x: -1, z: 0 },
+    { x: 0, z: -1 },
+    { x: 1, z: 0 },
+];
+
+// 「南側から斜めに光が当たる」ようにassemblySunの位置を設定する。northDirection
+// （コンパスの向き）が変わっても常に南から当たり続けるよう、rebuildAssemblyMeshes()の
+// たびに呼び直す（「斜めでいいから南側から光を当ててほしい」との依頼）
+function updateAssemblySunPosition() {
+    if (!assemblySun) return;
+    const south = ASSEMBLY_SOUTH_VECTOR_BY_NORTH_DIRECTION[northDirection] || ASSEMBLY_SOUTH_VECTOR_BY_NORTH_DIRECTION[0];
+    const HORIZONTAL_DISTANCE = 13; // 斜め具合の目安（元のposition(10,18,8)の水平距離≈12.8と近い値）
+    const HEIGHT = 18;
+    assemblySun.position.set(south.x * HORIZONTAL_DISTANCE, HEIGHT, south.z * HORIZONTAL_DISTANCE);
+}
+
 // ピッチごとのテクスチャ+マテリアル（BoxGeometryの6面ぶん）を遅延生成する。
 // 既にloadMapPanelImages()がプリロード中のHTMLImageElement（MAP_PANEL_IMAGES）を
 // そのまま流用し、二重に画像を取得しない
@@ -2678,17 +3014,21 @@ function getAssemblyPanelMaterials(pitch) {
     const canon = toCanonicalPitch(pitch);
     if (MAP_PANEL_MATERIALS[canon]) return MAP_PANEL_MATERIALS[canon];
 
+    // 生画像ではなく、色味を濃く（彩度アップ）した焼き込み済みキャッシュを使う
+    // （getMapPanelVividImage参照。「3Dの音符マットをもう少し色味を濃くしたい」との依頼）
     const img = getMapPanelImage(canon);
-    const tex = new THREE.Texture(img || undefined);
+    const vividImg = getMapPanelVividImage(canon);
+    const tex = new THREE.Texture(vividImg || undefined);
     tex.colorSpace = THREE.SRGBColorSpace;
-    if (img) {
-        if (img.complete && img.naturalWidth > 0) {
+    if (vividImg) {
+        tex.needsUpdate = true;
+    } else if (img) {
+        // 既存のimg.onload（2DマップのscheduleMapPanelRedraw）を上書きしないよう、
+        // addEventListenerで別リスナーとして追加するだけにする
+        img.addEventListener("load", () => {
+            tex.image = getMapPanelVividImage(canon);
             tex.needsUpdate = true;
-        } else {
-            // 既存のimg.onload（2DマップのscheduleMapPanelRedraw）を上書きしないよう、
-            // addEventListenerで別リスナーとして追加するだけにする
-            img.addEventListener("load", () => { tex.needsUpdate = true; }, { once: true });
-        }
+        }, { once: true });
     }
 
     const top = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.85 });
@@ -2718,6 +3058,28 @@ function buildAssemblyInstancedMesh(positions, geometry, material, sx, sy, sz, r
     return mesh;
 }
 
+// 音符マット1枚ごとの黒ぶち（LineSegments2＝fat lines）をまとめてGroupにする。InstancedMeshは
+// 三角形描画専用でLineSegments2には使えないため、buildAssemblyInstancedMesh()のように
+// 1つのメッシュにまとめることはできず、マット1枚につき1つのLineSegments2を作る
+// （ジオメトリ・マテリアルはassemblyPanelEdgesGeometry/Materialを共有するので軽量）
+// マット本体の面とぴったり同じ位置に黒ぶちを重ねるとz-fighting（深度値が同点でどちらが
+// 手前か不安定になり、線がちらついたり面に埋もれて見えなくなる）が起きるため、ごくわずかに
+// （1%）大きくして面より少しだけ外側に浮かせる。凹み演出（setAssemblyPanelPressed）でも
+// 黒ぶちの位置・スケールを再計算する際に同じ係数を使うので、共有定数にしてある
+const ASSEMBLY_PANEL_EDGE_SCALE_FACTOR = 1.01;
+function buildAssemblyEdgeLines(positions, sx, sy, sz, rotY) {
+    const group = new THREE.Group();
+    const quat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), rotY);
+    positions.forEach(pos => {
+        const line = new LineSegments2(assemblyPanelEdgesGeometry, assemblyPanelEdgesMaterial);
+        line.position.copy(pos);
+        line.quaternion.copy(quat);
+        line.scale.set(sx * ASSEMBLY_PANEL_EDGE_SCALE_FACTOR, sy * ASSEMBLY_PANEL_EDGE_SCALE_FACTOR, sz * ASSEMBLY_PANEL_EDGE_SCALE_FACTOR);
+        group.add(line);
+    });
+    return group;
+}
+
 // 曲が空の時に表示する簡単な案内文（2Dマップの「音符がありません」と同趣旨）
 function updateAssemblyEmptyState(isEmpty) {
     const canvas = document.getElementById("assemblyCanvas");
@@ -2741,14 +3103,26 @@ function updateAssemblyEmptyState(isEmpty) {
 // 曲やマップ設定が変わるたびに丸ごと呼び直す（ジオメトリ/マテリアルは使い回し、
 // 前回分のInstancedMeshだけ破棄して作り直す）
 function rebuildAssemblyMeshes() {
-    [assemblyRailMesh, assemblySensorMesh, ...Object.values(assemblyPanelMeshes)].forEach(m => {
+    updateAssemblySunPosition(); // コンパスの向き（northDirection）が変わっても常に南から光が当たるようにする
+    [assemblyRailSideMesh, assemblyRailRungMesh, assemblySensorMesh, assemblySensorBeamMesh, ...Object.values(assemblyPanelMeshes)].forEach(m => {
         if (m) assemblyScene.remove(m);
     });
-    assemblyRailMesh = null;
+    assemblyRailSideMesh = null;
+    assemblyRailRungMesh = null;
     assemblySensorMesh = null;
+    assemblySensorBeamMesh = null;
     assemblyPanelMeshes = {};
+    if (assemblyPanelEdgesGroup) assemblyScene.remove(assemblyPanelEdgesGroup);
+    assemblyPanelEdgesGroup = null;
     assemblyLayerGrids.forEach(g => assemblyScene.remove(g));
     assemblyLayerGrids = [];
+    // メッシュを作り直すと以前のインスタンスは失われるため、「凹み」の追跡状態もリセットする
+    // （リセットしないと、次にupdateAssemblyPlayMarker()が同じbeatIndexで呼ばれた時に
+    // 「変化なし」と誤判定し、新しいインスタンスに凹みが反映されなくなる）
+    assemblyPanelInstancesByBeat = new Map();
+    assemblyPanelPositionsByPitch = {};
+    assemblyPanelEdgeOffsetByPitch = {};
+    assemblyPressedBeatIndex = null;
 
     const { grid, extent, beatCenters } = buildMapGrid();
     if (!extent) {
@@ -2777,6 +3151,11 @@ function rebuildAssemblyMeshes() {
     const sensorPositions = [];
     const panelPositionsByPitch = {}; // canonical pitch -> Vector3[]
     const rotY = northDirection * Math.PI / 2;
+    const SENSOR_AWAY_OFFSET = 0.08; // 2D側のSENSOR_AWAY_OFFSET_RATIOと同じ比率（ASSEMBLY_CELL_SIZE=1なのでそのまま距離になる）
+    // ビームは「自分のマスのみ」に収める。センサーはSENSOR_AWAY_OFFSETぶんレールから
+    // 遠い側へずれているため、センサーからレール側のマス端までの距離は0.5+SENSOR_AWAY_OFFSET
+    const SENSOR_BEAM_LENGTH = 0.5 + SENSOR_AWAY_OFFSET;
+    const sensorBeamPositions = [];
 
     for (const [key, data] of grid) {
         const parts = key.split(",").map(Number);
@@ -2789,24 +3168,116 @@ function rebuildAssemblyMeshes() {
             if (parts[2] !== 0) continue;
             railPositions.push(pos);
         } else if (data.type === "sensor") {
-            sensorPositions.push(pos);
+            // 「センサーを枠の中で、レールから少し遠ざける」との依頼に対応。data.awayVecは
+            // レール中心から見てこのセンサーが外側へ向かう方向（buildMapGrid参照、2D側の
+            // drawMapCellと同じSENSOR_AWAY_OFFSET_RATIOに相当する値をそのまま使う）
+            const away = data.awayVec || { dx: 0, dy: 0 };
+            const sensorPos = pos.clone().add(new THREE.Vector3(away.dx * SENSOR_AWAY_OFFSET, 0, away.dy * SENSOR_AWAY_OFFSET));
+            sensorPositions.push(sensorPos);
+            // 「センサーからレールに向けて赤外線みたいなものを2マス分伸ばして」との依頼に対応。
+            // awayの逆向き（＝レールに向かう向き）へ2マス分の中心位置を計算する
+            sensorBeamPositions.push(sensorPos.clone().add(new THREE.Vector3(-away.dx * SENSOR_BEAM_LENGTH / 2, 0, -away.dy * SENSOR_BEAM_LENGTH / 2)));
         } else if (data.type === "panel") {
             const canon = toCanonicalPitch(data.pitch);
             if (!PITCH_TO_FILE[canon]) continue; // 2D版と同じ「対応画像が無ければ描かない」ガード
             if (!panelPositionsByPitch[canon]) panelPositionsByPitch[canon] = [];
+            const instanceIndex = panelPositionsByPitch[canon].length;
             panelPositionsByPitch[canon].push(pos);
+            // 「トロッコ通過時に音符マットを凹ませる」演出用に、このインスタンスがどの
+            // ビートに属するか記録しておく（updateAssemblyPlayMarker参照）
+            if (!assemblyPanelInstancesByBeat.has(data.beatIndex)) assemblyPanelInstancesByBeat.set(data.beatIndex, []);
+            assemblyPanelInstancesByBeat.get(data.beatIndex).push({ pitch: canon, index: instanceIndex });
         }
     }
+    assemblyPanelPositionsByPitch = panelPositionsByPitch;
+    assemblyPanelRotY = rotY;
+    // 黒ぶち（assemblyPanelEdgesGroup）は、pitchごとの配列を`Object.values(...).flat()`で
+    // つなげた1本のフラットな並びに対応する子オブジェクトを持つ（buildAssemblyEdgeLines参照）。
+    // 「凹んだ音符マットに合わせて黒ぶちも凹ませる」ために、(pitch, index)からその
+    // フラットな並びの何番目かを逆算できるよう、pitchごとの開始オフセットを記録しておく
+    assemblyPanelEdgeOffsetByPitch = {};
+    let assemblyPanelEdgeCumOffset = 0;
+    Object.entries(panelPositionsByPitch).forEach(([p, arr]) => {
+        assemblyPanelEdgeOffsetByPitch[p] = assemblyPanelEdgeCumOffset;
+        assemblyPanelEdgeCumOffset += arr.length;
+    });
 
-    assemblyRailMesh = buildAssemblyInstancedMesh(railPositions, assemblyUnitBoxGeometry, assemblyRailMaterial, 1, 0.2, 1, 0);
-    assemblyScene.add(assemblyRailMesh);
-    assemblySensorMesh = buildAssemblyInstancedMesh(sensorPositions, assemblyUnitBoxGeometry, assemblySensorMaterial, 0.9, 0.25, 0.9, 0);
+    // レールを「左右の本体（そのまま暗いグレー）＋中央の凹んだ溝＋一定間隔で架かる横木」という
+    // 梯子状の見た目に組み立てる（「グレー部分は凹んでいて、かつ梯子状に」との指摘の後、
+    // さらに「横部分（横木）はもっと太く、横部分じゃない部分は穴をあけてほしい」との
+    // 追加修正を反映）。溝の底を塗りつぶすのはやめ、左右のレール本体の間は横木以外
+    // 完全に何も描かない（＝素通しの穴）ことで「穴をあけて」を文字通り実現している。
+    // mapSettings.railDirectionは全レール共通の設定なので、向き（縦/横）もセル単位ではなく一括で決まる
+    // 「黒を太く、グレーは黒より横に突き出す＆凹んでいる」という組み合わせは、黒本体が
+    // セル端まで塞ぐ単純な形状だと、重なった部分でグレーが黒の陰に完全に隠れてしまい両立
+    // できなかった（凹み＝グレーの上面が黒より低い→重なる範囲では常に黒が上に来て隠す）。
+    // ユーザー確認の結果、「黒を細くする」ことで解決する方針に変更: 黒をセル端に付けたまま
+    // 太さだけ変えるのではなく、中心からのオフセットは固定し幅だけ細くすることで、黒の
+    // 内側（穴）だけでなく外側（セル端寄り）にも隙間ができる。横木（グレー）はその隙間の
+    // 内外どちらにも入り込む幅にすることで、黒に隠れない領域（内側の穴・外側の余白）では
+    // 素直に見え、黒と重なる中央部分だけ凹んで隠れる＝結果として「黒の脇からグレーが
+    // 突き抜けて見える」状態になる
+    const railIsVertical = mapSettings.railDirection === "vertical";
+    const RAIL_HEIGHT = 0.2;
+    const RAIL_SIDE_OFFSET = 0.3;                             // 中心から黒本体中心までの距離（固定）
+    const RAIL_SIDE_WIDTH = 0.15;                             // 黒本体の幅（0.4→0.15、大幅に細く）
+    const RAIL_RUNG_WIDTH = 0.92;                             // 横木の幅。黒本体の内側の穴だけでなく外側の余白にも届く広さ
+    const RAIL_RUNG_RECESS = 0.08;                            // 黒本体よりグレーの上面を凹ませる量
+    const RAIL_RUNG_HEIGHT = RAIL_HEIGHT - RAIL_RUNG_RECESS;
+    const RAIL_RUNG_Y_OFFSET = -RAIL_RUNG_RECESS / 2;         // 底面は黒本体と揃え、上面だけ凹ませる
+    const RAIL_RUNG_LENGTH = 0.22;                            // 横木の（レール方向の）太さ
+    const RAIL_RUNG_OFFSETS = [-0.25, 0.25];                  // 1マスあたり2本。隣接マスと合わせ0.5間隔の等間隔になる（0.22幅でも重ならない）
+
+    const sideAxis = railIsVertical ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 0, 1);
+    const railSidePositions = [];
+    railPositions.forEach(p => {
+        railSidePositions.push(p.clone().addScaledVector(sideAxis, RAIL_SIDE_OFFSET));
+        railSidePositions.push(p.clone().addScaledVector(sideAxis, -RAIL_SIDE_OFFSET));
+    });
+    assemblyRailSideMesh = buildAssemblyInstancedMesh(
+        railSidePositions, assemblyUnitBoxGeometry, assemblyRailMaterial,
+        railIsVertical ? RAIL_SIDE_WIDTH : 1, RAIL_HEIGHT, railIsVertical ? 1 : RAIL_SIDE_WIDTH, 0
+    );
+    assemblyScene.add(assemblyRailSideMesh);
+
+    const railAxis = railIsVertical ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(1, 0, 0);
+    const railRungPositions = [];
+    railPositions.forEach(p => {
+        RAIL_RUNG_OFFSETS.forEach(offset => {
+            railRungPositions.push(p.clone().addScaledVector(railAxis, offset).add(new THREE.Vector3(0, RAIL_RUNG_Y_OFFSET, 0)));
+        });
+    });
+    assemblyRailRungMesh = buildAssemblyInstancedMesh(
+        railRungPositions, assemblyUnitBoxGeometry, assemblyRailRungMaterial,
+        railIsVertical ? RAIL_RUNG_WIDTH : RAIL_RUNG_LENGTH, RAIL_RUNG_HEIGHT, railIsVertical ? RAIL_RUNG_LENGTH : RAIL_RUNG_WIDTH, 0
+    );
+    assemblyScene.add(assemblyRailRungMesh);
+    // センサーは正方形ではなく、レールに直角な方向へ長い長方形にする（2D側のSENSOR_CROSS_RATIO/
+    // SENSOR_ALONG_RATIOと同じ比率。「センサーを縦長に、レールに直角に伸びる方が長くなるように」）
+    const SENSOR_CROSS = 0.65, SENSOR_ALONG = 0.35;
+    assemblySensorMesh = buildAssemblyInstancedMesh(
+        sensorPositions, assemblyUnitBoxGeometry, assemblySensorMaterial,
+        railIsVertical ? SENSOR_CROSS : SENSOR_ALONG, 0.25, railIsVertical ? SENSOR_ALONG : SENSOR_CROSS, 0
+    );
     assemblyScene.add(assemblySensorMesh);
+    // センサーの「赤外線」ビーム。awayVecの軸（railIsVerticalならX軸、そうでなければZ軸）に
+    // 沿って伸びる細い半透明の棒。SENSOR_BEAM_LENGTH（マス数）は上のループで位置計算済み
+    const SENSOR_BEAM_THICKNESS = 0.035;
+    assemblySensorBeamMesh = buildAssemblyInstancedMesh(
+        sensorBeamPositions, assemblyUnitBoxGeometry, assemblySensorBeamMaterial,
+        railIsVertical ? SENSOR_BEAM_LENGTH : SENSOR_BEAM_THICKNESS, SENSOR_BEAM_THICKNESS, railIsVertical ? SENSOR_BEAM_THICKNESS : SENSOR_BEAM_LENGTH, 0
+    );
+    assemblySensorBeamMesh.castShadow = false;
+    assemblySensorBeamMesh.receiveShadow = false;
+    assemblyScene.add(assemblySensorBeamMesh);
     Object.entries(panelPositionsByPitch).forEach(([pitch, positions]) => {
         const mesh = buildAssemblyInstancedMesh(positions, assemblyUnitBoxGeometry, getAssemblyPanelMaterials(pitch), 0.95, 0.15, 0.95, rotY);
         assemblyPanelMeshes[pitch] = mesh;
         assemblyScene.add(mesh);
     });
+    const allPanelPositions = Object.values(panelPositionsByPitch).flat();
+    assemblyPanelEdgesGroup = buildAssemblyEdgeLines(allPanelPositions, 0.95, 0.15, 0.95, rotY);
+    assemblyScene.add(assemblyPanelEdgesGroup);
 
     // 3層を視覚的に伝える床グリッド（半透明の板は重なった面同士の深度ソート問題があるため
     // 使わず、不透明な線だけのGridHelperにする）
@@ -2823,7 +3294,8 @@ function rebuildAssemblyMeshes() {
     const boundaryFracFor = (centerSum) => ((((centerSum % 2) + 2) % 2) === 0 ? 0.5 : 0);
     const offsetX = boundaryFracFor(extent.minX + extent.maxX) === nativeLineFrac ? 0 : ASSEMBLY_CELL_SIZE / 2;
     const offsetZ = boundaryFracFor(extent.minY + extent.maxY) === nativeLineFrac ? 0 : ASSEMBLY_CELL_SIZE / 2;
-    [-1, 0, 1].forEach(layer => {
+    // グリッド線は中間層（レールが実在する層）だけに表示する（上位層・下位層には出さない）
+    [0].forEach(layer => {
         // GridHelperは本来「中心を通る2本の線だけ濃い色にする」機能を持つが、これは
         // gridSize（マス数）の偶奇でその中心線が実在するかどうかが決まる仕様のため、
         // マス数が変わるだけで「濃い線が出たり消えたりする」意図しない見た目のブレになる。
@@ -2834,6 +3306,18 @@ function rebuildAssemblyMeshes() {
         assemblyScene.add(helper);
         assemblyLayerGrids.push(helper);
     });
+
+    // 影用のshadow.camera（光源から見た正射影カメラ）の見える範囲を、内容の実際の広がりに
+    // 合わせて毎回更新する。既定値（左右上下±5の狭い正方形）のままだと、原点付近から外れた
+    // 音符マット/レールがその範囲外になり影が出なかったり、範囲の境界で不自然に切れたりする
+    // （曲が長い/マス数が多いほど顕著）。中心はtoWorld()により常に原点なので、半径は
+    // グリッドの対角ぶんの広さを取れば全体を確実に覆える
+    const shadowHalfExtent = Math.max(extent.maxX - extent.minX, extent.maxY - extent.minY) * ASSEMBLY_CELL_SIZE / 2 + 4;
+    assemblySun.shadow.camera.left = -shadowHalfExtent;
+    assemblySun.shadow.camera.right = shadowHalfExtent;
+    assemblySun.shadow.camera.top = shadowHalfExtent;
+    assemblySun.shadow.camera.bottom = -shadowHalfExtent;
+    assemblySun.shadow.camera.updateProjectionMatrix();
 
     if (!assemblyCameraFramed) {
         frameAssemblyCamera(extent);
@@ -2852,6 +3336,16 @@ function rebuildAssemblyMeshes() {
 // 移動だけは瞬時に切り替える）だが、対象がDOM要素ではなくThree.jsのメッシュな点が異なる
 function updateAssemblyPlayMarker(beatIndex, t) {
     if (!assemblyPlayMarker) return;
+
+    // 「トロッコが通過するとき、反応する音符マットを凹ませる」演出。beatIndexが
+    // 変化した時だけ、前のビートの凹みを戻し新しいビートの音符マットを凹ませる
+    // （毎フレーム同じbeatIndexで無駄に行列を再計算しないため）
+    if (beatIndex !== assemblyPressedBeatIndex) {
+        if (assemblyPressedBeatIndex !== null) setAssemblyPanelPressed(assemblyPressedBeatIndex, false);
+        if (beatIndex !== null) setAssemblyPanelPressed(beatIndex, true);
+        assemblyPressedBeatIndex = beatIndex;
+    }
+
     const posA = beatIndex == null ? null : assemblyBeatCenters[beatIndex];
     if (!posA) {
         assemblyPlayMarker.visible = false;
@@ -2863,6 +3357,67 @@ function updateAssemblyPlayMarker(beatIndex, t) {
     assemblyPlayMarker.position.lerpVectors(posA, posB, t);
     assemblyPlayMarker.position.y += 0.4; // レール/センサーの高さより少し上に浮かせて見やすくする
     assemblyPlayMarker.visible = true;
+}
+
+// beatIndexに鳴る音符マット（1つまたは和音で複数）を凹ませる/元に戻す。
+// InstancedMeshの該当インスタンスだけ、行列（位置・スケール）と色を差し替える。
+// 「へこんだのが目立たない」「エフェクトが全然わかりません」との指摘を受け、実測
+// （後述）で仕組み自体は正しく動作していることを確認した上で、効果の大きさそのものを
+// 大幅に強化した:
+// (1)沈み込む量をさらに増やす、(2)縦方向を大きく押しつぶす、(3)横方向（X/Z）には
+// 逆に広げる（正真正銘の「押しつぶし」の見た目にすると同時に、真上から見ても
+// footprintが広がって見えるようにする。高さだけの変化は見下ろすカメラだと
+// ほぼ分からないため、これが「全然分からない」の主因だったと考えられる）、
+// (4)per-instance colorをより強い暖色にして遠目にも分かる色の変化にする。
+// THREE.Vector3/THREE.Colorは、window.THREEが非同期に用意されるまで参照できないため、
+// （initAssemblyScene()以外の）トップレベルのconstで生成してはいけない（ensureThreeLoaded
+// 参照）。ここは数値だけ持ち、実際のTHREEオブジェクトはsetAssemblyPanelPressed()の中で作る
+const ASSEMBLY_PANEL_PRESS_DEPTH = 0.32;
+const ASSEMBLY_PANEL_PRESS_SCALE_Y = 0.22; // 縦方向のスケール（大きく押しつぶす）
+const ASSEMBLY_PANEL_PRESS_SCALE_XZ = 1.3; // 横方向のスケール（押しつぶされて広がる。真上から見てもfootprintの変化で分かる）
+const ASSEMBLY_PANEL_BASE_SCALE_XYZ = [0.95, 0.15, 0.95];
+const ASSEMBLY_PANEL_PRESSED_COLOR_RGB = [2.2, 1.6, 0.4]; // 強めの暖色に光らせる（1より大きい成分は明るく発光して見える）
+function setAssemblyPanelPressed(beatIndex, pressed) {
+    const entries = assemblyPanelInstancesByBeat.get(beatIndex);
+    if (!entries) return;
+    const [baseSx, baseSy, baseSz] = ASSEMBLY_PANEL_BASE_SCALE_XYZ;
+    const quat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), assemblyPanelRotY);
+    const color = pressed ? new THREE.Color(...ASSEMBLY_PANEL_PRESSED_COLOR_RGB) : new THREE.Color(1, 1, 1);
+    const m = new THREE.Matrix4();
+    entries.forEach(({ pitch, index }) => {
+        const mesh = assemblyPanelMeshes[pitch];
+        const basePos = assemblyPanelPositionsByPitch[pitch]?.[index];
+        if (!mesh || !basePos) return;
+        const pos = basePos.clone();
+        const scaleY = pressed ? baseSy * ASSEMBLY_PANEL_PRESS_SCALE_Y : baseSy;
+        const scaleXZ = pressed ? ASSEMBLY_PANEL_PRESS_SCALE_XZ : 1;
+        if (pressed) {
+            // 底面はほぼ据え置き（スケールを潰した分だけ中心のyを上げて補正）にしつつ、
+            // さらにASSEMBLY_PANEL_PRESS_DEPTHぶん沈める。天面は「据え置きの底面＋潰した
+            // 高さ」から沈み込み量ぶんさらに下がるので、見た目には「床に押し込まれた」形になる
+            pos.y += (baseSy - scaleY) / 2 - ASSEMBLY_PANEL_PRESS_DEPTH;
+        }
+        const scale = new THREE.Vector3(baseSx * scaleXZ, scaleY, baseSz * scaleXZ);
+        m.compose(pos, quat, scale);
+        mesh.setMatrixAt(index, m);
+        mesh.instanceMatrix.needsUpdate = true;
+        mesh.setColorAt(index, color);
+        if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+
+        // 「凹んでいても黒ぶちは凹まない」との指摘に対応。黒ぶち（LineSegments2、
+        // InstancedMeshではなく普通のObject3D）を、マット本体と同じ位置・スケールに
+        // 追従させる（ASSEMBLY_PANEL_EDGE_SCALE_FACTORぶんだけ一回り大きくするのは
+        // 元のbuildAssemblyEdgeLines()と同じ理由＝z-fighting防止）
+        const edgeOffset = assemblyPanelEdgeOffsetByPitch[pitch];
+        const edgeLine = (edgeOffset !== undefined && assemblyPanelEdgesGroup)
+            ? assemblyPanelEdgesGroup.children[edgeOffset + index]
+            : null;
+        if (edgeLine) {
+            edgeLine.position.copy(pos);
+            edgeLine.quaternion.copy(quat);
+            edgeLine.scale.set(scale.x * ASSEMBLY_PANEL_EDGE_SCALE_FACTOR, scale.y * ASSEMBLY_PANEL_EDGE_SCALE_FACTOR, scale.z * ASSEMBLY_PANEL_EDGE_SCALE_FACTOR);
+        }
+    });
 }
 
 // 内容の大きさに合わせてカメラの初期位置・ズーム範囲を決める。初回ビルド時のみ呼ばれる
@@ -2897,20 +3452,29 @@ function stopAssemblyRenderLoop() {
 
 // #assemblyAreaWrapperの実際の表示サイズにrenderer/cameraを合わせる。
 // #assemblyCanvasのheight:100%が効くには親に明確な高さ（min-heightではなくheight）が
-// 要るため、updateContentAreaMinHeights()と同じ「ヘッダー等を除いた残り高さ」の考え方で
-// ここではheightを直接指定する
+// 要るため、単体タブ表示時はupdateContentAreaMinHeights()と同じ「ヘッダー等を除いた
+// 残り高さ」の考え方でheightを直接指定する。「並べて」タブでは#bothTabContainerのgrid
+// （align-items:stretch）が既に高さを決めてくれるため、ここで上書きしない
+// （updateBothTabContainerHeight()が管理する）
 function resizeAssemblyRenderer() {
     if (!assemblySceneReady) return;
     const wrapper = document.getElementById("assemblyAreaWrapper");
     if (!wrapper) return;
-    const docTop = wrapper.getBoundingClientRect().top + window.scrollY;
-    wrapper.style.height = `${Math.max(window.innerHeight - docTop, 100)}px`;
+    if (activeTab === "both") {
+        wrapper.style.height = "";
+    } else {
+        const docTop = wrapper.getBoundingClientRect().top + window.scrollY;
+        wrapper.style.height = `${Math.max(window.innerHeight - docTop, 100)}px`;
+    }
 
     const w = wrapper.clientWidth, h = wrapper.clientHeight;
     if (w === 0 || h === 0) return;
     assemblyRenderer.setSize(w, h, false);
     assemblyCamera.aspect = w / h;
     assemblyCamera.updateProjectionMatrix();
+    // LineMaterial（音符マットの黒ぶち、fat lines）はlinewidthをピクセル単位で解釈するため、
+    // 実際のcanvasピクセルサイズ（resolution）を都度渡してやる必要がある
+    if (assemblyPanelEdgesMaterial) assemblyPanelEdgesMaterial.resolution.set(w, h);
     if (assemblyAnimFrameId !== null) assemblyRenderer.render(assemblyScene, assemblyCamera);
 }
 
@@ -2930,8 +3494,23 @@ function renderAssemblyPreview() {
 // 「if (activeTab === "map" || activeTab === "both") renderMap();」を編集のたびに
 // 個別に書いていたが、組み立てプレビューでも同じことが必要になったためまとめた）
 function refreshMapAndAssemblyIfVisible() {
-    if (activeTab === "map" || activeTab === "both") renderMap();
-    if (activeTab === "assembly") renderAssemblyPreview();
+    if (isMap2DActive()) renderMap();
+    if (isAssemblyActive()) renderAssemblyPreview();
+}
+
+// マップエリア内の2D/3D切替（#mapAreaWrapper・#assemblyAreaWrapper内のトグル、マップ単体
+// タブ・「並べて」タブどちらでも使える）。タブ自体は切り替えない点がswitchTab()と異なるため、
+// 表示切替・再描画・レンダーループの停止をここで個別に行う
+function setMapViewMode(mode) {
+    if (mode === mapViewMode) return;
+    const wasAssemblyActive = isAssemblyActive();
+    mapViewMode = mode;
+    localStorage.setItem("mapViewMode", mapViewMode);
+    applyTabVisibility();
+    updateContentAreaMinHeights();
+    if (isMap2DActive()) renderMap();
+    if (isAssemblyActive()) renderAssemblyPreview();
+    if (wasAssemblyActive && !isAssemblyActive()) stopAssemblyRenderLoop();
 }
 
 // マップ上の選択ハイライト（.mapSelectionOverlay）を描き直す。renderMap()の全再構築を
@@ -3186,7 +3765,10 @@ function setupMapAreaDrag() {
         // 五線譜タブのドラッグ選択と同じく、マップが表示されている間はページのどこから
         // （#mapAreaの外からでも）ドラッグを開始できるようにする。ボタン等の通常操作の邪魔を
         // しないよう、それらの上でのmousedownだけは除外する。
-        // 「両方」タブでは五線譜エリア内でのmousedownはこちらでは処理しない（setupGlobalEvents()側に任せる）
+        // 「両方」タブでは五線譜エリア内でのmousedownはこちらでは処理しない（setupGlobalEvents()側に任せる）。
+        // マップタブ・「並べて」タブが3Dプレビュー表示中（isAssemblyActive()）の時は、非表示の
+        // 2Dキャンバス上のヒットテストが裏で動いてしまわないよう除外する（OrbitControlsの操作と競合するため）
+        if (isAssemblyActive()) return;
         if (activeTab !== "map" && activeTab !== "both") return;
         if (isSeekDragging) return;
         if (activeTab === "both" && e.target.closest("#scoreWrapper")) return;
@@ -3646,7 +4228,17 @@ function buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap, ho
                 }
             });
             if (isHovered) {
-                staveNote.setStyle({ fillStyle: hoverColor, strokeStyle: hoverColor });
+                // 和音の場合、setStyle()だと和音全体（カーソルが乗っていないピッチも含む）が
+                // 赤く塗られてしまい、実際にホバー中のピッチより上にずれて見える原因になっていた
+                // （右クリックで消える対象は`hoveredPos.hitPitchIndex`が指す1音だけなので、
+                // ハイライトもそのキーだけに絞る）。単音の場合はどちらでも見た目は同じだが、
+                // 和音でない時にsetKeyStyleだと符幹の色が変わらず見た目が変わってしまうため、
+                // ピッチが1つの時は従来通りsetStyleで音符全体を塗る
+                if (pitches.length > 1 && hoveredPos.hitPitchIndex != null && hoveredPos.hitPitchIndex < pitches.length) {
+                    staveNote.setKeyStyle(hoveredPos.hitPitchIndex, { fillStyle: hoverColor, strokeStyle: hoverColor });
+                } else {
+                    staveNote.setStyle({ fillStyle: hoverColor, strokeStyle: hoverColor });
+                }
             }
         }
 
@@ -3795,7 +4387,7 @@ function drawOverlayGhost(context, stave, notesArray, overlayGhost, color) {
 
 // 1行分（複数小節）をVexFlowで構築し、rowDiv（未アペンド）を返す。
 // renderScore()（全体再描画）とupdateHoverRows()（該当行だけの軽量再描画）の両方から呼ばれる共通ロジック
-function buildRow(rowMeasures, rowIndex) {
+function buildRow(rowMeasures, rowIndex, attach) {
         const isFirstRow = rowIndex === 0;
 
         const firstMeasureExtra = isFirstRow ? FIRST_MEASURE_EXTRA : 0;
@@ -3804,6 +4396,12 @@ function buildRow(rowMeasures, rowIndex) {
         const rowDiv = document.createElement("div");
         rowDiv.style.position = "relative";
         rowDiv.dataset.rowIndex = rowIndex;
+        // recordNotePositionsForStaff()が読むrowDiv.offsetTopは、要素がドキュメントに
+        // 挿入され前の行までレイアウトが確定して初めて正しい値になる（未接続のdivは常に0）。
+        // 中身（VexFlow描画・クリック判定位置の記録）を作り始める前に、呼び出し元が
+        // 指定した場所へ先に挿入しておく（renderScore()の初回描画、updateHoverRows()の
+        // 差し替えのどちらでも、この時点で挿入位置さえ確定していれば以降offsetTopは正しい）
+        attach(rowDiv);
 
         const renderer = new VF.Renderer(rowDiv, VF.Renderer.Backends.SVG);
         const rowBottom = score.grandStaff ? STAVE_TOP_LOWER + 150 : STAVE_TOP_BASE + 150;
@@ -4059,8 +4657,7 @@ function renderScore() {
     }
 
     rows.forEach((rowMeasures, rowIndex) => {
-        const rowDiv = buildRow(rowMeasures, rowIndex);
-        scoreElement.appendChild(rowDiv);
+        buildRow(rowMeasures, rowIndex, (rowDiv) => scoreElement.appendChild(rowDiv));
     });
 
     updateCountsBar();
@@ -4610,6 +5207,19 @@ function getMeasureIndexFromXY(clickX, clickY) {
 }
 
 // 実際の音符編集処理（ドラッグでない通常クリック時に呼ばれる）
+// 音符データを書き換えた直後に必ず行う後処理をまとめたもの（保存・再描画・「並べて」タブなら
+// マップも更新・再生中/一時停止中なら音の再スケジュール）。handleNoteEdit()内の分岐ごとに
+// 個別に書くと呼び忘れが起きやすい（実際、再生中の編集を音に反映する処理は長らく抜けていた）
+// ため、1箇所にまとめて呼び出す
+function commitNoteEdit() {
+    saveHistory();
+    renderScore();
+    if (activeTab === "both") renderMap();
+    // 再生中/一時停止中に音符を編集したら、今鳴っている音符はそのまま鳴らし切り、
+    // まだ鳴っていない先の部分だけ新しい内容で敷き直す（BPM変更時と同じ仕組みを流用）
+    if (playState !== "stopped") rescheduleFromCurrentPosition();
+}
+
 function handleNoteEdit(e, svg, rowDiv) {
     // クリック直後にrenderScore()すると、クリック前のホバー位置（プレビュー計算のもとになったnotePositions）が
     // データ変更後には古くなっており、変更後の音符と重複したプレビューが一瞬表示されてしまう。
@@ -4671,9 +5281,7 @@ function handleNoteEdit(e, svg, rowDiv) {
                     }
                     if (nextAccidental !== accidental) {
                         note.pitches[shiftHit.pitchIndex] = `${letter}${nextAccidental}${octave}`;
-                        saveHistory();
-                        renderScore();
-                        if (activeTab === "both") renderMap();
+                        commitNoteEdit();
                     }
                 }
             }
@@ -4704,18 +5312,14 @@ function handleNoteEdit(e, svg, rowDiv) {
                         duration: target.duration,
                         ...(target.dotted ? { dotted: true } : {})
                     };
-                    saveHistory();
-                    renderScore();
-                    if (activeTab === "both") renderMap();
+                    commitNoteEdit();
                 } else {
                     // 既存の和音への音追加（この段の音符自体に追加するだけ、他の段とは無関係）
                     const pitch = yToPitch(clickYLocal, false);
                     if (pitch && !target.pitches.includes(pitch) && target.pitches.length < getChordMax()) {
                         target.pitches.push(pitch);
                         target.pitches.sort((a, b) => pitchToSemitone(a) - pitchToSemitone(b));
-                        saveHistory();
-                        renderScore();
-                        if (activeTab === "both") renderMap();
+                        commitNoteEdit();
                         // 音を設置した瞬間に、その音を鳴らして確認できるようにする
                         playNote(pitch, getAudioContext().currentTime, 0.3);
                     }
@@ -4743,9 +5347,7 @@ function handleNoteEdit(e, svg, rowDiv) {
                     ...beatsToRests(split.trailingBeats)
                 ];
                 targetArray.splice(segment.index, 1, ...replacement);
-                saveHistory();
-                renderScore();
-                if (activeTab === "both") renderMap();
+                commitNoteEdit();
                 // 音を設置した瞬間に、その音を鳴らして確認できるようにする（休符の場合は鳴らさない）
                 if (centerEntry.pitches) {
                     playNote(centerEntry.pitches[0], getAudioContext().currentTime, 0.3);
@@ -4767,14 +5369,10 @@ function handleNoteEdit(e, svg, rowDiv) {
                     duration: note.duration,
                     ...(note.dotted ? { dotted: true } : {})
                 };
-                saveHistory();
-                renderScore();
-                if (activeTab === "both") renderMap();
+                commitNoteEdit();
             } else {
                 note.pitches.splice(hit.pitchIndex, 1);
-                saveHistory();
-                renderScore();
-                if (activeTab === "both") renderMap();
+                commitNoteEdit();
             }
         }
     }
@@ -4818,7 +5416,7 @@ function setupSVGEventsForRow(svg, rowDiv) {
         const hitNoteX = findNoteAtX(measureIndex, mouseX);
 
         const newHovered = pitch
-            ? { measureIndex, x: mouseX, y: mouseY, pitch, staff, hitNoteIndex: hitNote ? hitNote.noteIndex : (hitNoteX ? hitNoteX.noteIndex : null), directHit: !!hitNote }
+            ? { measureIndex, x: mouseX, y: mouseY, pitch, staff, hitNoteIndex: hitNote ? hitNote.noteIndex : (hitNoteX ? hitNoteX.noteIndex : null), hitPitchIndex: hitNote ? hitNote.pitchIndex : null, directHit: !!hitNote }
             : null;
 
         const changed = JSON.stringify(newHovered) !== JSON.stringify(hoveredPos);
@@ -4875,8 +5473,11 @@ function updateHoverRows(prevHoveredPos, newHoveredPos) {
         const endMeasureIndex = startMeasureIndex + rowMeasures.length - 1;
         notePositions = notePositions.filter(p => p.measureIndex < startMeasureIndex || p.measureIndex > endMeasureIndex);
 
-        const newRowDiv = buildRow(rowMeasures, rowIndex);
-        scoreElement.replaceChild(newRowDiv, oldRowDiv);
+        // 新しい行はoldRowDivの直前に挿入してから中身を作る（offsetTopを正しく求めるため、
+        // buildRow()の中身が組み上がる前にDOM上の最終位置を確定させる必要がある）。
+        // 古い行は新しい行の中身が揃ってから取り除く
+        const newRowDiv = buildRow(rowMeasures, rowIndex, (rowDiv) => scoreElement.insertBefore(rowDiv, oldRowDiv));
+        oldRowDiv.remove();
 
         const svg = newRowDiv.querySelector("svg");
         if (svg) setupSVGEventsForRow(svg, newRowDiv);
@@ -5056,7 +5657,7 @@ function reflowForDrawerToggle() {
     // 組み立てプレビューは2Dマップと違い、renderer/カメラのアスペクト比がラッパーの
     // 実サイズに直接依存するカメラ駆動ビューポートなので、ドロワー開閉でも明示的に
     // リサイズが必要（window resizeイベントはドロワー開閉では発火しないため）
-    if (activeTab === "assembly") resizeAssemblyRenderer();
+    if (isAssemblyActive()) resizeAssemblyRenderer();
 }
 
 function setDrawerOpen(open) {
@@ -5295,11 +5896,14 @@ function setupGlobalEvents() {
     document.addEventListener("mousedown", e => {
         // マップタブの操作（マップ側の独立したドラッグ選択、setupMapAreaDrag()）と
         // 干渉しないよう、このハンドラは五線譜が表示されている時だけ動く。
-        // 「両方」タブでは五線譜・マップの両エリアが同時に見えるため、マップエリア内での
-        // mousedownはこちらでは処理しない（setupMapAreaDrag()側に任せる）
+        // 「両方」タブでは五線譜・マップ(2D)の両エリアが同時に見えるため、マップエリア内での
+        // mousedownはこちらでは処理しない（setupMapAreaDrag()側に任せる）。3Dプレビュー表示中も
+        // 同様に、OrbitControlsでのドラッグ（カメラ回転）が誤って小節選択を発生させないよう、
+        // #assemblyAreaWrapper内でのmousedownも除外する
         if (activeTab !== "score" && activeTab !== "both") return;
         if (isSeekDragging) return;
         if (activeTab === "both" && e.target.closest("#mapAreaWrapper")) return;
+        if (activeTab === "both" && e.target.closest("#assemblyAreaWrapper")) return;
         if (e.target.closest("button")) return;
         if (e.target.closest("input")) return;
         if (e.target.closest("label")) return;
@@ -5954,6 +6558,7 @@ async function main() {
             saveHistory();
             renderScore();
             refreshMapAndAssemblyIfVisible();
+            rescheduleFromCurrentPosition();
         });
 
     document.getElementById("transposeUp")
@@ -6052,7 +6657,7 @@ async function main() {
         setupDeleteButtons();
         setupInsertButtons();
         updateAbLoopStripGeometry();
-        if (activeTab === "assembly") resizeAssemblyRenderer();
+        if (isAssemblyActive()) resizeAssemblyRenderer();
     });
 
     document.getElementById("addMeasureBtn")
@@ -6144,6 +6749,26 @@ async function main() {
     }
     document.getElementById("compassBtn")?.addEventListener("click", toggleNorthDirection);
     document.getElementById("assemblyCompassBtn")?.addEventListener("click", toggleNorthDirection);
+
+    // マップタブ内の2D/3D切替
+    document.querySelectorAll(".map-view-mode-btn").forEach(btn => {
+        btn.addEventListener("click", () => setMapViewMode(btn.dataset.mapViewMode));
+    });
+
+    // 2Dマップのグリッド線ON/OFF（3D側のassemblyGridToggleBtnと対になるボタン）
+    const mapGridToggleBtn = document.getElementById("mapGridToggleBtn");
+    if (mapGridToggleBtn) {
+        const applyMapGridToggleStyle = () => {
+            const icon = mapGridToggleBtn.querySelector("i");
+            if (icon) icon.style.color = mapGridVisible ? "#4a6cf7" : "#ccc";
+        };
+        applyMapGridToggleStyle();
+        mapGridToggleBtn.addEventListener("click", () => {
+            mapGridVisible = !mapGridVisible;
+            applyMapGridToggleStyle();
+            if (mapRenderState) drawMapCanvas(mapRenderState);
+        });
+    }
 
     // 組み立てプレビューのグリッド線ON/OFF
     const assemblyGridToggleBtn = document.getElementById("assemblyGridToggleBtn");
