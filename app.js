@@ -96,8 +96,8 @@ if (!TABS.some(t => t.id === activeTab)) activeTab = "score";
 // 独立した「プレビュー」タブを廃止しマップタブに統合した際に導入。当初は「並べて」タブは
 // 2D固定としていたが、直後に「並べてタブでも、2D3Dボタンはいる」との追加依頼で「並べて」でも
 // 切り替えられるよう拡張した）
-let mapViewMode = localStorage.getItem("mapViewMode") || "2d";
-if (mapViewMode !== "2d" && mapViewMode !== "3d") mapViewMode = "2d";
+let mapViewMode = localStorage.getItem("mapViewMode") || "3d";
+if (mapViewMode !== "2d" && mapViewMode !== "3d") mapViewMode = "3d";
 // マップエリア（マップタブ・「並べて」タブどちらでも）が3Dプレビュー表示中かどうか
 // （旧`activeTab === "assembly"`相当の判定）
 function isAssemblyActive() {
@@ -276,7 +276,19 @@ function getAudioContext() {
         audioCtx = new AudioContext();
         masterGainNode = audioCtx.createGain();
         masterGainNode.gain.value = volume;
-        masterGainNode.connect(audioCtx.destination);
+        // SE音源は音価で打ち切らず自然長（約0.5秒）のまま再生する仕様のため、音符の間隔が
+        // それより短い（速い曲・密集した和音等）と多数の音が重なって鳴り続ける。それらを
+        // 単純に加算した音量を制限する仕組みが無かったため、重なりが増えると音割れ
+        // （クリッピング）していた。出力の最終段に軽いリミッター（コンプレッサー）を挟み、
+        // 静かな場面には影響させず、重なって音量が大きくなった瞬間だけ自動で抑える
+        const limiter = audioCtx.createDynamicsCompressor();
+        limiter.threshold.value = -6;  // このdBを超えた分だけ効き始める
+        limiter.knee.value = 6;        // 効き始めをなだらかにする
+        limiter.ratio.value = 20;      // ほぼリミッター相当の強い圧縮比
+        limiter.attack.value = 0.003;  // 音の頭を潰さないよう素早く反応
+        limiter.release.value = 0.15;  // 短すぎるとポンピングして不自然になるため少し長めに
+        masterGainNode.connect(limiter);
+        limiter.connect(audioCtx.destination);
     }
     return audioCtx;
 }
@@ -1669,14 +1681,52 @@ function switchTab(tabId) {
     playTabSwitchAnimation();
 }
 
-// タブ切替時、新しく表示された中身をふわっとフェードイン（+わずかに下からスライド）させる
+// タブ切替時、新しく表示された中身をふわっとフェードイン（+わずかに下からスライド）させる。
+// #mainではなく#bothTabContainer（実際のタブの中身）に対して行う——全画面表示対応で
+// #playbackBarが#mainの子になったため、#main自体をフェードさせると再生バーまで
+// タブ切替のたびに一緒にフェードしてしまう（再生バーはタブ切替と無関係に常時表示のため）
 function playTabSwitchAnimation() {
-    const main = document.getElementById("main");
-    if (!main) return;
-    main.classList.remove("tab-content-fade");
-    void main.offsetWidth; // reflowを強制してアニメーションを最初からやり直させる
-    main.classList.add("tab-content-fade");
+    const container = document.getElementById("bothTabContainer");
+    if (!container) return;
+    container.classList.remove("tab-content-fade");
+    void container.offsetWidth; // reflowを強制してアニメーションを最初からやり直させる
+    container.classList.add("tab-content-fade");
 }
+
+// 全画面表示中、無操作が一定時間続いたら周辺UI（左上のヒント・右上のコーナー
+// オーバーレイ・下部の再生バー）をフェードアウトする。「無操作が一定時間で、全画面の
+// 左上、右上、真下のUIは消えるようにしてほしい」との依頼に対応（動画プレイヤーの
+// 全画面操作UIと同じ定石。再生バーの見た目＝半透明/ぼかしの是非は別件、index.htmlの
+// #main:fullscreen #playbackBar側のコメント参照）。実際の見た目の変化はCSS側
+// （#main.fullscreen-idle ...）が担当し、ここでは「無操作が続いているかどうか」だけを
+// 判定してクラスを付け外しする
+const FULLSCREEN_IDLE_HIDE_MS = 1000;
+function setupFullscreenIdleHide(mainEl) {
+    let idleTimer = null;
+    const scheduleHide = () => {
+        clearTimeout(idleTimer);
+        if (!document.fullscreenElement) return;
+        idleTimer = setTimeout(() => mainEl.classList.add("fullscreen-idle"), FULLSCREEN_IDLE_HIDE_MS);
+    };
+    const onActivity = () => {
+        if (!document.fullscreenElement) return;
+        mainEl.classList.remove("fullscreen-idle");
+        scheduleHide();
+    };
+    ["mousemove", "mousedown", "keydown", "wheel", "touchstart"].forEach(evt => {
+        document.addEventListener(evt, onActivity, { passive: true });
+    });
+    document.addEventListener("fullscreenchange", () => {
+        clearTimeout(idleTimer);
+        mainEl.classList.remove("fullscreen-idle");
+        if (document.fullscreenElement) scheduleHide();
+    });
+}
+
+// 空・陸の色のデフォルト値。「リセットボタンが欲しい」との依頼に対応するため、
+// 初期値としてだけでなくリセット時の復元先としても参照できるよう定数化しておく
+const MAP_SKY_COLOR_DEFAULT = "#4a90d9";
+const MAP_GROUND_COLOR_DEFAULT = "#8fc98a";
 
 // マップ設定
 let mapSettings = {
@@ -1686,6 +1736,8 @@ let mapSettings = {
     wrapValue: 50,               // 折り返し値（一列あたりのセンサー数。レール1マス=センサー1個のためマス数と同義）
     hideUnusedSensors: false,    // true=周りに音符マットがないセンサーを配置しない（カウントにも含めない）
     activeLayer: "middle",       // "middle" | "upper" | "lower" （表示する層）
+    skyColor: MAP_SKY_COLOR_DEFAULT,     // 3Dプレビューの空の色（2D側には見た目上の反映は無いが、設定は2D/3D共通で持つ）
+    groundColor: MAP_GROUND_COLOR_DEFAULT, // 3Dプレビューの陸の色。2Dではマップの背景色として使う
 };
 
 // 層名⇔グリッドのz座標の対応。中間層=0（センサーが存在するのはここだけ）、
@@ -2326,6 +2378,11 @@ function setupBothTabDivider() {
                 renderScore();
                 setupDeleteButtons();
                 setupInsertButtons();
+                // 3D側は境界線ドラッグ中にリサイズが一切呼ばれておらず、CSS上の箱（grid）は
+                // 追従して伸び縮みする一方、WebGLの実解像度とカメラのaspectは元のままだった
+                // ため、その差分がCSSによる引き伸ばし表示として見えていた（「3Dが引き伸ばされた
+                // ようになる」との指摘）。五線譜と同様に1フレームに1回のペースで追従させる
+                if (isAssemblyActive()) resizeAssemblyRenderer();
             });
         }
     });
@@ -2340,6 +2397,7 @@ function setupBothTabDivider() {
         setupDeleteButtons();
         setupInsertButtons();
         if (activeTab === "both") renderMap();
+        if (isAssemblyActive()) resizeAssemblyRenderer();
     });
 
     // 境界線中央の「左右を入れ替え」ボタンは、クリックでの左右入れ替えに加え、
@@ -2580,8 +2638,6 @@ function drawMapCanvas(state) {
     // 罫線は1マスごとにstroke()を呼ぶと（マス数が多い時に）呼び出し回数自体がボトルネックに
     // なるため、全マス分の線分を1つのPath2Dにまとめておき、最後に1回だけstroke()する
     const borderPath = new Path2D();
-    // センサーの赤外線ビームは隣接マスをまたいで伸びるため、全マス描画後にまとめて上から描く
-    const sensorBeams = [];
 
     for (let gy = 0; gy < gridH; gy++) {
         for (let gx = 0; gx < gridW; gx++) {
@@ -2590,7 +2646,7 @@ function drawMapCanvas(state) {
             const data = grid.get(`${ax},${ay},${z}`);
             const ownWrapCoord = isVertical ? ax : ay;
             const isSeparator = isSepCoord(ownWrapCoord);
-            drawMapCell(ctx, borderPath, { px: gx * cellSize, py: gy * cellSize, cellSize, gx, gy, isSeparator, isVertical, data, sensorBeams });
+            drawMapCell(ctx, borderPath, { px: gx * cellSize, py: gy * cellSize, cellSize, gx, gy, isSeparator, isVertical, data });
         }
     }
 
@@ -2599,8 +2655,6 @@ function drawMapCanvas(state) {
         ctx.lineWidth = 1;
         ctx.stroke(borderPath);
     }
-
-    drawMapSensorBeams(ctx, sensorBeams);
 
     ctx.restore();
 }
@@ -2611,30 +2665,10 @@ const SENSOR_CROSS_RATIO = 0.65;
 const SENSOR_ALONG_RATIO = 0.35;
 const SENSOR_AWAY_OFFSET_RATIO = 0.08; // レール（マス中心線）から外側へずらす量（セルサイズに対する比率）
 
-// センサーの「赤外線」ビーム。最初は2マス分の長さにしたが「自分のマスのみ」に
-// 変更してほしいとの依頼で、センサー自身のマスからはみ出さない長さにした。
-// センサーはSENSOR_AWAY_OFFSET_RATIOぶんレールから遠い側へずれているため、
-// センサーからレール側のマス端までの距離はちょうど0.5+SENSOR_AWAY_OFFSET_RATIOになる
-const SENSOR_BEAM_LENGTH_CELLS = 0.5 + SENSOR_AWAY_OFFSET_RATIO;
-function drawMapSensorBeams(ctx, beams) {
-    if (!beams.length) return;
-    ctx.save();
-    ctx.strokeStyle = "rgba(255, 40, 40, 0.55)";
-    ctx.lineWidth = 1.2;
-    ctx.beginPath();
-    beams.forEach(b => {
-        const len = b.cellSize * SENSOR_BEAM_LENGTH_CELLS;
-        ctx.moveTo(b.cx, b.cy);
-        ctx.lineTo(b.cx + b.dx * len, b.cy + b.dy * len);
-    });
-    ctx.stroke();
-    ctx.restore();
-}
-
 // 1マス分の描画。区切りマスの罫線スキップロジックは元のDOM版（renderMap()旧実装）と
 // 一字一句同じ条件式を保っている。罫線はctx.stroke()を都度呼ばず、呼び出し元が持つ
 // 1本のPath2Dに線分を足しこむだけにする（drawMapCanvas()参照）
-function drawMapCell(ctx, borderPath, { px, py, cellSize, gx, gy, isSeparator, isVertical, data, sensorBeams }) {
+function drawMapCell(ctx, borderPath, { px, py, cellSize, gx, gy, isSeparator, isVertical, data }) {
     // --- 背景 ---
     // レールは3Dプレビューと合わせた「細い黒レール2本＋幅広いグレーの横木（穴あき）」の
     // 見た目にするため、単色の塗りつぶし背景は持たない（drawMapRailLine側で直接描く）
@@ -2656,16 +2690,6 @@ function drawMapCell(ctx, borderPath, { px, py, cellSize, gx, gy, isSeparator, i
             ctx, px + (cellSize - sensorW) / 2 + awayOffsetX, py + (cellSize - sensorH) / 2 + awayOffsetY,
             sensorW, sensorH, "sensor"
         );
-        // 「センサーからレールに向けて赤外線みたいなものを2マス分伸ばして」との依頼に対応。
-        // ここではまだ描かず、全マス描画後にまとめて描く（drawMapCanvas参照）。理由:
-        // ビームは隣接マスにまたがって伸びるため、この時点で描くと後から描かれる隣マスの
-        // 背景（白/グレー等）に上書きされて途中で消えてしまう
-        if (sensorBeams) {
-            sensorBeams.push({
-                cx: px + cellSize / 2, cy: py + cellSize / 2,
-                dx: -awayVec.dx, dy: -awayVec.dy, cellSize,
-            });
-        }
     } else if (!isSeparator && data && data.type === "panel" && PITCH_TO_FILE[toCanonicalPitch(data.pitch)]) {
         drawMapGradientRect(ctx, px, py, cellSize, cellSize, "panel");
     } else {
@@ -2852,12 +2876,29 @@ function ensureThreeLoaded(callback) {
 let assemblyScene = null, assemblyCamera = null, assemblyRenderer = null, assemblyControls = null, assemblySun = null;
 let assemblySceneReady = false;
 let assemblyAnimFrameId = null;
+let assemblySkyMesh = null, assemblyGroundMesh = null; // 空（グラデーション球）・陸（地面）。色をUIから変更できるよう参照を保持する
+// 空・陸の色そのものは2D/3D共通のmapSettings.skyColor/groundColorで保持する（保存・共有のため）
+const ASSEMBLY_GROUND_Y = -1.5; // 地面の高さ（カメラがこれより下に潜ったら透明にする判定にも使う）
+const ASSEMBLY_GROUND_TRANSPARENT_OPACITY = 0.12; // 地中に潜った時の地面の不透明度
 let assemblyCameraFramed = false; // 初回のみカメラを内容に合わせてフレーミングする（編集のたびに視点をリセットしないため）
-let assemblyRailSideMesh = null, assemblyRailRungMesh = null, assemblySensorMesh = null, assemblySensorBeamMesh = null;
+// 「一列の最大センサー数」やレール方向はマップ全体の縦横比を大きく変える設定のため、
+// これらが変わった時だけは例外的に再フレーミングする（変えないと、新しい形のマップが
+// 古いカメラ位置の視界外に大きくはみ出し「マップの片割れが残っている」ように見えてしまう）。
+// rebuildAssemblyMeshes()で、フレーミング済みの値と現在の値を比較して判定する
+let assemblyFramedWrapValue = null;
+let assemblyFramedRailDirection = null;
+let assemblyRailSideMesh = null, assemblyRailRungMesh = null, assemblySensorMesh = null;
 let assemblyPanelMeshes = {};   // canonical pitch -> InstancedMesh
 let assemblyPanelEdgesGroup = null; // 音符マット1枚ごとの黒ぶち（THREE.LineSegmentsの集合）
 let assemblyLayerGrids = [];    // 3層それぞれの床グリッド（THREE.GridHelper）
 let assemblyGridVisible = true; // #assemblyGridToggleBtnで切り替える、rebuildAssemblyMeshes()を跨いで保持する
+// カメラワーク（#assemblyCameraPlayBtn＝再生/一時停止、.assembly-angle-btn＝アングル選択）。
+// assemblyCameraAngleModeは"rotateLeft"|"rotateRight"|"trolleyView"の排他選択、
+// assemblyCameraPlayingがtrueの間だけstartAssemblyRenderLoop()のtick内で実際に
+// カメラを動かす。どちらもrebuildAssemblyMeshes()を跨いで保持する（assemblyGridVisibleと
+// 同じ位置付けの状態）
+let assemblyCameraAngleMode = "rotateRight";
+let assemblyCameraPlaying = false;
 let assemblyPlayMarker = null;  // 再生中のトロッコ位置を示す球（initAssemblyScene()で1回だけ作成し使い回す）
 let assemblyBeatCenters = [];   // ビートごとのレール中心のワールド座標（updateAssemblyPlayMarker用、rebuildAssemblyMeshes()のたびに作り直す）
 // 「トロッコが通過するとき、反応する音符マットをへこます」用。beatIndex -> [{pitch, index}]
@@ -2872,10 +2913,71 @@ let assemblyPanelEdgeOffsetByPitch = {}; // canonical pitch -> assemblyPanelEdge
 const ASSEMBLY_CELL_SIZE = 1;
 // 層の間隔はマス目の縦横と同じ長さにする（＝1マスぶんが縦横高さとも等しい立方体になる）
 const ASSEMBLY_LAYER_HEIGHT = ASSEMBLY_CELL_SIZE;
+const ASSEMBLY_ROTATE_SPEED = 0.7; // 自動回転の速さ（OrbitControls既定の2.0より遅く「ゆっくり」に）
+// トロッコ視点のカメラの高さ・後方オフセット・注視点の先読み距離。
+// 見下ろし角度＝atan(HEIGHT/(BACK_OFFSET+LOOK_AHEAD))という関係があるため、
+// 3つを個別に調整することで「見下ろし具合」と「引き具合」を別々にコントロールできる。
+// 「もう少しカメラを下げて、遠くが見える感じで」との指定でHEIGHTを下げ、LOOK_AHEADを
+// 伸ばして遠近感を強調した後、「気持ち見下し気味で、水平線は見えるように」との指定で
+// HEIGHTだけ少し戻した（見下ろし角を少し付けつつ、浅めに保って遠くの見通しは保つ）
+const ASSEMBLY_TROLLEY_VIEW_HEIGHT = 2.2; // トロッコ視点のカメラの高さ（トロッコ位置からの上乗せ）
+const ASSEMBLY_TROLLEY_VIEW_BACK_OFFSET = 4; // トロッコ視点のカメラを進行方向と逆へ下げる量
+const ASSEMBLY_TROLLEY_VIEW_LOOK_AHEAD = 4; // 注視点をトロッコの少し先に置く距離
 
 const MAP_PANEL_MATERIALS = {}; // canonical pitch -> [6面ぶんのMeshStandardMaterial]（BoxGeometry用）
-let assemblyRailMaterial = null, assemblyRailRungMaterial = null, assemblySensorMaterial = null, assemblySensorBeamMaterial = null, assemblyPanelSideMaterial = null, assemblyUnitBoxGeometry = null;
+let assemblyRailMaterial = null, assemblyRailRungMaterial = null, assemblySensorMaterial = null, assemblyPanelSideMaterial = null, assemblyUnitBoxGeometry = null;
 let assemblyPanelEdgesGeometry = null, assemblyPanelEdgesMaterial = null; // 音符マットの黒ぶち用（共有、位置/回転/スケールだけ個別に設定する）
+
+// 空の色（#assemblySkyColorInput）を変更する。水平線側（bottomColor）は指定色を白へ
+// 75%寄せた明るい色を自動で作り、グラデーション自体は常に保つ
+function applyAssemblySkyColor(hex) {
+    if (!assemblySkyMesh) return;
+    const top = new THREE.Color(hex);
+    const bottom = top.clone().lerp(new THREE.Color(0xffffff), 0.75);
+    assemblySkyMesh.material.uniforms.topColor.value.copy(top);
+    assemblySkyMesh.material.uniforms.bottomColor.value.copy(bottom);
+}
+
+// 陸の色（#assemblyGroundColorInput）を変更する
+function applyAssemblyGroundColor(hex) {
+    if (!assemblyGroundMesh) return;
+    assemblyGroundMesh.material.color.set(hex);
+}
+
+// 色ピッカーの"input"連打（ドラッグ中の連続発火）を、指を止めた瞬間だけにまとめるための
+// 汎用デバウンス。最後の呼び出しからdelayms経っても次が来なければそこでfnを実行する
+const MAP_COLOR_INPUT_DEBOUNCE_MS = 200;
+function debounce(fn, delay) {
+    let timer = null;
+    return (...args) => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => { timer = null; fn(...args); }, delay);
+    };
+}
+
+// 空・陸の色の変更窓口。mapSettingsへ保存し（2D側にUIは無いが、設定自体は共通の
+// mapSettingsに保持し続ける）、3D側の見た目・color inputの表示値を更新する
+function setAssemblySkyColor(hex) {
+    mapSettings.skyColor = hex;
+    saveMapSettings();
+    applyAssemblySkyColor(hex);
+    if (assemblyRenderer && assemblyCamera) assemblyRenderer.render(assemblyScene, assemblyCamera);
+    document.querySelectorAll(".map-sky-color-input").forEach(el => { el.value = hex; });
+}
+
+function setAssemblyGroundColor(hex) {
+    mapSettings.groundColor = hex;
+    saveMapSettings();
+    applyAssemblyGroundColor(hex);
+    if (assemblyRenderer && assemblyCamera) assemblyRenderer.render(assemblyScene, assemblyCamera);
+    document.querySelectorAll(".map-ground-color-input").forEach(el => { el.value = hex; });
+}
+
+// 空・陸の色を初期値に戻す（「リセットボタンが欲しい」との依頼対応）
+function resetAssemblyColors() {
+    setAssemblySkyColor(MAP_SKY_COLOR_DEFAULT);
+    setAssemblyGroundColor(MAP_GROUND_COLOR_DEFAULT);
+}
 
 // 初回のタブ切り替え時にだけ呼ばれる。renderer/scene/camera/ライト/OrbitControls/
 // 共有ジオメトリ・マテリアルを1回だけ構築する
@@ -2902,7 +3004,61 @@ function initAssemblyScene() {
     assemblyRenderer.toneMappingExposure = 1.35;
 
     assemblyScene = new THREE.Scene();
-    assemblyScene.background = new THREE.Color(0xffffff);
+
+    // 空: カメラを中心に包む大きな球（内側から見る＝THREE.BackSide）に、頂点の高さで
+    // 色を補間するグラデーションシェーダーをかける（three.js公式サンプルの空と同じ手法）。
+    // 「見上げると中央後方に大きな黒丸が出る」不具合の原因は、この球がワールド原点に
+    // 固定されていたこと——カメラがOrbitControlsの平行移動で原点から離れると、球の外に
+    // 出てしまい（BackSideは内側からしか見えないため）その先の何も無い部分が
+    // レンダラーの既定クリアカラー（黒）で見えてしまっていた。対策として、毎フレーム
+    // 球の位置をカメラの現在位置に合わせる（startAssemblyRenderLoop参照）ことで、
+    // カメラが常に球の中心＝内側に居続けるようにした
+    const skyGeometry = new THREE.SphereGeometry(450, 32, 15);
+    const skyMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+            topColor: { value: new THREE.Color(mapSettings.skyColor) },
+            bottomColor: { value: new THREE.Color(mapSettings.skyColor).lerp(new THREE.Color(0xffffff), 0.75) },
+            offset: { value: 20 },
+            exponent: { value: 0.6 },
+        },
+        vertexShader: `
+            varying vec3 vWorldPosition;
+            void main() {
+                vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+                vWorldPosition = worldPosition.xyz;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+        `,
+        fragmentShader: `
+            uniform vec3 topColor;
+            uniform vec3 bottomColor;
+            uniform float offset;
+            uniform float exponent;
+            varying vec3 vWorldPosition;
+            void main() {
+                float h = normalize(vWorldPosition + vec3(0.0, offset, 0.0)).y;
+                gl_FragColor = vec4(mix(bottomColor, topColor, max(pow(max(h, 0.0), exponent), 0.0)), 1.0);
+            }
+        `,
+        side: THREE.BackSide,
+        fog: false,
+        depthWrite: false,
+    });
+    assemblySkyMesh = new THREE.Mesh(skyGeometry, skyMaterial);
+    assemblyScene.add(assemblySkyMesh);
+
+    // 陸（地面）。3層（上位/中間/下位）の一番下より確実に低い位置に置く。
+    // THREE.DoubleSideにしておくことで、万が一下から見上げても（表面が裏返っていても）
+    // 面自体が消えて黒い穴に見えることがないようにする。transparent:trueにしておき、
+    // カメラが地面より下に潜り込んだ時だけstartAssemblyRenderLoop()側でopacityを
+    // 下げて透明にする（「地中に埋まったら地面を透明にして上を見上げられるように」）
+    const groundGeometry = new THREE.PlaneGeometry(900, 900);
+    const groundMaterial = new THREE.MeshStandardMaterial({ color: mapSettings.groundColor, roughness: 1, side: THREE.DoubleSide, transparent: true, opacity: 1 });
+    assemblyGroundMesh = new THREE.Mesh(groundGeometry, groundMaterial);
+    assemblyGroundMesh.rotation.x = -Math.PI / 2;
+    assemblyGroundMesh.position.y = ASSEMBLY_GROUND_Y;
+    assemblyGroundMesh.receiveShadow = true;
+    assemblyScene.add(assemblyGroundMesh);
 
     assemblyCamera = new THREE.PerspectiveCamera(50, 1, 0.1, 500);
     assemblyCamera.position.set(12, 12, 12); // 内容に応じてframeAssemblyCamera()が上書きする
@@ -2927,13 +3083,15 @@ function initAssemblyScene() {
     assemblyControls.enableDamping = true;
     assemblyControls.dampingFactor = 0.08;
     assemblyControls.zoomToCursor = true; // マウス（タッチ）位置を中心にズームする
-    // 右ドラッグは常に平行移動。左ドラッグは通常は回転だが、OrbitControls標準の挙動として
-    // Shift/Ctrl/Metaを押しながらだと自動的に平行移動に切り替わる（mouseButtons.LEFTを
-    // ROTATEのままにしておくだけでよく、こちらで手動切り替えする必要はない）
+    // 「右クリックのドラッグで回転、左クリックのドラッグで移動にしてほしい（今の逆）」との
+    // 依頼で、既定のOrbitControls配置（左=回転/右=平行移動）から入れ替えた。OrbitControls
+    // 標準の挙動として、割り当てた操作がどちらのボタンでもShift/Ctrl/Metaを押しながらだと
+    // 回転⇔平行移動が反転する（こちらで手動切り替えする必要はない）
     assemblyControls.enablePan = true;
-    assemblyControls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+    assemblyControls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
     assemblyControls.minDistance = 3;
     assemblyControls.maxDistance = 200; // frameAssemblyCamera()で曲ごとに調整
+    assemblyControls.autoRotateSpeed = ASSEMBLY_ROTATE_SPEED; // 既定値2.0より遅く、「ゆっくり」回転させる（左回り/右回りボタン）
     canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
     // 使い回す共有ジオメトリ・マテリアル（2Dマップの色使いに合わせる: レール=ダークグレー、
@@ -2944,9 +3102,6 @@ function initAssemblyScene() {
     // 2Dマップの中央帯（drawMapRailLine、#999）と同系色（rebuildAssemblyMeshes参照）
     assemblyRailRungMaterial = new THREE.MeshStandardMaterial({ color: 0x999999, roughness: 0.6, metalness: 0.25 });
     assemblySensorMaterial = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.5, metalness: 0.1 });
-    // センサーの「赤外線」ビーム（2Dのdraw MapSensorBeamsと同じ発想）。光源の影響を受けず
-    // 常に一定の明るさで光って見えるようMeshBasicMaterialを使い、半透明にしてビームらしさを出す
-    assemblySensorBeamMaterial = new THREE.MeshBasicMaterial({ color: 0xff2828, transparent: true, opacity: 0.55 });
     assemblyPanelSideMaterial = new THREE.MeshStandardMaterial({ color: 0xefefef, roughness: 0.8 });
     // 音符マットの黒ぶち。単位立方体（assemblyUnitBoxGeometry）の辺だけを取り出したジオメトリを
     // 1つ共有し、各マットの実際のサイズ・位置・回転はLineSegments2側のscale/position/quaternionで
@@ -3104,13 +3259,12 @@ function updateAssemblyEmptyState(isEmpty) {
 // 前回分のInstancedMeshだけ破棄して作り直す）
 function rebuildAssemblyMeshes() {
     updateAssemblySunPosition(); // コンパスの向き（northDirection）が変わっても常に南から光が当たるようにする
-    [assemblyRailSideMesh, assemblyRailRungMesh, assemblySensorMesh, assemblySensorBeamMesh, ...Object.values(assemblyPanelMeshes)].forEach(m => {
+    [assemblyRailSideMesh, assemblyRailRungMesh, assemblySensorMesh, ...Object.values(assemblyPanelMeshes)].forEach(m => {
         if (m) assemblyScene.remove(m);
     });
     assemblyRailSideMesh = null;
     assemblyRailRungMesh = null;
     assemblySensorMesh = null;
-    assemblySensorBeamMesh = null;
     assemblyPanelMeshes = {};
     if (assemblyPanelEdgesGroup) assemblyScene.remove(assemblyPanelEdgesGroup);
     assemblyPanelEdgesGroup = null;
@@ -3123,6 +3277,7 @@ function rebuildAssemblyMeshes() {
     assemblyPanelPositionsByPitch = {};
     assemblyPanelEdgeOffsetByPitch = {};
     assemblyPressedBeatIndex = null;
+    assemblyPanelPressAnimations = new Map();
 
     const { grid, extent, beatCenters } = buildMapGrid();
     if (!extent) {
@@ -3152,10 +3307,6 @@ function rebuildAssemblyMeshes() {
     const panelPositionsByPitch = {}; // canonical pitch -> Vector3[]
     const rotY = northDirection * Math.PI / 2;
     const SENSOR_AWAY_OFFSET = 0.08; // 2D側のSENSOR_AWAY_OFFSET_RATIOと同じ比率（ASSEMBLY_CELL_SIZE=1なのでそのまま距離になる）
-    // ビームは「自分のマスのみ」に収める。センサーはSENSOR_AWAY_OFFSETぶんレールから
-    // 遠い側へずれているため、センサーからレール側のマス端までの距離は0.5+SENSOR_AWAY_OFFSET
-    const SENSOR_BEAM_LENGTH = 0.5 + SENSOR_AWAY_OFFSET;
-    const sensorBeamPositions = [];
 
     for (const [key, data] of grid) {
         const parts = key.split(",").map(Number);
@@ -3174,9 +3325,6 @@ function rebuildAssemblyMeshes() {
             const away = data.awayVec || { dx: 0, dy: 0 };
             const sensorPos = pos.clone().add(new THREE.Vector3(away.dx * SENSOR_AWAY_OFFSET, 0, away.dy * SENSOR_AWAY_OFFSET));
             sensorPositions.push(sensorPos);
-            // 「センサーからレールに向けて赤外線みたいなものを2マス分伸ばして」との依頼に対応。
-            // awayの逆向き（＝レールに向かう向き）へ2マス分の中心位置を計算する
-            sensorBeamPositions.push(sensorPos.clone().add(new THREE.Vector3(-away.dx * SENSOR_BEAM_LENGTH / 2, 0, -away.dy * SENSOR_BEAM_LENGTH / 2)));
         } else if (data.type === "panel") {
             const canon = toCanonicalPitch(data.pitch);
             if (!PITCH_TO_FILE[canon]) continue; // 2D版と同じ「対応画像が無ければ描かない」ガード
@@ -3260,16 +3408,6 @@ function rebuildAssemblyMeshes() {
         railIsVertical ? SENSOR_CROSS : SENSOR_ALONG, 0.25, railIsVertical ? SENSOR_ALONG : SENSOR_CROSS, 0
     );
     assemblyScene.add(assemblySensorMesh);
-    // センサーの「赤外線」ビーム。awayVecの軸（railIsVerticalならX軸、そうでなければZ軸）に
-    // 沿って伸びる細い半透明の棒。SENSOR_BEAM_LENGTH（マス数）は上のループで位置計算済み
-    const SENSOR_BEAM_THICKNESS = 0.035;
-    assemblySensorBeamMesh = buildAssemblyInstancedMesh(
-        sensorBeamPositions, assemblyUnitBoxGeometry, assemblySensorBeamMaterial,
-        railIsVertical ? SENSOR_BEAM_LENGTH : SENSOR_BEAM_THICKNESS, SENSOR_BEAM_THICKNESS, railIsVertical ? SENSOR_BEAM_THICKNESS : SENSOR_BEAM_LENGTH, 0
-    );
-    assemblySensorBeamMesh.castShadow = false;
-    assemblySensorBeamMesh.receiveShadow = false;
-    assemblyScene.add(assemblySensorBeamMesh);
     Object.entries(panelPositionsByPitch).forEach(([pitch, positions]) => {
         const mesh = buildAssemblyInstancedMesh(positions, assemblyUnitBoxGeometry, getAssemblyPanelMaterials(pitch), 0.95, 0.15, 0.95, rotY);
         assemblyPanelMeshes[pitch] = mesh;
@@ -3319,9 +3457,18 @@ function rebuildAssemblyMeshes() {
     assemblySun.shadow.camera.bottom = -shadowHalfExtent;
     assemblySun.shadow.camera.updateProjectionMatrix();
 
+    // 「一列の最大センサー数」やレール方向はマップ全体の縦横比を大きく変えるため、
+    // 前回フレーミングした時から変わっていたら、通常は編集のたびに視点をリセットしない
+    // 方針を例外的に上書きして再フレーミングする（assemblyFramedWrapValue等の説明参照）
+    if (assemblyCameraFramed &&
+        (assemblyFramedWrapValue !== mapSettings.wrapValue || assemblyFramedRailDirection !== mapSettings.railDirection)) {
+        assemblyCameraFramed = false;
+    }
     if (!assemblyCameraFramed) {
         frameAssemblyCamera(extent);
         assemblyCameraFramed = true;
+        assemblyFramedWrapValue = mapSettings.wrapValue;
+        assemblyFramedRailDirection = mapSettings.railDirection;
     }
 
     // 再生中/一時停止中にグリッドが再構築された場合、現在位置のマーカーを再適用する
@@ -3371,52 +3518,93 @@ function updateAssemblyPlayMarker(beatIndex, t) {
 // (4)per-instance colorをより強い暖色にして遠目にも分かる色の変化にする。
 // THREE.Vector3/THREE.Colorは、window.THREEが非同期に用意されるまで参照できないため、
 // （initAssemblyScene()以外の）トップレベルのconstで生成してはいけない（ensureThreeLoaded
-// 参照）。ここは数値だけ持ち、実際のTHREEオブジェクトはsetAssemblyPanelPressed()の中で作る
+// 参照）。ここは数値だけ持ち、実際のTHREEオブジェクトはapplyAssemblyPanelPressAmount()の中で作る
 const ASSEMBLY_PANEL_PRESS_DEPTH = 0.32;
 const ASSEMBLY_PANEL_PRESS_SCALE_Y = 0.22; // 縦方向のスケール（大きく押しつぶす）
 const ASSEMBLY_PANEL_PRESS_SCALE_XZ = 1.3; // 横方向のスケール（押しつぶされて広がる。真上から見てもfootprintの変化で分かる）
 const ASSEMBLY_PANEL_BASE_SCALE_XYZ = [0.95, 0.15, 0.95];
 const ASSEMBLY_PANEL_PRESSED_COLOR_RGB = [2.2, 1.6, 0.4]; // 強めの暖色に光らせる（1より大きい成分は明るく発光して見える）
+// 「アニメーションを滑らかに」との依頼を受けて一度は押し込み・戻りの両方をアニメーション化
+// したが、直後に「踏み込む瞬間は一瞬に、戻る時は今のままで」と修正された。踏み込みは
+// setAssemblyPanelPressed()内でamountを即座に1にする（アニメーションさせない）ため、
+// ここに残るdurationは戻り（1→0）専用
+const ASSEMBLY_PANEL_RELEASE_DURATION_S = 0.18;
+const ASSEMBLY_PANEL_PRESS_SETTLE_EPS = 0.001;
+let assemblyPanelPressAnimations = new Map(); // "pitch:index" -> {pitch, index, amount, target}
+
+function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+
+// amount(0..1)に応じてマット本体＋黒ぶちの行列・色を補間して書き込む
+function applyAssemblyPanelPressAmount(pitch, index, amount) {
+    const mesh = assemblyPanelMeshes[pitch];
+    const basePos = assemblyPanelPositionsByPitch[pitch]?.[index];
+    if (!mesh || !basePos) return;
+    const [baseSx, baseSy, baseSz] = ASSEMBLY_PANEL_BASE_SCALE_XYZ;
+    const eased = easeOutCubic(Math.max(0, Math.min(1, amount)));
+
+    const scaleY = baseSy - (baseSy - baseSy * ASSEMBLY_PANEL_PRESS_SCALE_Y) * eased;
+    const scaleXZ = 1 + (ASSEMBLY_PANEL_PRESS_SCALE_XZ - 1) * eased;
+    const pos = basePos.clone();
+    pos.y += ((baseSy - scaleY) / 2 - ASSEMBLY_PANEL_PRESS_DEPTH) * eased;
+    const scale = new THREE.Vector3(baseSx * scaleXZ, scaleY, baseSz * scaleXZ);
+    const quat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), assemblyPanelRotY);
+    const color = new THREE.Color(
+        1 + (ASSEMBLY_PANEL_PRESSED_COLOR_RGB[0] - 1) * eased,
+        1 + (ASSEMBLY_PANEL_PRESSED_COLOR_RGB[1] - 1) * eased,
+        1 + (ASSEMBLY_PANEL_PRESSED_COLOR_RGB[2] - 1) * eased,
+    );
+
+    const m = new THREE.Matrix4();
+    m.compose(pos, quat, scale);
+    mesh.setMatrixAt(index, m);
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.setColorAt(index, color);
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+
+    // 「凹んでいても黒ぶちは凹まない」との指摘に対応。黒ぶち（LineSegments2、
+    // InstancedMeshではなく普通のObject3D）を、マット本体と同じ位置・スケールに
+    // 追従させる（ASSEMBLY_PANEL_EDGE_SCALE_FACTORぶんだけ一回り大きくするのは
+    // 元のbuildAssemblyEdgeLines()と同じ理由＝z-fighting防止）
+    const edgeOffset = assemblyPanelEdgeOffsetByPitch[pitch];
+    const edgeLine = (edgeOffset !== undefined && assemblyPanelEdgesGroup)
+        ? assemblyPanelEdgesGroup.children[edgeOffset + index]
+        : null;
+    if (edgeLine) {
+        edgeLine.position.copy(pos);
+        edgeLine.quaternion.copy(quat);
+        edgeLine.scale.set(scale.x * ASSEMBLY_PANEL_EDGE_SCALE_FACTOR, scale.y * ASSEMBLY_PANEL_EDGE_SCALE_FACTOR, scale.z * ASSEMBLY_PANEL_EDGE_SCALE_FACTOR);
+    }
+}
+
+// beatIndexに鳴る音符マット（1つまたは和音で複数）を凹ませる/元に戻す。
+// 「踏み込む瞬間は一瞬に」との指定で、押す時（pressed=true）はアニメーションさせず
+// その場でamount=1にする。戻る時（pressed=false）だけtickAssemblyPanelPressAnimations()
+// による補間アニメーション対象にする
 function setAssemblyPanelPressed(beatIndex, pressed) {
     const entries = assemblyPanelInstancesByBeat.get(beatIndex);
     if (!entries) return;
-    const [baseSx, baseSy, baseSz] = ASSEMBLY_PANEL_BASE_SCALE_XYZ;
-    const quat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), assemblyPanelRotY);
-    const color = pressed ? new THREE.Color(...ASSEMBLY_PANEL_PRESSED_COLOR_RGB) : new THREE.Color(1, 1, 1);
-    const m = new THREE.Matrix4();
     entries.forEach(({ pitch, index }) => {
-        const mesh = assemblyPanelMeshes[pitch];
-        const basePos = assemblyPanelPositionsByPitch[pitch]?.[index];
-        if (!mesh || !basePos) return;
-        const pos = basePos.clone();
-        const scaleY = pressed ? baseSy * ASSEMBLY_PANEL_PRESS_SCALE_Y : baseSy;
-        const scaleXZ = pressed ? ASSEMBLY_PANEL_PRESS_SCALE_XZ : 1;
+        const key = `${pitch}:${index}`;
         if (pressed) {
-            // 底面はほぼ据え置き（スケールを潰した分だけ中心のyを上げて補正）にしつつ、
-            // さらにASSEMBLY_PANEL_PRESS_DEPTHぶん沈める。天面は「据え置きの底面＋潰した
-            // 高さ」から沈み込み量ぶんさらに下がるので、見た目には「床に押し込まれた」形になる
-            pos.y += (baseSy - scaleY) / 2 - ASSEMBLY_PANEL_PRESS_DEPTH;
+            assemblyPanelPressAnimations.delete(key);
+            applyAssemblyPanelPressAmount(pitch, index, 1);
+            return;
         }
-        const scale = new THREE.Vector3(baseSx * scaleXZ, scaleY, baseSz * scaleXZ);
-        m.compose(pos, quat, scale);
-        mesh.setMatrixAt(index, m);
-        mesh.instanceMatrix.needsUpdate = true;
-        mesh.setColorAt(index, color);
-        if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+        // 押し込みは常に瞬時にamount=1へ飛ぶため、戻り始めのamountは常に1でよい
+        assemblyPanelPressAnimations.set(key, { pitch, index, amount: 1, target: 0 });
+    });
+}
 
-        // 「凹んでいても黒ぶちは凹まない」との指摘に対応。黒ぶち（LineSegments2、
-        // InstancedMeshではなく普通のObject3D）を、マット本体と同じ位置・スケールに
-        // 追従させる（ASSEMBLY_PANEL_EDGE_SCALE_FACTORぶんだけ一回り大きくするのは
-        // 元のbuildAssemblyEdgeLines()と同じ理由＝z-fighting防止）
-        const edgeOffset = assemblyPanelEdgeOffsetByPitch[pitch];
-        const edgeLine = (edgeOffset !== undefined && assemblyPanelEdgesGroup)
-            ? assemblyPanelEdgesGroup.children[edgeOffset + index]
-            : null;
-        if (edgeLine) {
-            edgeLine.position.copy(pos);
-            edgeLine.quaternion.copy(quat);
-            edgeLine.scale.set(scale.x * ASSEMBLY_PANEL_EDGE_SCALE_FACTOR, scale.y * ASSEMBLY_PANEL_EDGE_SCALE_FACTOR, scale.z * ASSEMBLY_PANEL_EDGE_SCALE_FACTOR);
-        }
+// 毎フレーム呼ぶ。amountをtargetへ少しずつ近づけ、その値で見た目を更新する
+// （現状、Mapに入るのは「戻り」アニメーションのみ）。目標に到達したエントリは
+// Mapから取り除く（以降は何もしなくてよい静止状態のため）
+function tickAssemblyPanelPressAnimations(dt) {
+    if (assemblyPanelPressAnimations.size === 0) return;
+    const step = dt / ASSEMBLY_PANEL_RELEASE_DURATION_S;
+    assemblyPanelPressAnimations.forEach((anim, key) => {
+        anim.amount = Math.max(anim.target, anim.amount - step);
+        applyAssemblyPanelPressAmount(anim.pitch, anim.index, anim.amount);
+        if (Math.abs(anim.amount - anim.target) < ASSEMBLY_PANEL_PRESS_SETTLE_EPS) assemblyPanelPressAnimations.delete(key);
     });
 }
 
@@ -3435,14 +3623,95 @@ function frameAssemblyCamera(extent) {
     assemblyControls.update();
 }
 
+// assemblyCameraPlaying×assemblyCameraAngleModeの現在の組み合わせをOrbitControlsに反映する。
+// 再生/一時停止ボタン・アングル選択ボタンのどちらのクリックからも呼ばれる
+function applyAssemblyCameraAngleAndPlayState() {
+    if (!assemblyControls) return;
+    if (assemblyCameraPlaying && assemblyCameraAngleMode === "trolleyView") {
+        // トロッコ視点はupdateAssemblyTrolleyViewCamera()がカメラを直接動かすため、
+        // OrbitControlsのドラッグ操作は無効化する（有効のままだとドラッグ入力が
+        // 内部に溜まり、トロッコ視点を抜けた瞬間にカメラが跳ねる原因になる）
+        assemblyControls.autoRotate = false;
+        assemblyControls.enabled = false;
+    } else if (assemblyCameraPlaying) {
+        assemblyControls.enabled = true;
+        assemblyControls.autoRotate = true;
+        assemblyControls.autoRotateSpeed = assemblyCameraAngleMode === "rotateLeft" ? -ASSEMBLY_ROTATE_SPEED : ASSEMBLY_ROTATE_SPEED;
+    } else {
+        assemblyControls.autoRotate = false;
+        assemblyControls.enabled = true;
+    }
+}
+
 function startAssemblyRenderLoop() {
     if (assemblyAnimFrameId !== null) return;
+    let lastTime = performance.now();
     const tick = () => {
         assemblyAnimFrameId = requestAnimationFrame(tick);
-        assemblyControls.update();
+        const now = performance.now();
+        // タブを切り替えて離れていた間などdtが異常に大きくなるケースに備えて上限を設ける
+        // （音符マットの凹みアニメーションが一気に飛ぶのを防ぐ）
+        const dt = Math.min(0.1, (now - lastTime) / 1000);
+        lastTime = now;
+        tickAssemblyPanelPressAnimations(dt);
+        if (assemblyCameraPlaying && assemblyCameraAngleMode === "trolleyView") {
+            // トロッコ視点はOrbitControlsを経由せずカメラを直接動かすため、
+            // controls.update()は呼ばない（呼ぶと内部のspherical状態に基づいて
+            // 位置が上書きされてしまう）
+            updateAssemblyTrolleyViewCamera();
+        } else {
+            // 左回り/右回り再生中は、トロッコが見えている間だけ回転の中心を
+            // トロッコの現在位置へ追従させる（再生していない/トロッコが無い時は
+            // 直前の中心のまま回り続ける）
+            if (assemblyCameraPlaying && assemblyPlayMarker && assemblyPlayMarker.visible) {
+                assemblyControls.target.copy(assemblyPlayMarker.position);
+            }
+            assemblyControls.update();
+        }
+        // 空の球を常にカメラの位置へ追従させる（黒丸バグ対策、initAssemblyScene参照）
+        if (assemblySkyMesh) assemblySkyMesh.position.copy(assemblyCamera.position);
+        // 「地面より地中にアングルが埋まってしまった場合、地面は透明で上を見上げられる
+        // ように」との依頼に対応。カメラが地面のyより下に潜っている間だけ地面を
+        // 半透明にし、地上に戻ったら元の不透明度に戻す
+        if (assemblyGroundMesh) {
+            const shouldBeTransparent = assemblyCamera.position.y < ASSEMBLY_GROUND_Y;
+            const targetOpacity = shouldBeTransparent ? ASSEMBLY_GROUND_TRANSPARENT_OPACITY : 1;
+            if (assemblyGroundMesh.material.opacity !== targetOpacity) {
+                assemblyGroundMesh.material.opacity = targetOpacity;
+            }
+        }
         assemblyRenderer.render(assemblyScene, assemblyCamera);
     };
     tick();
+}
+
+// トロッコ視点: トロッコよりやや後ろにカメラを置き、進行方向を向かせる
+// （drawMapPlayLine/updateAssemblyPlayMarkerと同じ、beatIndexとbeatIndex+1の
+// レール中心座標から進行方向を求める）
+function updateAssemblyTrolleyViewCamera() {
+    if (!assemblyPlayMarker || !assemblyPlayMarker.visible || currentHighlightBeatIndex == null) return;
+    const posA = assemblyBeatCenters[currentHighlightBeatIndex];
+    if (!posA) return;
+    let posB = assemblyBeatCenters[currentHighlightBeatIndex + 1] || posA;
+    // 段の折り返しをまたぐ大ジャンプは進行方向として不自然なので、直前の位置を保つ
+    if (posA.distanceTo(posB) > ASSEMBLY_CELL_SIZE * 1.5) posB = posA;
+    let forward = posB.clone().sub(posA);
+    if (forward.lengthSq() < 1e-6) forward.set(0, 0, 1); // 移動が無い瞬間のフォールバック
+    forward.y = 0;
+    forward.normalize();
+
+    // 「トロッコよりやや後ろ」との指定で、進行方向と逆向きに少し下げた位置にカメラを置く
+    const eye = assemblyPlayMarker.position.clone();
+    eye.addScaledVector(forward, -ASSEMBLY_TROLLEY_VIEW_BACK_OFFSET);
+    eye.y += ASSEMBLY_TROLLEY_VIEW_HEIGHT;
+    assemblyCamera.position.copy(eye);
+    // 注視点はeyeの高さ（=トロッコより高い位置）ではなく、トロッコ自身の高さのまま
+    // 少し先を見るようにする。真水平を向かせるとカメラがトロッコより高く・近いせいで
+    // トロッコが画面の下端からはみ出して見えなくなっていた（「トロッコの後ろが見える
+    // くらいでいい」との指摘はこれが原因）。トロッコの高さを見ることで自然に見下ろす
+    // 角度になり、後ろ姿が画面内に収まる
+    const lookTarget = assemblyPlayMarker.position.clone().addScaledVector(forward, ASSEMBLY_TROLLEY_VIEW_LOOK_AHEAD);
+    assemblyCamera.lookAt(lookTarget);
 }
 
 function stopAssemblyRenderLoop() {
@@ -5828,6 +6097,16 @@ function setupGlobalEvents() {
         const dy = dragState.currentY - dragState.startY;
         if (!dragState.isDragging && Math.hypot(dx, dy) > DRAG_THRESHOLD) {
             dragState.isDragging = true;
+            // ドラッグが小節選択と確定した瞬間、それより前のホバー（mousedown直前まで
+            // 更新されていた音符プレビュー）がsetupSVGEventsForRow側のmousemoveで
+            // 更新されずに残ったままになる（dragState存在中はホバー処理自体をスキップする
+            // 実装のため）。「もう音符は設置しない、ホバープレビューは不要」との指摘に対応し、
+            // ここで明示的に消す
+            if (hoveredPos !== null) {
+                const prevHovered = hoveredPos;
+                hoveredPos = null;
+                updateHoverRows(prevHovered, null);
+            }
         }
         if (dragState.isDragging) {
             drawSelectionRect();
@@ -6406,6 +6685,11 @@ function musicXMLToScore(xmlString) {
 
 // 読み込み完了後の共通後処理（JSON/MusicXMLどちらの読み込み結果もここに渡す）
 function applyLoadedScore({ score: loadedScore, title, bpm, northDirection: loadedNorthDirection, mapSettings: loadedMapSettings }) {
+    // 「再生中にファイル読み込みした場合は再生終了してほしい」との依頼に対応。
+    // 読み込んだ新しい譜面と、再生中だった古い譜面のスケジュール（beatSchedule等）が
+    // 食い違ったまま再生を続けると、演奏内容と表示がずれる・存在しない小節を参照して
+    // エラーになる等の不整合が起きるため、読み込み前に必ず再生を止める
+    stopScore();
     score = loadedScore;
     resetAbLoopRangeToFull();
     renderAbLoopBand();
@@ -6786,6 +7070,61 @@ async function main() {
         });
     }
 
+    // 空・陸の色（3Dのみ。2Dには一度追加したがUIごと不要と判明し削除済み——
+    // ただしmapSettings.skyColor/groundColor自体は今後のため残してある）。
+    // 「色の確定＝ドラッグして止めた瞬間」との指摘に対応し、"change"（ピッカー全体を閉じるまで
+    // 発火しない）ではなく"input"をデバウンスする方式にした。ピッカー操作中は"input"が連続発火
+    // し続け、指を止めると（ピッカーを閉じなくても）それ以降イベントが来なくなる性質を利用し、
+    // 最後の"input"からMAP_COLOR_INPUT_DEBOUNCE_MS経っても次が来なければそこで初めて確定・反映する
+    const debouncedSetAssemblySkyColor = debounce(setAssemblySkyColor, MAP_COLOR_INPUT_DEBOUNCE_MS);
+    const debouncedSetAssemblyGroundColor = debounce(setAssemblyGroundColor, MAP_COLOR_INPUT_DEBOUNCE_MS);
+    document.querySelectorAll(".map-sky-color-input").forEach(el => {
+        el.value = mapSettings.skyColor;
+        el.addEventListener("input", (e) => debouncedSetAssemblySkyColor(e.target.value));
+    });
+    document.querySelectorAll(".map-ground-color-input").forEach(el => {
+        el.value = mapSettings.groundColor;
+        el.addEventListener("input", (e) => debouncedSetAssemblyGroundColor(e.target.value));
+    });
+    document.querySelectorAll(".map-color-reset-btn").forEach(el => {
+        el.addEventListener("click", () => resetAssemblyColors());
+    });
+
+    // 組み立てプレビューのカメラワーク（再生/一時停止 ＋ 左回り/右回り/トロッコ視点の
+    // アングル選択）。どちらのボタンを押した時も、現在の再生状態×アングルの組み合わせを
+    // applyAssemblyCameraAngleAndPlayState()にまとめて反映させる
+    const assemblyCameraPlayBtn = document.getElementById("assemblyCameraPlayBtn");
+    const applyAssemblyCameraPlayStyle = () => {
+        if (!assemblyCameraPlayBtn) return;
+        const icon = assemblyCameraPlayBtn.querySelector("i");
+        if (icon) icon.className = assemblyCameraPlaying ? "fa-solid fa-pause" : "fa-solid fa-play";
+        assemblyCameraPlayBtn.title = assemblyCameraPlaying ? "カメラワークを一時停止" : "カメラワークを再生";
+    };
+    if (assemblyCameraPlayBtn) {
+        applyAssemblyCameraPlayStyle();
+        assemblyCameraPlayBtn.addEventListener("click", () => {
+            assemblyCameraPlaying = !assemblyCameraPlaying;
+            applyAssemblyCameraAngleAndPlayState();
+            applyAssemblyCameraPlayStyle();
+        });
+    }
+
+    const assemblyAngleBtns = document.querySelectorAll(".assembly-angle-btn");
+    const applyAssemblyAngleButtonStyles = () => {
+        assemblyAngleBtns.forEach(btn => {
+            const icon = btn.querySelector("i");
+            if (icon) icon.style.color = btn.dataset.angleMode === assemblyCameraAngleMode ? "#4a6cf7" : "#ccc";
+        });
+    };
+    applyAssemblyAngleButtonStyles();
+    assemblyAngleBtns.forEach(btn => {
+        btn.addEventListener("click", () => {
+            assemblyCameraAngleMode = btn.dataset.angleMode;
+            applyAssemblyAngleButtonStyles();
+            applyAssemblyCameraAngleAndPlayState();
+        });
+    });
+
     document.getElementById("newScoreBtn")
         .addEventListener("click", () => openNewScoreModal());
 
@@ -6835,6 +7174,45 @@ async function main() {
 
     document.getElementById("redoBtn")
         .addEventListener("click", () => redo());
+
+    // 全画面表示。「五線譜やマップなど、中身だけを全表示にしてほしい」との依頼に対応し、
+    // ヘッダー・タブ切替・各種ツールバー・再生バーを含むページ全体ではなく、#main
+    // （タブの中身＝五線譜/マップ/組み立てプレビューだけを内包する要素）を全画面化する。
+    // タブごとの表示切り替えはactiveTab側で既に処理済み（非表示のタブはdisplay:noneになる）
+    // ため、#mainを全画面化するだけで、その瞬間に見えているタブの中身がそのまま画面いっぱいに
+    // 広がる（タブ専用の要素を都度切り替える必要が無い）
+    const fullscreenBtn = document.getElementById("fullscreenBtn");
+    if (fullscreenBtn) {
+        const fullscreenTarget = document.getElementById("main");
+        const updateFullscreenBtnIcon = () => {
+            const isFullscreen = !!document.fullscreenElement;
+            fullscreenBtn.querySelector("i").className = isFullscreen ? "fa-solid fa-compress" : "fa-solid fa-expand";
+            fullscreenBtn.title = isFullscreen ? "全画面表示を終了" : "全画面表示";
+        };
+        fullscreenBtn.addEventListener("click", () => {
+            if (document.fullscreenElement) {
+                document.exitFullscreen();
+            } else {
+                fullscreenTarget.requestFullscreen();
+            }
+        });
+        // 全画面の切り替え自体でブラウザのresizeイベントが発火する場合も多いが、確実性のため
+        // ヘッダー/ツールバー分の高さが増減した後の再レイアウトを明示的にここでも行う
+        // （window resize用の既存処理＝updateBothTabContainerHeight/updateContentAreaMinHeights/
+        // renderScore/resizeAssemblyRendererと同じ一式）
+        document.addEventListener("fullscreenchange", () => {
+            updateFullscreenBtnIcon();
+            updateBothTabContainerHeight();
+            updateContentAreaMinHeights();
+            renderScore();
+            setupDeleteButtons();
+            setupInsertButtons();
+            updateAbLoopStripGeometry();
+            if (isAssemblyActive()) resizeAssemblyRenderer();
+        });
+        updateFullscreenBtnIcon();
+        setupFullscreenIdleHide(fullscreenTarget);
+    }
 
     document.getElementById("playBtn")
         .addEventListener("click", () => {

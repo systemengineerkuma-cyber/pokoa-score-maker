@@ -102,6 +102,92 @@
             border-top: 1px solid var(--border);
             box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.06);
             z-index: 140;
+            transition: opacity 0.3s ease;
+        }
+
+        /* 全画面表示中（#main:fullscreen）は、ヘッダー・ツールバー・#statusBarが
+           見えなくなる（全画面はfullscreenElement＝#mainのサブツリーしか描画されないため）。
+           「再生UIは欲しいが、下位ツールバーのエリアではなく全画面に馴染むように」、
+           さらに「ミニプレーヤーっぽく、もっと背景に馴染む感じ」との依頼に対応し、
+           画面幅ほぼいっぱいの不透明な帯ではなく、中央下に浮く小さめの半透明カードにする。
+           その後「最大中は、タイトル、テンポ、AB、ボリュームは不要」との指摘で、
+           #playbackBarLeft（タイトル+BPM）・#playbackBarRight（音量）・
+           #abLoopStripRow（AB区間帯）・#abLoopToggleBtn（ABボタン）を非表示にし、
+           シークバーと再生系ボタン（最初に戻す/再生/停止/ループ）だけの、より小さい
+           構成にした。表示する内容自体が減ったため、幅も合わせて縮めてある。
+           #playbackBar自体はgridのままだが、非表示要素は自動的にトラックサイズの
+           計算から除外されるため、実質「1行目=シークバー、2行目=コントロール」の
+           2行構成として振る舞う（#playbackControlsRow内の各ボタンの位置決めは、
+           この行自身の中央=50%を基準にしたpx指定のため、行の幅が変わっても中央に来る） */
+        #main:fullscreen #playbackBar {
+            left: 50%;
+            right: auto;
+            bottom: 16px;
+            transform: translateX(-50%);
+            /* 「全画面の再生グループは、全画面じゃないときのバーの長さと一緒にして
+               ほしい」との指摘に対応し、通常時の#seekBarRowのmax-width（640px）と
+               揃える。表示する中身は減っても、シークバーの長さ自体は変えない */
+            width: min(640px, 92vw);
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            align-items: center;
+            column-gap: 8px;
+            row-gap: 2px;
+            padding: 8px 14px 10px;
+            border-top: none;
+            border-radius: var(--radius-md);
+            /* 当初は半透明+backdrop-filter:blurの浮いたガラス風カードにしていたが、
+               「表示中の半透明、ぼかしをやめてほしい」との指摘で不透明な背景に戻した
+               （幅を縮めて中央に浮かせる・無操作で消える、という構成自体は維持） */
+            background: var(--surface);
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+        }
+
+        #main:fullscreen #seekBarRow {
+            grid-column: 1 / -1;
+            grid-row: 1;
+            max-width: none;
+            width: auto;
+            margin: 0;
+            padding: 0;
+        }
+
+        #main:fullscreen #playbackBarLeft,
+        #main:fullscreen #playbackBarRight,
+        #main:fullscreen #abLoopStripRow,
+        #main:fullscreen #abLoopToggleBtn {
+            display: none;
+        }
+
+        #main:fullscreen #playbackControlsRow {
+            grid-column: 1 / -1;
+            grid-row: 3;
+            height: 32px;
+            padding: 0;
+        }
+
+        /* 通常時、5ボタン（AB/最初に戻す/再生/停止/ループ）は#playbackControlsRowの
+           幅が十分広いこと前提で、再生ボタンを基準にした`left: calc(50% ± px)`の
+           絶対配置で並べている（app.js冒頭のコメント参照）。全画面のミニプレーヤーでは
+           中央列がその前提より大きく狭くなるため、そのままだと両端のボタンが
+           左右の列（タイトル/音量）にはみ出して重なってしまう。そこでボタン列自体は
+           flexに切り替え、実際に割り当てられた幅の中で自然に詰めて中央寄せする
+           （ボタン自体の見た目=丸・サイズ等は他のクラス定義のまま変えない） */
+        #main:fullscreen #playbackBarCenter {
+            position: static;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 2px;
+            height: 100%;
+        }
+
+        #main:fullscreen #restartBtn,
+        #main:fullscreen .playback-play-btn,
+        #main:fullscreen #stopBtn,
+        #main:fullscreen #loopBtn {
+            position: static;
+            transform: none;
         }
 
         /* Spotifyの再生バーのように、画面幅いっぱいではなく中央に収めた
@@ -565,14 +651,16 @@
         /* タブ切替時、新しい中身をふわっとフェードインさせる。
            以前はtranslateY(8px→0)で「わずかに下からスライド」させる演出も
            付けていたが、「並べて」タブでは五線譜/マップ2つの枠が並ぶため、transformで
-           #main全体が動く間に境界線（枠線）がちらつく（ずれて見える）との指摘があり、
-           位置がまったく動かないopacityのみのフェードに変更した */
+           対象要素全体が動く間に境界線（枠線）がちらつく（ずれて見える）との指摘があり、
+           位置がまったく動かないopacityのみのフェードに変更した。対象は#bothTabContainer
+           （#mainではない——全画面表示対応で#playbackBarが#mainの子になったため、
+           #mainごとフェードさせると常時表示のはずの再生バーまで巻き込まれてしまう） */
         @keyframes tabContentFadeIn {
             from { opacity: 0; }
             to { opacity: 1; }
         }
 
-        #main.tab-content-fade {
+        #bothTabContainer.tab-content-fade {
             animation: tabContentFadeIn 0.22s ease-out;
         }
 
@@ -628,6 +716,24 @@
             align-items: center;
             justify-content: center;
             transition: background 0.15s, transform 0.1s, box-shadow 0.15s;
+        }
+
+        /* 組み立てプレビューの空・陸の色ピッカー。ツールバーの他のボタンと大きさを揃える */
+        .toolbar input[type="color"] {
+            width: 28px;
+            height: 28px;
+            padding: 2px;
+            border: none;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            background: none;
+        }
+        .toolbar input[type="color"]::-webkit-color-swatch-wrapper {
+            padding: 0;
+        }
+        .toolbar input[type="color"]::-webkit-color-swatch {
+            border: 1px solid var(--border-color, #ccc);
+            border-radius: 4px;
         }
 
         .toolbar button:hover, .toolbar label:hover {
@@ -742,6 +848,14 @@
 
         #zoomSlider {
             width: 240px;
+        }
+
+        /* 元はHTML側のinline style="width:100px"で指定していたが、全画面時のミニ
+           プレーヤー化（#main:fullscreen #volumeSlider）で幅を縮めようとした際、
+           inline styleの詳細度がCSSのID指定より常に高く上書きできなかったため、
+           ここでの通常のCSSルールに統一した */
+        #volumeSlider {
+            width: 100px;
         }
 
         #seekBar {
@@ -1002,6 +1116,7 @@
             border-radius: var(--radius-pill);
             pointer-events: none;
             opacity: 0.7;
+            transition: opacity 0.3s ease;
         }
         /* マップタブの#mapCornerOverlayと同じ右上の定位置に、コンパス・グリッド線トグルを
            縦に並べる（層切替は、このプレビューでは3層とも常に表示済みのため不要） */
@@ -1014,6 +1129,7 @@
             flex-direction: column;
             align-items: flex-end;
             gap: 8px;
+            transition: opacity 0.3s ease;
         }
         /* コンパスボタンは他のツールバーボタンと違いアイコン+文字ラベルを横並びで持つため、
            固定28px幅ではなく内容に合わせた幅にする（#mapCompassOverlayと同じ理由） */
@@ -1415,6 +1531,7 @@
             top: 8px;
             right: 8px;
             z-index: 950;
+            transition: opacity 0.3s ease;
         }
 
         #helpBtn {
@@ -1732,6 +1849,28 @@
             }
         }
 
+        /* 全画面表示中、無操作が一定時間続いたら周辺UI（左上のヒント・右上のコーナー
+           オーバーレイ・下部の再生バー）をフェードアウトする。「無操作が一定時間で、
+           全画面の左上、右上、真下のUIは消えるようにしてほしい」との依頼に対応
+           （動画プレイヤーの全画面操作UIと同じ定石）。一度「再生グループはこの対象から
+           外してほしい」と言われて外したが、その意図は実際には「表示中の半透明・ぼかし
+           自体をやめてほしい」（#playbackBarの見た目、上のコメント参照）というものだった
+           と分かったため、自動非表示の対象には#playbackBarも含めたまま戻している。
+           クラスの付け外しはJS側（setupFullscreenIdleHide、app.js）が行う。
+           #mapCornerOverlayは元々ホバーで隠れる仕組み（#mapAreaWrapper:hover
+           #mapCornerOverlay）を持つが、カーソルを動かさず乗せたままにしていると
+           :hoverは効き続けてしまうため、このルールをスタイルシートの最後に置くことで
+           （詳細度が同じ場合は後に書かれた方が勝つ）、無操作時はホバー中でも
+           確実に隠すようにしている */
+        #main.fullscreen-idle #assemblyHint,
+        #main.fullscreen-idle #assemblyCornerOverlay,
+        #main.fullscreen-idle #mapCornerOverlay,
+        #main.fullscreen-idle #infoWrap,
+        #main.fullscreen-idle #playbackBar {
+            opacity: 0;
+            pointer-events: none;
+        }
+
     </style>
 </head>
 <body>
@@ -1769,6 +1908,7 @@
                 <button id="saveBtn" tabindex="-1" title="保存"><i class="fa-solid fa-floppy-disk"></i></button>
                 <button id="undoBtn" tabindex="-1" title="アンドゥ (Ctrl+Z)"><i class="fa-solid fa-rotate-left"></i></button>
                 <button id="redoBtn" tabindex="-1" title="リドゥ (Ctrl+Y)"><i class="fa-solid fa-rotate-right"></i></button>
+                <button id="fullscreenBtn" tabindex="-1" title="全画面表示"><i class="fa-solid fa-expand"></i></button>
             </div>
             <div class="toolbar" id="toolbarEditMode">
                 <button id="editModeNote" tabindex="-1" title="編集モード"><i class="fa-solid fa-pencil"></i></button>
@@ -1867,7 +2007,7 @@
         </div>
 
         <div id="assemblyAreaWrapper" style="display:none;">
-            <div id="assemblyHint">ドラッグで回転・スクロールでズーム（Shift/Ctrl+ドラッグで平行移動）</div>
+            <div id="assemblyHint">右ドラッグで回転・スクロールでズーム（左ドラッグで平行移動）</div>
             <div id="assemblyCornerOverlay">
                 <div class="toolbar map-view-mode-toggle">
                     <button class="map-view-mode-btn text-btn" data-map-view-mode="2d" tabindex="-1" title="2Dマップ表示">2D</button>
@@ -1882,52 +2022,67 @@
                 <div class="toolbar">
                     <button id="assemblyGridToggleBtn" tabindex="-1" title="グリッド線の表示/非表示"><i class="fa-solid fa-table-cells"></i></button>
                 </div>
+                <div class="toolbar">
+                    <input type="color" id="assemblySkyColorInput" class="map-sky-color-input" tabindex="-1" title="空の色">
+                    <input type="color" id="assemblyGroundColorInput" class="map-ground-color-input" tabindex="-1" title="陸の色">
+                    <button class="map-color-reset-btn" tabindex="-1" title="空・陸の色をリセット"><i class="fa-solid fa-rotate-left"></i></button>
+                </div>
+                <div class="toolbar">
+                    <button id="assemblyCameraPlayBtn" tabindex="-1" title="カメラワークを再生"><i class="fa-solid fa-play"></i></button>
+                    <button class="assembly-angle-btn" data-angle-mode="rotateLeft" tabindex="-1" title="左回り"><i class="fa-solid fa-rotate-left"></i></button>
+                    <button class="assembly-angle-btn" data-angle-mode="rotateRight" tabindex="-1" title="右回り"><i class="fa-solid fa-rotate-right"></i></button>
+                    <button class="assembly-angle-btn" data-angle-mode="trolleyView" tabindex="-1" title="トロッコ視点"><i class="fa-solid fa-eye"></i></button>
+                </div>
             </div>
             <canvas id="assemblyCanvas"></canvas>
         </div>
     </div>
-</div>
 
-<div id="playbackBar">
-    <div id="playbackBarLeft">
-        <div id="scoreTitle">
-            <i class="fa-solid fa-file-lines"></i>
-            <input type="text" id="scoreTitleInput" placeholder="楽譜の名前" value="">
+    <!-- 全画面表示（Fullscreen API）はfullscreenElement（#main）のサブツリーしか描画しない
+         ため、全画面中も再生UIを見せるには#playbackBarが#mainの子である必要がある。
+         position:fixedなので#main配下に移してもレイアウト上の見た目は変わらない
+         （#main:fullscreen #playbackBarのスタイルだけ、全画面向けの見た目に変える） -->
+    <div id="playbackBar">
+        <div id="playbackBarLeft">
+            <div id="scoreTitle">
+                <i class="fa-solid fa-file-lines"></i>
+                <input type="text" id="scoreTitleInput" placeholder="楽譜の名前" value="">
+            </div>
+            <span class="playback-chip">
+                <input type="number" id="bpmInput" value="120" min="40" max="240" step="1" style="width:40px; border:none; font-size:12px; text-align:center; background:transparent; outline:none; font-variant-numeric:tabular-nums;" title="BPM">
+                <span style="font-size:12px; color:var(--text-faint);">BPM</span>
+            </span>
         </div>
-        <span class="playback-chip">
-            <input type="number" id="bpmInput" value="120" min="40" max="240" step="1" style="width:40px; border:none; font-size:12px; text-align:center; background:transparent; outline:none; font-variant-numeric:tabular-nums;" title="BPM">
-            <span style="font-size:12px; color:var(--text-faint);">BPM</span>
-        </span>
-    </div>
-    <div id="playbackBarRight">
-        <span class="playback-chip">
-            <i id="muteBtn" class="fa-solid fa-volume-high" style="font-size:12px; color:var(--text-faint); cursor:pointer;" title="ミュート"></i>
-            <input type="range" id="volumeSlider" min="0" max="1" step="0.01" value="0.8" title="音量" style="width:100px;">
-        </span>
-    </div>
-    <div id="seekBarRow">
-        <span id="seekTimeCurrent">0:00</span>
-        <input type="range" id="seekBar" min="0" max="1" step="0.001" value="0" title="再生位置">
-        <span id="seekTimeTotal">0:00</span>
-    </div>
-    <div id="abLoopStripRow">
-        <div id="abLoopStrip">
-            <div id="abLoopBand">
-                <span id="abLoopLabelA">A</span>
-                <span id="abLoopLabelB">B</span>
-                <div id="abLoopHandleA" title="開始位置（A）をドラッグして調整"></div>
-                <div id="abLoopHandleB" title="終了位置（B）をドラッグして調整"></div>
+        <div id="playbackBarRight">
+            <span class="playback-chip">
+                <i id="muteBtn" class="fa-solid fa-volume-high" style="font-size:12px; color:var(--text-faint); cursor:pointer;" title="ミュート"></i>
+                <input type="range" id="volumeSlider" min="0" max="1" step="0.01" value="0.8" title="音量">
+            </span>
+        </div>
+        <div id="seekBarRow">
+            <span id="seekTimeCurrent">0:00</span>
+            <input type="range" id="seekBar" min="0" max="1" step="0.001" value="0" title="再生位置">
+            <span id="seekTimeTotal">0:00</span>
+        </div>
+        <div id="abLoopStripRow">
+            <div id="abLoopStrip">
+                <div id="abLoopBand">
+                    <span id="abLoopLabelA">A</span>
+                    <span id="abLoopLabelB">B</span>
+                    <div id="abLoopHandleA" title="開始位置（A）をドラッグして調整"></div>
+                    <div id="abLoopHandleB" title="終了位置（B）をドラッグして調整"></div>
+                </div>
             </div>
         </div>
-    </div>
-    <div id="playbackControlsRow">
-    <div id="playbackBarCenter">
-        <button id="abLoopToggleBtn" class="playback-ctrl-btn" tabindex="-1" title="A-B区間ループの有効/無効">AB</button>
-        <button id="restartBtn" class="playback-ctrl-btn" tabindex="-1" title="最初に戻す" style="opacity:0.4;" disabled><i class="fa-solid fa-backward-step"></i></button>
-        <button id="playBtn" class="playback-play-btn" tabindex="-1" title="再生/一時停止"><i class="fa-solid fa-play"></i></button>
-        <button id="stopBtn" class="playback-ctrl-btn" tabindex="-1" title="停止" style="opacity:0.4;" disabled><i class="fa-solid fa-stop"></i></button>
-        <button id="loopBtn" class="playback-ctrl-btn" tabindex="-1" title="ループ再生"><i class="fa-solid fa-repeat" style="color:#ccc;"></i></button>
-    </div>
+        <div id="playbackControlsRow">
+        <div id="playbackBarCenter">
+            <button id="abLoopToggleBtn" class="playback-ctrl-btn" tabindex="-1" title="A-B区間ループの有効/無効">AB</button>
+            <button id="restartBtn" class="playback-ctrl-btn" tabindex="-1" title="最初に戻す" style="opacity:0.4;" disabled><i class="fa-solid fa-backward-step"></i></button>
+            <button id="playBtn" class="playback-play-btn" tabindex="-1" title="再生/一時停止"><i class="fa-solid fa-play"></i></button>
+            <button id="stopBtn" class="playback-ctrl-btn" tabindex="-1" title="停止" style="opacity:0.4;" disabled><i class="fa-solid fa-stop"></i></button>
+            <button id="loopBtn" class="playback-ctrl-btn" tabindex="-1" title="ループ再生"><i class="fa-solid fa-repeat" style="color:#ccc;"></i></button>
+        </div>
+        </div>
     </div>
 </div>
 
