@@ -23,6 +23,80 @@ let historyIndex = -1;
 let hasUnsavedChanges = false;
 let northDirection = 0; // 0=↑, 1=→, 2=↓, 3=←
 
+// デバッグ用の隠しウィンドウ（Ctrl+Shift+Dで表示/非表示）。「隠しデバッグウィンドウが欲しい」
+// との依頼に対応。中身は当初からは決めておらず、必要になった時にdebugStateへキーを足していく
+// 運用にする（例: debugState.playState = playState; renderDebugPanel();）。
+// renderDebugPanel()はdebugStateの中身をそのままキー: 値の一覧として#debugPanelBodyに描画する
+let debugState = {};
+// デバッグウィンドウの「テーマ」設定（デフォルト/UNDERTALE/マフェット戦）。3Dプレビューの
+// 空・陸の見た目を切り替える（applyAssemblyThemeVisuals参照）。3Dシーンがまだ無い間に
+// 選ばれても、initAssemblyScene()が生成直後にこの値を見て反映するため問題ない
+const DEBUG_THEMES = ["default", "undertale", "muffet"];
+let debugTheme = DEBUG_THEMES.includes(localStorage.getItem("debugTheme")) ? localStorage.getItem("debugTheme") : "default";
+function toggleDebugPanel() {
+    const panel = document.getElementById("debugPanel");
+    if (!panel) return;
+    const nowVisible = panel.style.display === "none";
+    panel.style.display = nowVisible ? "flex" : "none";
+    if (nowVisible) renderDebugPanel();
+}
+function renderDebugPanel() {
+    const body = document.getElementById("debugPanelBody");
+    if (!body) return;
+    const keys = Object.keys(debugState);
+    body.textContent = keys.length
+        ? keys.map(k => `${k}: ${JSON.stringify(debugState[k])}`).join("\n")
+        : "（debugStateは空です。必要な項目をdebugStateに追加してください）";
+}
+
+// デバッグウィンドウの、ヘッダードラッグでの移動・閉じるボタン・テーマ切り替えを配線する。
+// 「もっと使いやすくしてほしい」との依頼に対応（#helpBtnのポップオーバーと同じ
+// ドラッグ実装パターンを踏襲している）
+function setupDebugPanel() {
+    const panel = document.getElementById("debugPanel");
+    const header = document.getElementById("debugPanelHeader");
+    const closeBtn = document.getElementById("debugPanelCloseBtn");
+    const themeSelect = document.getElementById("debugPanelThemeSelect");
+    if (!panel || !header || !closeBtn || !themeSelect) return;
+
+    closeBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        panel.style.display = "none";
+    });
+
+    // ヘッダーのどこをドラッグしても、ウィンドウのように自由な位置へ動かせる。
+    // 初期配置はCSSのtop/rightだが、ドラッグを始めた瞬間に現在位置をleft/topへ
+    // 焼き直してから追従させる（right指定のままだとleftで動かせないため）
+    let dragState = null;
+    header.addEventListener("mousedown", (e) => {
+        if (e.target.closest("#debugPanelCloseBtn")) return;
+        const rect = panel.getBoundingClientRect();
+        panel.style.left = `${rect.left}px`;
+        panel.style.top = `${rect.top}px`;
+        panel.style.right = "auto";
+        dragState = { startX: e.clientX, startY: e.clientY, startLeft: rect.left, startTop: rect.top };
+        e.preventDefault();
+    });
+    document.addEventListener("mousemove", (e) => {
+        if (!dragState) return;
+        const dx = e.clientX - dragState.startX;
+        const dy = e.clientY - dragState.startY;
+        panel.style.left = `${dragState.startLeft + dx}px`;
+        panel.style.top = `${dragState.startTop + dy}px`;
+    });
+    document.addEventListener("mouseup", () => { dragState = null; });
+
+    // テーマ: デフォルト/UNDERTALEの2択。「ダーク/ライトではない」との訂正を受け、
+    // CSS変数によるUI全体の配色切り替えはやめ、3Dプレビューの空・陸の見た目だけを
+    // 切り替える方式にした（applyAssemblyThemeVisuals参照）
+    themeSelect.value = debugTheme;
+    themeSelect.addEventListener("change", () => {
+        debugTheme = themeSelect.value;
+        localStorage.setItem("debugTheme", debugTheme);
+        applyAssemblyThemeVisuals();
+    });
+}
+
 let audioCtx = null;
 let masterGainNode = null; // 全音源が経由するマスター音量ノード（再生中でもリアルタイムに音量変更するため）
 let volume = parseFloat(localStorage.getItem("volume")) || 0.8; // 0〜1
@@ -47,6 +121,22 @@ let beatSchedule = []; // {beatIndex, startTime, endTime} 1エントリ=マッ�
 let upperNoteBoundarySchedule = [];
 let lowerNoteBoundarySchedule = [];
 let activeSourceNodes = []; // {node, startTime} 再生中にスケジュール済みの音源（曲中のテンポ変更時に先の分を止めるため）
+// 実際の発音（playNote呼び出し）の先読みスケジューラ用の状態。
+// 「シークした位置から曲の終端までの残り音符を毎回まとめて一括でWeb Audioグラフに予約する」実装だと、
+// 曲の前半（残り音符が多い位置）から再生するほど「予約済み未発音」のノードが長時間・大量に同時存在し、
+// 実機のオーディオレンダリングスレッドが処理落ちして「出だしが重い/音がガビる」原因になっていた
+// （詳しくは他PCでの調査引き継ぎ参照）。対策として、常に「今から数秒先まで」だけをplayNote()で
+// 実際に予約し、再生が進むにつれて少しずつ継ぎ足す方式に変更する。
+// pendingNoteEvents: {pitch, startTime, duration}を実際に鳴る時刻の昇順に並べたもの（休符は含まない）。
+// scheduleMeasuresFrom()が呼ばれるたびに作り直す（テンポ変更・シーク・停止による再スケジュールに対応）
+let pendingNoteEvents = [];
+let pendingNoteEventsCursor = 0; // pendingNoteEventsのうち、まだplayNote()していない先頭位置
+const SCHEDULE_LOOKAHEAD_SECONDS = 3; // 常にこの秒数先まで予約しておく
+const SCHEDULE_TICK_INTERVAL_MS = 200; // 先読み分を継ぎ足す間隔
+// scheduleMeasuresFrom()を呼ぶたびにインクリメントする世代カウンタ。先読みループ（setTimeoutで
+// 継続する）は毎tickでこの値と自分が生成された時点の値を比較し、不一致なら（テンポ変更/シーク/
+// 停止等で別のスケジュールに置き換わった証拠なので）静かに処理を打ち切る
+let scheduleGeneration = 0;
 let currentHighlightMeasure = -1;
 let currentHighlightBeatIndex = null; // マップのレール上の再生位置（ビート番号）
 let currentHighlightBeatT = 0; // そのビート内での経過（0〜1）
@@ -57,10 +147,68 @@ let animFrameId = null;
 let mapBeatPositions = [];
 let mapRailIsVertical = false;
 let mapRailCellSize = 0;
+// 「折り返しあり」時のみ使う、拍番号(beatIdx)→railIndex（mapBeatPositions/assemblyBeatCentersRaw
+// 内での物理的な通し番号）の対応表。トロッコの表示位置（updateWrapTrolleyPositionAtTime）が
+// 実際に鳴っている拍の正しい物理セルを求めるために使う。「折り返しなし」では使わない（空のまま）
+let wrapBeatIndexToRailIndex = [];
 // beatIndex -> [{px,py}]（現在表示中の層にある音符マットのセル左上、canvasローカル座標）。
 // 「トロッコ通過時に音符マットを凹ませる」演出（2D版）用、renderMap()のたびに作り直す
 let mapPanelPositionsByBeat = new Map();
 let mapGridVisible = true; // #mapGridToggleBtnで切り替える、renderMap()を跨いで保持する（3Dプレビュー側のassemblyGridVisibleと対になる設定）
+
+// トロッコの「見た目の位置」の進行方向用の状態（2D・3D共通）。動きが無い/ごく僅かな瞬間に
+// 直前の向きを保持し続けるためだけに使う（resolveTrolleyDisplayPosition参照）
+let trolleyDisplayForward = null;         // {x,y} 直前の実際の移動方向（正規化済み、3Dの向き表示用）
+
+// 「コネクタ経路を実時間で辿る追いつきモード」は、このコードベースの現在のレール生成方式
+// （buildFixedRailTrack＝経路上の隣接セルは必ず1マス差で大ジャンプが起きない設計、
+// buildMapGridの非wrap分岐＝段同士が物理的に繋がっていないため瞬間移動が正しい仕様）の
+// どちらでも実際には使われない（connectorPathsは常に空のMapのまま）と判明したため、
+// 2026-09のコードレビューで撤去した。以前はここでcatchup用の状態（出発ビートindex・
+// 経路・実時間の記録）をリセットしていたが、それらの変数自体を削除したため、現状は
+// 何もしなくてよい（trolleyDisplayForwardは元々ここでリセットしていなかった、その
+// ままの挙動を維持している）。呼び出し側（再生開始・停止・シーク時）はそのまま残して
+// あるが、この関数自体は実質的に無効化されている
+function resetTrolleyDisplayState() {
+}
+
+// beatIndex/tから見た目のトロッコ位置を求める。rawBeatCenters/戻り値の単位は呼び出し側が
+// 渡すcellSize基準（2Dはpx換算済みのmapBeatPositions+mapRailCellSize、3Dは1マス=1の
+// assemblyBeatCenters+ASSEMBLY_CELL_SIZE=1）。ビート間は線形補間。次ビートまでの距離が
+// 遠い（段の折り返し等でレールが物理的に繋がっていない）場合は、その場で即座に目的地へ
+// 瞬間移動する。
+// 戻り値は{x,y}に加え、直前の実際の移動方向{forward:{x,y}}（3D側の向き表示用。動きが
+// 無かった/ごく僅かだった場合は直前の向きをそのまま保持する）も含める
+function resolveTrolleyDisplayPosition(rawBeatCenters, beatIndex, t, cellSize) {
+    if (beatIndex == null || !rawBeatCenters || !rawBeatCenters[beatIndex]) return null;
+
+    const updateForward = (fromPos, toPos) => {
+        const fx = toPos.x - fromPos.x, fy = toPos.y - fromPos.y;
+        const len = Math.hypot(fx, fy);
+        if (len > 1e-6) trolleyDisplayForward = { x: fx / len, y: fy / len };
+    };
+
+    const posA = rawBeatCenters[beatIndex];
+    const posB = rawBeatCenters[beatIndex + 1] || posA;
+    const dx = posB.x - posA.x, dy = posB.y - posA.y;
+    const bigJump = Math.hypot(dx, dy) > cellSize * 1.5;
+    if (!bigJump) {
+        const pos = { x: posA.x + dx * t, y: posA.y + dy * t };
+        updateForward(posA, posB);
+        return { x: pos.x, y: pos.y, forward: trolleyDisplayForward };
+    }
+
+    // 段の折り返し等、次ビートまでの距離が遠い（レールで物理的に繋がっていない）区間は
+    // その場で即座に目的地（次のビート位置）へ瞬間移動する。
+    // 「レールの端で次のレールに移るとき、向きが一瞬進行方向と逆になる」バグの原因：
+    // ここでupdateForward(posA, posB)を呼んでいたため、posA（段の終端）→posB（次の段の
+    // 先頭、折り返し軸方向にオフセットした位置）という、物理的に繋がっていない2点間の
+    // 直線ベクトルがそのまま「向き」として採用されてしまっていた（「折り返しなし」時の
+    // 段は同じ向きに並ぶ非ミラー行のため、この直線は実際の進行方向とほぼ正反対
+    // （実測dot≈-0.92）になり得る）。この瞬間は向きを更新せず、直前まで使っていた
+    // 向きを維持する
+    return { x: posB.x, y: posB.y, forward: trolleyDisplayForward };
+}
 
 // 小節範囲選択用の状態
 let selectedMeasures = new Set();
@@ -281,14 +429,22 @@ function getAudioContext() {
         // 単純に加算した音量を制限する仕組みが無かったため、重なりが増えると音割れ
         // （クリッピング）していた。出力の最終段に軽いリミッター（コンプレッサー）を挟み、
         // 静かな場面には影響させず、重なって音量が大きくなった瞬間だけ自動で抑える
+        // （値は他PCでのCPU負荷ストレステストで検証済みのものに揃えている）
         const limiter = audioCtx.createDynamicsCompressor();
         limiter.threshold.value = -6;  // このdBを超えた分だけ効き始める
-        limiter.knee.value = 6;        // 効き始めをなだらかにする
+        limiter.knee.value = 0;        // ちょうどthresholdからハードに効かせる
         limiter.ratio.value = 20;      // ほぼリミッター相当の強い圧縮比
         limiter.attack.value = 0.003;  // 音の頭を潰さないよう素早く反応
-        limiter.release.value = 0.15;  // 短すぎるとポンピングして不自然になるため少し長めに
+        limiter.release.value = 0.1;   // 短すぎるとポンピングして不自然になるため少し長めに
         masterGainNode.connect(limiter);
         limiter.connect(audioCtx.destination);
+    }
+    // ページ読み込み時に生成したAudioContextは、ブラウザの自動再生制限により
+    // ユーザー操作なしでは"suspended"状態のまま留まることがある。明示的にresume()を
+    // 試みておく（失敗しても無視——実際の再生開始側(startPlaybackFromMeasure)で
+    // 改めてresume完了を待ってからスケジュールする）
+    if (audioCtx.state === "suspended") {
+        audioCtx.resume().catch(() => {});
     }
     return audioCtx;
 }
@@ -501,6 +657,86 @@ function getPlaybackEndMeasureIndex() {
     return score.measures.length - 1;
 }
 
+// 「再生位置に自動で追従」トグル（#autoFollowToggleBtn、ABの左）。ONの間、再生中に
+// 五線譜（.playLine）・2Dマップ（.mapPlayLine）の再生位置を自動でスクロール追従させる
+// （trackPlayback参照）。挙動は2つで異なる: 五線譜は画面外に出た時だけキャッチアップする
+// （maybeFollowPlaybackElement）のに対し、2Dマップは「常にトロッコが見えるように」との
+// 指摘を受け、毎フレーム画面中心に追従させ続ける（followMapPlaybackContinuous）。
+// 曲を跨いだ設定ではなく単なるUI操作の好みのため、volume等と同様localStorageに保存する
+let autoFollowPlayback = localStorage.getItem("autoFollowPlayback") !== "false";
+
+function applyAutoFollowToggleStyle() {
+    const btn = document.getElementById("autoFollowToggleBtn");
+    if (btn) btn.style.color = autoFollowPlayback ? "#4a6cf7" : "#ccc";
+}
+
+// 固定ヘッダー（#stickyHeader）・下部の再生バー（#playbackBar）に隠れていない、
+// 実際に見えている縦方向の範囲を返す。「並べて」タブで#scoreWrapper/#mapAreaWrapper
+// 自身がスクロールする場合・単体タブでウィンドウ自体がスクロールする場合のどちらでも、
+// getBoundingClientRect()はビューポート基準の座標を返すため、この判定はどちらの
+// スクロール方式でも共通して使える
+function getPlaybackFollowSafeBounds() {
+    const header = document.getElementById("stickyHeader");
+    const playbackBar = document.getElementById("playbackBar");
+    const top = header ? header.getBoundingClientRect().bottom : 0;
+    const bottom = playbackBar ? playbackBar.getBoundingClientRect().top : window.innerHeight;
+    return { top, bottom };
+}
+
+// 追従スクロールが不要に連発しないよう、クールダウンを設ける（五線譜専用。
+// 2Dマップ側は毎フレーム型のfollowMapPlaybackContinuous()を使うため対象外）。
+// smooth scrollのアニメーション中（数百ms）は毎フレームの判定でまだ「見えていない」と
+// 出続けるため、クールダウン無しだと同じ位置へ何度もscrollIntoView()を呼び直して
+// アニメーションが飛び飛びになってしまう
+const AUTO_FOLLOW_SCROLL_COOLDOWN_MS = 600;
+const autoFollowLastScrollAt = { score: 0 };
+
+function maybeFollowPlaybackElement(el, key) {
+    if (!autoFollowPlayback || !el) return;
+    const rect = el.getBoundingClientRect();
+    // 要素が display:none（非表示タブ側）の場合は幅・高さとも0になるため、
+    // その場合は判定自体をスキップする（そのビューは今表示されていないので追従不要）
+    if (rect.width === 0 && rect.height === 0) return;
+    const bounds = getPlaybackFollowSafeBounds();
+    const visible = rect.top >= bounds.top && rect.bottom <= bounds.bottom
+        && rect.left >= 0 && rect.right <= window.innerWidth;
+    if (visible) return;
+    const now = performance.now();
+    if (now - autoFollowLastScrollAt[key] < AUTO_FOLLOW_SCROLL_COOLDOWN_MS) return;
+    autoFollowLastScrollAt[key] = now;
+    el.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+}
+
+// 2Dマップ用の追従（五線譜と違い「常にトロッコが見えるように」との指摘を受け、五線譜側
+// （画面外に出たら初めてキャッチアップする方式）より積極的な、毎フレーム型に変更した）。
+// trackPlayback()から毎フレーム呼ばれ、トロッコ（.mapPlayLine）の画面中心からのズレを
+// 都度そのまま打ち消すようスクロールし続ける——3D側のトロッコ視点チェイスカメラを
+// DOMスクロールで模したイメージ。トロッコはdrawMapPlayLine側で1フレームごとに
+// なめらかに移動するため、この関数も毎フレーム小さな量だけ動かすことになり、結果として
+// 連続的なパンに見える（smoothスクロールではなく即時移動を毎フレーム繰り返す方式。
+// smoothだと前フレームのアニメーションと競合してカクつく）
+function followMapPlaybackContinuous(el) {
+    if (!autoFollowPlayback || !el) return;
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return; // 2Dマップが非表示中は何もしない
+    const bounds = getPlaybackFollowSafeBounds();
+    const targetCx = window.innerWidth / 2;
+    const targetCy = (bounds.top + bounds.bottom) / 2;
+    const dx = (rect.left + rect.right) / 2 - targetCx;
+    const dy = (rect.top + rect.bottom) / 2 - targetCy;
+    if (dx === 0 && dy === 0) return;
+    const wrapper = document.getElementById("mapAreaWrapper");
+    // 「並べて」タブ等、#mapAreaWrapper自身がスクロールする（overflow:auto、
+    // .bothTabActive時のみ）場合はそちらを、単体タブ表示（ウィンドウ自体がスクロールする）
+    // ではウィンドウをスクロールする
+    const wrapperScrolls = wrapper && ["auto", "scroll"].includes(getComputedStyle(wrapper).overflowY);
+    if (wrapperScrolls) {
+        wrapper.scrollBy({ left: dx, top: dy, behavior: "auto" });
+    } else {
+        window.scrollBy({ left: dx, top: dy, behavior: "auto" });
+    }
+}
+
 function getPlaybackRangeMeasures() {
     if (abLoopRange && abLoopEnabled) return { startMeasureIndex: abLoopRange.startMeasureIndex, endMeasureIndex: abLoopRange.endMeasureIndex };
     return { startMeasureIndex: 0, endMeasureIndex: getPlaybackEndMeasureIndex() };
@@ -511,8 +747,8 @@ function getPlaybackRangeMeasures() {
 // （「シークバーの秒数は変えないでほしい」との要望——動かせる範囲はA-Bに
 // 制限しつつ、表示される時刻・目盛りは曲全体の絶対時間のままにする）
 function getFullSongDuration() {
-    const bpm = parseInt(document.getElementById("bpmInput")?.value) || 120;
-    return Math.max(0, score.measures.length * getBeatsPerMeasure() * (60 / bpm));
+    const timeline = computeMeasureTimeline();
+    return Math.max(0, timeline[timeline.length - 1]);
 }
 
 function playScore() {
@@ -524,29 +760,48 @@ function playScore() {
 // 指定した小節からスケジュールを組み直して再生を開始する（playScore()の本体であり、
 // シーク（seekToRatio）からも「その位置の小節から再生し直す」ために使う）
 function startPlaybackFromMeasure(measureIndex) {
+    resetTrolleyDisplayState(); // 再生開始（ループ再開含む）は滑らかに追いつかせず先頭から
     playState = "playing";
 
     const ctx = getAudioContext();
-    playStartTime = ctx.currentTime + 0.1;
-    noteSchedule = [];
-    noteTimeMap = [];
-    beatSchedule = [];
-    upperNoteBoundarySchedule = [];
-    lowerNoteBoundarySchedule = [];
-    activeSourceNodes = [];
 
-    // マップのセンサー番号（beatIndex）は曲頭からの絶対番号なので、開始小節分のビート数を
-    // オフセットとして渡し、途中から再生してもセンサーのハイライトがずれないようにする
-    const beatIndexOffset = measureIndex * getBeatsPerMeasure() * 4;
+    // ctx.currentTimeを基準にplayStartTime等を計算するため、実際にcontextが"running"に
+    // なってから（resumeが完了してから）でないと、その後のスケジュール全体が
+    // タイミングごとズレてしまう。"suspended"のまま読み進めてしまうバグへの対処
+    const beginScheduling = () => {
+        playStartTime = ctx.currentTime + 0.1;
+        noteSchedule = [];
+        noteTimeMap = [];
+        beatSchedule = [];
+        upperNoteBoundarySchedule = [];
+        lowerNoteBoundarySchedule = [];
+        activeSourceNodes = [];
 
-    // シークバー用: 曲の絶対的な先頭から数えて、何秒ぶん進んだ位置から再生を始めるか
-    const bpm = parseInt(document.getElementById("bpmInput").value) || 120;
-    playAbsoluteElapsedAtStart = measureIndex * getBeatsPerMeasure() * (60 / bpm);
+        // マップのセンサー番号（beatIndex）は曲頭からの絶対番号なので、開始小節分のビート数を
+        // オフセットとして渡し、途中から再生してもセンサーのハイライトがずれないようにする
+        const beatIndexOffset = measureIndex * getBeatsPerMeasure() * 4;
 
-    scheduleMeasuresFrom(measureIndex, { noteIndex: 0, time: playStartTime }, { noteIndex: 0, time: playStartTime }, beatIndexOffset, null);
+        // シークバー用: 曲の絶対的な先頭から数えて、何秒ぶん進んだ位置から再生を始めるか
+        // （テンポマップ対応: 小節ごとに実効テンポが変わりうるため、累積タイムラインを使う）
+        playAbsoluteElapsedAtStart = computeMeasureTimeline()[measureIndex];
 
-    updatePlaybackButtons();
-    trackPlayback();
+        scheduleMeasuresFrom(measureIndex, { noteIndex: 0, time: playStartTime }, { noteIndex: 0, time: playStartTime }, beatIndexOffset, null);
+
+        updatePlaybackButtons();
+        trackPlayback();
+    };
+
+    if (ctx.state === "running") {
+        beginScheduling();
+    } else {
+        // resumeが失敗した場合も（無音になるだけでも）スケジュール自体は行っておく。
+        // resumeの完了待ちの間に、別のstopScore()等でこのctxが既に破棄され
+        // （audioCtxが差し替わり）ている可能性があるため、完了時点でまだ自分が
+        // 有効なcontextかどうかを確認してから実行する（古い方が後から発火して
+        // 新しい再生状態を上書きしてしまう競合を防ぐ）
+        const guardedBegin = () => { if (audioCtx === ctx) beginScheduling(); };
+        ctx.resume().then(guardedBegin, guardedBegin);
+    }
 }
 
 // startMeasureIndex小節目から末尾まで、BPM入力欄の現在値でスケジュールする
@@ -558,23 +813,31 @@ function startPlaybackFromMeasure(measureIndex) {
 // resumeMeasureStartTimeOverride: 曲中のテンポ変更で小節の途中から再開する場合、
 // その小節がもともと始まった時刻（表示上の小節範囲がずれないように引き継ぐ）
 function scheduleMeasuresFrom(startMeasureIndex, upperResume, lowerResume, beatIndexOffset, resumeMeasureStartTimeOverride) {
-    const bpm = parseInt(document.getElementById("bpmInput").value) || 120;
-    const beatDuration = 60 / bpm;
-    const sixteenthDuration = beatDuration * 0.25; // マップの1センサー(16分音符)分の長さ
     const measuresPerRow = getMeasuresPerRow();
     const beatsPerMeasure = getBeatsPerMeasure();
-    const measureDuration = beatsPerMeasure * beatDuration;
 
     // 小節単位のスケジュール（noteSchedule: 小節ハイライト用、noteTimeMap: 再生位置ライン用、
     // beatSchedule: マップのセンサー点灯用）は、上段・下段どちらの音符内容にも依存しない。
-    // 小節はどちらの配列で見ても必ず同じ拍数で埋まっているため、小節の開始・終了時刻はBPMと
-    // 小節番号だけで決まる純粋な算術で求められる
+    // 小節はどちらの配列で見ても必ず同じ拍数で埋まっているため、小節の開始・終了時刻は
+    // その時点の実効テンポ（テンポマップ、score.measures[i].tempo）と小節番号だけで決まる
+    // 純粋な算術で求められる（曲全体で単一だったbpmを、小節ごとに切り替わりうる値に拡張）
     let time = Math.min(upperResume.time, lowerResume.time);
     let beatIndex = beatIndexOffset;
+    let currentBpm = getEffectiveTempoAtMeasure(startMeasureIndex);
 
     const endMeasureIndex = getPlaybackEndMeasureIndex();
 
+    // 実際の発音（playNote呼び出し＝Web Audioのノード生成）は重い処理のため、ここでは
+    // 「いつ・何を鳴らすか」をpendingNoteEventsに集めるだけに留め、実際にplayNote()するのは
+    // 後段の先読みスケジューラ（scheduleLookaheadTick）に任せる（詳細は下のコメント参照）
+    const collectedNoteEvents = [];
+
     for (let measureIndex = startMeasureIndex; measureIndex <= endMeasureIndex; measureIndex++) {
+        if (score.measures[measureIndex].tempo != null) currentBpm = score.measures[measureIndex].tempo;
+        const beatDuration = 60 / currentBpm;
+        const sixteenthDuration = beatDuration * 0.25; // マップの1センサー(16分音符)分の長さ
+        const measureDuration = beatsPerMeasure * beatDuration;
+
         const isResumeMeasure = measureIndex === startMeasureIndex;
         const measureStartTime = (isResumeMeasure && resumeMeasureStartTimeOverride != null)
             ? resumeMeasureStartTimeOverride
@@ -594,15 +857,6 @@ function scheduleMeasuresFrom(startMeasureIndex, upperResume, lowerResume, beatI
         }
         const measureWidth = isFirstMeasure ? STAVE_WIDTH_BASE + FIRST_MEASURE_EXTRA : STAVE_WIDTH_BASE;
 
-        noteSchedule.push({ measureIndex, startTime: measureStartTime, endTime: measureEndTime });
-        noteTimeMap.push({
-            startTime: measureStartTime,
-            endTime: measureEndTime,
-            startX: sx * scale,
-            endX: (sx + measureWidth) * scale,
-            rowIndex
-        });
-
         // マップのセンサー(16分音符)単位での開始・終了時刻を記録。再開直後の小節は、
         // 実際に鳴らし直す時刻（time）から小節末尾までの残り分だけ生成する
         // （それより前のスロットは、reschedule側で既存のbeatScheduleがそのまま残っている）
@@ -613,20 +867,35 @@ function scheduleMeasuresFrom(startMeasureIndex, upperResume, lowerResume, beatI
             time = slotEnd;
         }
         time = measureEndTime;
+
+        noteSchedule.push({ measureIndex, startTime: measureStartTime, endTime: measureEndTime });
+        noteTimeMap.push({
+            startTime: measureStartTime,
+            endTime: measureEndTime,
+            startX: sx * scale,
+            endX: (sx + measureWidth) * scale,
+            rowIndex
+        });
     }
 
     // 終了検知はtrackPlayback内でaudioCtx時刻を見て行う（setTimeoutは一時停止中もカウントが進んでしまうため使わない）
     playEndTime = time;
 
-    // 実際の発音（playNote呼び出し）と、再開位置探しに使う音符境界スケジュールは、
-    // 上段・下段それぞれ独立にその配列を歩いて生成する（リズムが異なるため、鳴らす時刻の
-    // 進み方も独立している）
+    // 音符境界スケジュール（upperNoteBoundarySchedule/lowerNoteBoundarySchedule、テンポ変更等での
+    // 再開位置探しに使う）は、算術のみで軽いためこれまで通り曲の残り全体ぶんを毎回すぐに作る。
+    // collectedNoteEvents（発音イベントの収集先）は上の小節ループより前で宣言済み
+    // （曲の前半（残り音符が多い位置）から再生するときに、残り全部のノードを一度に生成すると
+    // 実機のオーディオレンダリングスレッドが処理落ちし「出だしが重い/音がガビる」原因になっていた
+    // ため、実際のplayNote()呼び出しは後段の先読みスケジューラ(scheduleLookaheadTick)に任せる）
     function scheduleStream(notesAccessor, boundarySchedule, resume) {
         // resume.timeは「その段の小節開始時刻＋スキップした音符の拍数分」であるはず（呼び出し元で
         // 保証）なので、残りの音符を順に足していけば、再開小節の末尾でちょうど小節終了時刻に一致する。
         // そのため2小節目以降は特別な調整をせず、そのままtを引き継げばよい
         let t = resume.time;
+        let streamBpm = getEffectiveTempoAtMeasure(startMeasureIndex);
         for (let measureIndex = startMeasureIndex; measureIndex <= endMeasureIndex; measureIndex++) {
+            if (score.measures[measureIndex].tempo != null) streamBpm = score.measures[measureIndex].tempo;
+            const beatDuration = 60 / streamBpm;
             const measure = score.measures[measureIndex];
             const notes = notesAccessor(measure);
             const isResumeMeasure = measureIndex === startMeasureIndex;
@@ -636,7 +905,7 @@ function scheduleMeasuresFrom(startMeasureIndex, upperResume, lowerResume, beatI
                 const note = notes[noteIndex];
                 const duration = noteBeats(note) * beatDuration;
                 if (!note.rest && note.pitches) {
-                    note.pitches.forEach(pitch => playNote(pitch, t, duration * 0.9));
+                    note.pitches.forEach(pitch => collectedNoteEvents.push({ pitch, startTime: t, duration: duration * 0.9 }));
                 }
                 boundarySchedule.push({ measureIndex, noteIndex, startTime: t, endTime: t + duration });
                 t += duration;
@@ -646,6 +915,50 @@ function scheduleMeasuresFrom(startMeasureIndex, upperResume, lowerResume, beatI
 
     scheduleStream(m => m.upperNotes, upperNoteBoundarySchedule, upperResume);
     scheduleStream(m => m.lowerNotes, lowerNoteBoundarySchedule, lowerResume);
+
+    // 上段・下段合わせて、実際に鳴る時刻の昇順にソートしてから先読みスケジューラへ渡す
+    // （上段を全部集めてから下段を全部集める順のままチャンク分割すると、曲頭で最初に鳴る
+    // はずの下段の音が配列の後方に位置してしまい、処理に時間がかかった時に予定時刻を
+    // 過ぎてから呼ばれる＝スケジュールの遅刻が起きるため、必ず時刻順に並べ直す）
+    collectedNoteEvents.sort((a, b) => a.startTime - b.startTime);
+    pendingNoteEvents = collectedNoteEvents;
+    pendingNoteEventsCursor = 0;
+
+    scheduleGeneration++;
+    scheduleLookaheadTick(scheduleGeneration);
+}
+
+// 先読みスケジューラ本体。「今から数秒先（SCHEDULE_LOOKAHEAD_SECONDS）まで」に開始時刻がある
+// pendingNoteEventsだけをplayNote()で実際に予約し、まだ先の分は次回以降のtickに残す。
+// myGenerationは呼び出された時点のscheduleGeneration。以降のtickのたびに現在値と比較し、
+// 一致しなくなっていたら（テンポ変更/シーク/停止等で別のスケジュールに置き換わった証拠）
+// 静かに処理を打ち切る（audioCtxが閉じられている場合も同様に打ち切る）
+function scheduleLookaheadTick(myGeneration) {
+    if (myGeneration !== scheduleGeneration || !audioCtx) return;
+
+    // 一時停止中はここで何もしない。pauseScore()はaudioCtxをsuspendするだけで、この
+    // setTimeoutループ自体は止めていないため、チェックせずに進むとplayNote()内の
+    // getAudioContext()が「suspendedなら自動でresume()する」ガード（ブラウザの自動再生
+    // 制限対策）を踏んでしまい、一時停止したはずのcontextが数百ms後に勝手に再開され、
+    // 音が鳴り続け・トロッコの定速アニメーションも一時停止中に進んでしまうバグになっていた
+    // （「一時停止しても、再開したら少し先から始まる」として報告された）。
+    // generationはそのまま維持し、tickだけを次回に先送りする——再開時に自動的に
+    // 続きから追いつけるようにするため、ループ自体は止めない
+    if (playState !== "playing") {
+        setTimeout(() => scheduleLookaheadTick(myGeneration), SCHEDULE_TICK_INTERVAL_MS);
+        return;
+    }
+
+    const horizon = audioCtx.currentTime + SCHEDULE_LOOKAHEAD_SECONDS;
+    while (pendingNoteEventsCursor < pendingNoteEvents.length && pendingNoteEvents[pendingNoteEventsCursor].startTime < horizon) {
+        const { pitch, startTime, duration } = pendingNoteEvents[pendingNoteEventsCursor];
+        playNote(pitch, startTime, duration);
+        pendingNoteEventsCursor++;
+    }
+
+    if (pendingNoteEventsCursor < pendingNoteEvents.length) {
+        setTimeout(() => scheduleLookaheadTick(myGeneration), SCHEDULE_TICK_INTERVAL_MS);
+    }
 }
 
 // 再生中/一時停止中にBPMや音符データ（移調など）が変更されたら、今鳴っている音符が終わった
@@ -706,6 +1019,13 @@ function rescheduleFromCurrentPosition() {
 
     if (resumeMeasureIndex >= score.measures.length || resumeMeasureIndex > getPlaybackEndMeasureIndex()) {
         playEndTime = earliestResumeTime;
+        // ここから先はscheduleMeasuresFrom()を呼ばない（鳴らす曲がもう無いため）が、
+        // 直前まで動いていた先読みループ（scheduleLookaheadTick）がまだ先の分を
+        // 予約し残している可能性があるため、世代を進めて確実に打ち切る
+        // （そのままにすると、削除済み/変更済みの小節の音が鳴ってしまうことがある）
+        scheduleGeneration++;
+        pendingNoteEvents = [];
+        pendingNoteEventsCursor = 0;
         return;
     }
 
@@ -741,6 +1061,11 @@ function stopScore() {
     highlightMeasure(-1);
     updatePlaybackMarkers(null);
     document.querySelectorAll(".playLine").forEach(el => el.remove());
+    // 先読みループ（scheduleLookaheadTick）が万一まだ残っていても、世代を進めて確実に打ち切る
+    // （audioCtxをnullにするだけでも次tickでガードされるが、念のため明示的にも無効化する）
+    scheduleGeneration++;
+    pendingNoteEvents = [];
+    pendingNoteEventsCursor = 0;
     if (audioCtx) {
         audioCtx.close();
         audioCtx = null;
@@ -843,9 +1168,13 @@ function updateSeekBar() {
 function updateSeekBarFillStart() {
     const bar = document.getElementById("seekBar");
     if (!bar || !score) return;
-    const startRatio = (abLoopRange && abLoopEnabled && score.measures.length > 0)
-        ? abLoopRange.startMeasureIndex / score.measures.length
-        : 0;
+    let startRatio = 0;
+    if (abLoopRange && abLoopEnabled && score.measures.length > 0) {
+        // テンポマップ対応: 小節番号の単純な比ではなく、累積タイムライン（秒）ベースの比にする
+        const timeline = computeMeasureTimeline();
+        const totalDuration = timeline[timeline.length - 1];
+        startRatio = totalDuration > 0 ? timeline[abLoopRange.startMeasureIndex] / totalDuration : 0;
+    }
     bar.style.setProperty("--fill-start", `${startRatio * 100}%`);
 }
 
@@ -853,14 +1182,59 @@ function updateSeekBarFillStart() {
 // 小節単位で対象の小節を求め、そこからスケジュールを組み直して再生する
 // （曲の途中の任意の時刻ちょうどから鳴らし直すのは、上段・下段の音符境界が
 // 揃っていないと崩れるため、小節単位に丸めている）
+// 「折り返しあり」の固定長線路（buildFixedRailTrack）上でのトロッコ位置を、指定した
+// audioCtx時刻から算出し、currentHighlightBeatIndex/Tを更新してupdatePlaybackMarkers()を
+// 呼ぶ。syncHighlightToMeasureStart（シーク時）・trackPlayback（毎フレーム）の両方で
+// 同じ計算式を使うための共通化
+function updateWrapTrolleyPositionAtTime(time) {
+    // mapBeatPositionsは2D(renderMap)、assemblyBeatCentersRawは3D(rebuildAssemblyMeshes)
+    // 側でしか埋まらないため、どちらか実際にレンダリング済みの方を使う
+    const pathLen = mapBeatPositions.length || assemblyBeatCentersRaw.length;
+    if (pathLen <= 1) return;
+
+    // 「折り返しあり」の線路は曲の拍ぶんの直線＋行と行を繋ぐカーブから成るが、カーブの
+    // 中間セルも行から間借りした実際の拍としてbeatSchedule・wrapBeatIndexToRailIndexに
+    // 1:1で対応するため（buildFixedRailTrack参照）、非折り返しモードと同じ単純な
+    // 「今の拍のrailIndexからnextRailIndexまでをtで線形補間」で滑らかに表示できる
+    const currentBeat = beatSchedule.find(b => time >= b.startTime && time < b.endTime);
+    let idx, t;
+    if (currentBeat && wrapBeatIndexToRailIndex.length > 0) {
+        const pos = wrapBeatIndexToRailIndex[currentBeat.beatIndex];
+        const nextPos = wrapBeatIndexToRailIndex[currentBeat.beatIndex + 1];
+        if (pos == null) {
+            // 衝突等でこの拍にセンサー自体が配置されなかった稀なケース。位置は更新しない
+            // （直前の表示のまま——レールを壊さない方を優先した既知の限界、pickSensorPosition参照）
+            return;
+        }
+        const rawT = (currentBeat.endTime > currentBeat.startTime) ? (time - currentBeat.startTime) / (currentBeat.endTime - currentBeat.startTime) : 0;
+        idx = pos;
+        t = (nextPos != null) ? rawT : 0;
+    } else {
+        // beatSchedule/対応表が無い（再生していない・プレビュー等）場合のみ、従来の定速フォールバック
+        const bpm = parseInt(document.getElementById("bpmInput")?.value) || 120;
+        const cellsPerSec = 1 / ((60 / bpm) * 0.25);
+        const posAlongPath = (time * cellsPerSec) % pathLen;
+        idx = Math.floor(posAlongPath);
+        t = posAlongPath - idx;
+    }
+    currentHighlightBeatIndex = idx;
+    currentHighlightBeatT = t;
+    updatePlaybackMarkers(idx, t);
+}
+
 // 指定した小節の頭の状態を、小節ハイライト・マップのマーカーへ即座に反映する。
 // シークや最初に戻す操作は、一時停止中に行われるとtrackPlayback()のループが
 // 1度も回らないまま止まってしまい、見た目が新しい位置に追従しないため、
 // stopScore()+startPlaybackFromMeasure()の直後にこれを呼んで明示的に同期する
 function syncHighlightToMeasureStart(measureIndex) {
+    resetTrolleyDisplayState(); // シーク直後は滑らかに追いつかせず即座に正しい位置へ合わせる
     currentHighlightMeasure = measureIndex;
     highlightMeasure(measureIndex);
-    if (beatSchedule.length > 0) {
+    if (mapSettings.railWrapEnabled) {
+        // 「折り返しあり」のトロッコは曲の再生位置（小節）とは無関係な定速クロックのため、
+        // シーク自体では動かさず、その時点のaudioCtx.currentTimeから改めて位置を求める
+        if (audioCtx) updateWrapTrolleyPositionAtTime(audioCtx.currentTime);
+    } else if (beatSchedule.length > 0) {
         currentHighlightBeatIndex = beatSchedule[0].beatIndex;
         currentHighlightBeatT = 0;
         updatePlaybackMarkers(currentHighlightBeatIndex, 0);
@@ -902,6 +1276,7 @@ function seekToRatio(ratio) {
 // シークバーをドラッグ中、実際に音を鳴らし直す（seekToRatio）前のプレビューとして、
 // 五線譜のハイライトとマップの再生位置マーカーだけをドラッグ位置に追従させる
 function previewSeekHighlight(measureIndex) {
+    resetTrolleyDisplayState(); // シーク直後は滑らかに追いつかせず即座に正しい位置へ合わせる
     highlightMeasure(measureIndex);
     const beatIndex = measureIndex * getBeatsPerMeasure() * 4;
     updatePlaybackMarkers(beatIndex, 0);
@@ -918,7 +1293,16 @@ function previewSeekHighlight(measureIndex) {
 function measureIndexForFullSongRatio(ratio) {
     const measureCount = score.measures.length;
     if (measureCount <= 0) return null;
-    return Math.min(measureCount - 1, Math.max(0, Math.floor(ratio * measureCount)));
+    // テンポマップ対応: 小節ごとの実際の長さ（秒）が均一とは限らないため、単純な
+    // ratio×小節数ではなく、累積タイムライン（秒）上で目標時刻に対応する小節を探す
+    const timeline = computeMeasureTimeline();
+    const totalDuration = timeline[timeline.length - 1];
+    const targetTime = ratio * totalDuration;
+    let idx = measureCount - 1;
+    for (let i = 0; i < measureCount; i++) {
+        if (targetTime < timeline[i + 1]) { idx = i; break; }
+    }
+    return Math.min(measureCount - 1, Math.max(0, idx));
 }
 
 // #abLoopStripの表示位置・幅を#seekBarの実測位置に揃える（#seekBarRowと
@@ -1056,14 +1440,23 @@ function trackPlayback() {
             highlightMeasure(currentHighlightMeasure);
         }
 
-        const currentBeat = beatSchedule.find(b => now >= b.startTime && now < b.endTime);
-        if (currentBeat) {
-            // レール上のマーカーは、このビートから次のビートへ1拍ぶんの時間で移動する
-            const beatT = (now - currentBeat.startTime) / (currentBeat.endTime - currentBeat.startTime);
-            currentHighlightBeatIndex = currentBeat.beatIndex;
-            currentHighlightBeatT = beatT;
-            updatePlaybackMarkers(currentBeat.beatIndex, beatT);
+        if (mapSettings.railWrapEnabled) {
+            // 「折り返しあり」は曲の拍数とは無関係な固定長の線路（buildFixedRailTrack）の
+            // ため、トロッコは曲の再生位置とは無関係に一定速度で線路上を進める。
+            // audioCtx.currentTime（一時停止で正しく止まり、再開で正しく再開する既存の
+            // 時計）を使い、線路の全長で周回（終端まで来たら先頭へループ）させる
+            updateWrapTrolleyPositionAtTime(now);
+        } else {
+            const currentBeat = beatSchedule.find(b => now >= b.startTime && now < b.endTime);
+            if (currentBeat) {
+                // レール上のマーカーは、このビートから次のビートへ1拍ぶんの時間で移動する
+                const beatT = (now - currentBeat.startTime) / (currentBeat.endTime - currentBeat.startTime);
+                currentHighlightBeatIndex = currentBeat.beatIndex;
+                currentHighlightBeatT = beatT;
+                updatePlaybackMarkers(currentBeat.beatIndex, beatT);
+            }
         }
+        followMapPlaybackContinuous(document.querySelector(".mapPlayLine"));
 
         for (let i = 0; i < noteTimeMap.length; i++) {
             const m = noteTimeMap[i];
@@ -1074,6 +1467,7 @@ function trackPlayback() {
                 break;
             }
         }
+        maybeFollowPlaybackElement(document.querySelector(".playLine"), "score");
     }
 
     animFrameId = requestAnimationFrame(trackPlayback);
@@ -1112,24 +1506,14 @@ function drawMapPlayLine(beatIndex, t) {
     // canvasの実際の画面位置ぶんを座標に加算する
     const canvas = document.getElementById("mapGrid");
     const wrapper = document.getElementById("mapAreaWrapper");
-    const posA = mapBeatPositions[beatIndex];
-    if (!canvas || !wrapper || !posA) return;
-    let posB = mapBeatPositions[beatIndex + 1] || posA;
+    if (!canvas || !wrapper || !mapBeatPositions[beatIndex]) return;
 
-    // 段の折り返し（wrapValueごとの改行）をまたぐ瞬間は、beatIndexとbeatIndex+1が
-    // レール上で隣接しておらず、段の端から次の段の端まで大きく離れた座標になる
-    // （折り返しは連続した1本のレールが続くのではなく、行の先頭に戻る形のため）。
-    // これをそのまま補間すると、マーカーが何もない場所を横切って飛んでいくように
-    // 見えてしまうため、1マス分より離れている場合は補間せず次の位置へ瞬時に切り替える
-    if (mapRailCellSize > 0) {
-        const dx = posB.x - posA.x;
-        const dy = posB.y - posA.y;
-        if (Math.hypot(dx, dy) > mapRailCellSize * 1.5) {
-            posB = posA;
-        }
-    }
+    // beatIndex/beatIndex+1間の単純な線形補間（段の折り返し等で距離が遠い場合は瞬間移動。
+    // 詳細はresolveTrolleyDisplayPosition参照）
+    const local = resolveTrolleyDisplayPosition(mapBeatPositions, beatIndex, t, mapRailCellSize);
+    if (!local) return;
 
-    // posA/posBはcanvasローカル座標（canvasの左上を原点とするpx）。#mapAreaWrapper基準の
+    // localはcanvasローカル座標（canvasの左上を原点とするpx）。#mapAreaWrapper基準の
     // 座標に変換するため、canvasの実際の表示位置とwrapperのスクロール量を加算する
     // （選択ハイライトのcreateMapOverlayEl()と同じ変換パターン）
     const canvasRect = canvas.getBoundingClientRect();
@@ -1137,13 +1521,15 @@ function drawMapPlayLine(beatIndex, t) {
     const offsetX = canvasRect.left - wrapperRect.left + wrapper.scrollLeft;
     const offsetY = canvasRect.top - wrapperRect.top + wrapper.scrollTop;
 
-    const localX = posA.x + (posB.x - posA.x) * t;
-    const localY = posA.y + (posB.y - posA.y) * t;
-    const x = localX + offsetX;
-    const y = localY + offsetY;
+    const x = local.x + offsetX;
+    const y = local.y + offsetY;
 
-    const w = mapRailIsVertical ? mapRailCellSize * 0.4 : mapRailCellSize * 0.9;
-    const h = mapRailIsVertical ? mapRailCellSize * 0.9 : mapRailCellSize * 0.4;
+    // 「トロッコはもう少し大きくていい、ただしマスからはみ出ない程度」との指定が
+    // 0.4/0.9→0.5/0.95の後さらに続いたため、1マス(1.0)ちょうどまで引き上げた（長さ側）。
+    // その後「トロッコの幅を少し広げてほしい」との依頼で、幅側（進行方向と直交する
+    // 短辺）を0.55→0.65に拡張した（3D側の本体幅拡張と揃えた変更）
+    const w = mapRailIsVertical ? mapRailCellSize * 0.65 : mapRailCellSize * 1.0;
+    const h = mapRailIsVertical ? mapRailCellSize * 1.0 : mapRailCellSize * 0.65;
 
     const line = document.createElement("div");
     line.className = "mapPlayLine";
@@ -1153,12 +1539,50 @@ function drawMapPlayLine(beatIndex, t) {
         top: ${y - h / 2}px;
         width: ${w}px;
         height: ${h}px;
-        background: rgba(255, 209, 0, 0.9);
-        border-radius: 3px;
         pointer-events: none;
         z-index: 8;
     `;
+    // プリミティブ組み立てのトロッコ（buildProceduralTrolleyMesh）のスナップショット生成
+    // （loadAssemblyTrolleyIcon2D参照）が完了済みならそのアイコン画像を使う。生成前は
+    // SVGの簡易アイコンで代用し、生成完了後に呼ばれるdrawMapPlayLine()から自然に切り替わる
+    line.innerHTML = assemblyTrolleyIcon2DDataURL
+        ? `<img src="${assemblyTrolleyIcon2DDataURL}" style="width:100%;height:100%;display:block;">`
+        : buildMapTrolleyIconSVG(w, h, mapRailIsVertical);
     wrapper.appendChild(line);
+}
+
+// 2Dマップの再生位置マーカーを、実機のトロッコ写真を参考にした簡易アイコン（荷台+
+// 車輪4つ+取っ手、真上から見た形）として描くSVG文字列を組み立てる。w/hは呼び出し側
+// （drawMapPlayLine）でレール向きに応じて長辺/短辺を入れ替え済みなので、ここでは
+// isVerticalに応じてどちらが進行方向（長辺）かだけ見て配置する
+function buildMapTrolleyIconSVG(w, h, isVertical) {
+    const bodyColor = "#4a2035", wheelColor = "#263454", handleColor = "#1c1c1c";
+    let bodyX, bodyY, bodyW, bodyH, wheelR, handleRect;
+    if (isVertical) {
+        bodyW = w * 0.72; bodyH = h * 0.66;
+        bodyX = (w - bodyW) / 2; bodyY = (h - bodyH) / 2;
+        wheelR = w * 0.26;
+        handleRect = { x: bodyX + bodyW * 0.3, y: bodyY - h * 0.1, w: bodyW * 0.4, h: h * 0.14 };
+    } else {
+        bodyW = w * 0.66; bodyH = h * 0.72;
+        bodyX = (w - bodyW) / 2; bodyY = (h - bodyH) / 2;
+        wheelR = h * 0.26;
+        handleRect = { x: bodyX + bodyW - w * 0.02, y: bodyY + bodyH * 0.3, w: w * 0.12, h: bodyH * 0.4 };
+    }
+    const wheelXs = [bodyX + wheelR * 0.4, bodyX + bodyW - wheelR * 0.4];
+    const wheelYs = [bodyY + wheelR * 0.4, bodyY + bodyH - wheelR * 0.4];
+    const wheels = wheelXs.flatMap(wx => wheelYs.map(wy =>
+        `<circle cx="${wx}" cy="${wy}" r="${wheelR}" fill="${wheelColor}"/>`
+    )).join("");
+    // display:blockが無いと<svg>はinline要素としてベースライン基準で配置され、
+    // フォントのディセンダー分だけ下に隙間ができて見た目が実際の位置よりも下にずれる
+    // （「レールの横を走ってしまっている」との報告の原因。cellSizeが小さいマップでは
+    // マーカー自体の高さ(h)がその隙間と同程度かそれより小さいため、1マス分ズレて見えた）
+    return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="overflow:visible; display:block;">`
+        + wheels
+        + `<rect x="${bodyX}" y="${bodyY}" width="${bodyW}" height="${bodyH}" rx="${wheelR * 0.6}" fill="${bodyColor}"/>`
+        + `<rect x="${handleRect.x}" y="${handleRect.y}" width="${handleRect.w}" height="${handleRect.h}" rx="${wheelR * 0.4}" fill="${handleColor}"/>`
+        + `</svg>`;
 }
 
 // 2Dマップ版の「トロッコ通過時に音符マットを凹ませる」演出。3D版
@@ -1408,6 +1832,36 @@ function getBeatsPerMeasure() {
     return num * 4 / den;
 }
 
+// 曲中の任意の位置で「今のテンポ」を求める。score.measures[i].tempoは、その小節から
+// 新しいテンポが始まる場合だけ持つ省略可能フィールド（無ければ直前の小節から継続）。
+// measure0にも無ければ#bpmInput（テンポマップが無い曲の従来通りの基準テンポ）を使う。
+// 呼び出し側でループしながら求める場合は、この関数を毎回0から呼ぶとO(n^2)になるため、
+// 直前の値を保持するローカル変数を使って1回のループで済ませること（下記参照）
+function getEffectiveTempoAtMeasure(measureIndex) {
+    let tempo = parseInt(document.getElementById("bpmInput")?.value) || 120;
+    for (let i = 0; i <= measureIndex && i < score.measures.length; i++) {
+        if (score.measures[i].tempo != null) tempo = score.measures[i].tempo;
+    }
+    return tempo;
+}
+
+// 曲全体の「各小節の開始時刻（秒、曲頭=0基準）」をテンポマップ考慮の累積で求める。
+// 戻り値はscore.measures.length+1個の配列（末尾は曲全体の合計時間=次の小節が
+// あるとしたらの開始時刻）。getFullSongDuration・startPlaybackFromMeasure・
+// updateStatusBar・measureIndexForFullSongRatio・updateSeekBarFillStartが共通で使う
+function computeMeasureTimeline() {
+    const beatsPerMeasure = getBeatsPerMeasure();
+    let tempo = parseInt(document.getElementById("bpmInput")?.value) || 120;
+    let t = 0;
+    const starts = [0];
+    for (let i = 0; i < score.measures.length; i++) {
+        if (score.measures[i].tempo != null) tempo = score.measures[i].tempo;
+        t += beatsPerMeasure * (60 / tempo);
+        starts.push(t);
+    }
+    return starts;
+}
+
 // 和音として同時に鳴らせるピッチ数の上限（固定11、UIでの変更は廃止済み）
 function getChordMax() {
     return 11;
@@ -1546,6 +2000,21 @@ const SCORE_ONLY_TOOLBAR_IDS = [
     "toolbarKeySig", "toolbarTranspose"
 ];
 
+// 組み立てプレビュー（3D）専用のツールバー。元は3Dキャンバス上に浮かせた
+// #assemblyCornerOverlayの一部だったが、画面上部のメニューバーへ移設したため、
+// 3Dプレビュー表示中（showMap3D）だけ表示する
+const ASSEMBLY_3D_TOOLBAR_IDS = [
+    "toolbarAssemblyCompass", "toolbarAssemblyGrid", "toolbarAssemblyColors", "toolbarAssemblyCamera"
+];
+
+// 2Dマップ専用のツールバー。元は2Dマップ上に浮かせた#mapCornerOverlayの一部
+// （「表示する層」だけは引き続き#mapCornerOverlay側に残す）だったが、画面上部の
+// メニューバーへ移設したため、2Dマップ表示中（showMap2D）だけ表示する
+// （2D/3D切替ボタン自体は#toolbarMapViewToggleとして2D/3D共通の1つに統合済みのため含まない）
+const MAP_2D_TOOLBAR_IDS = [
+    "toolbarMap2DCompass", "toolbarMap2DGrid"
+];
+
 function applyTabVisibility() {
     const isBoth    = activeTab === "both";
     const showScore = activeTab === "score" || isBoth;
@@ -1580,11 +2049,11 @@ function applyTabVisibility() {
     const assemblyAreaWrapper = document.getElementById("assemblyAreaWrapper");
     if (assemblyAreaWrapper) assemblyAreaWrapper.style.display = showMap3D ? "" : "none";
 
-    // マップエリア内（2D/3Dどちらでも同じ画面位置）に置く2D/3D切替。
-    // どちらのコピー（#mapAreaWrapper内・#assemblyAreaWrapper内）も、今はそれぞれの親と
-    // 全く同じ条件（showMap2D/showMap3D）で表示すればよいので、親のdisplay切替に任せて
-    // 個別のdisplay制御はしない
-    // ボタンの選択状態はDOM上に2組（2D用エリア内・3D用エリア内）あるので両方まとめて更新する
+    // マップ（2D/3D共通）の2D/3D切替。画面上部のメニューバーに1つだけ設置している
+    // （#toolbarMapViewToggle）。マップタブ表示中（2D/3Dどちらでも）は常に表示する
+    const toolbarMapViewToggle = document.getElementById("toolbarMapViewToggle");
+    if (toolbarMapViewToggle) toolbarMapViewToggle.style.display = showMap ? "" : "none";
+
     document.querySelectorAll(".map-view-mode-btn").forEach(btn => {
         const active = btn.dataset.mapViewMode === mapViewMode;
         btn.style.color = active ? "#3451d1" : "#767676";
@@ -1603,10 +2072,25 @@ function applyTabVisibility() {
         if (el) el.style.display = showScore ? "" : "none";
     });
 
-    // ヘルプは五線譜エリア右上に重ねる絶対配置のオーバーレイになったため、
-    // レイアウトの高さには影響しない。五線譜が見えているタブ（五線譜/並べて）では常に表示する
+    // 組み立てプレビュー（3D）専用のツールバー（画面上部のメニューバーに設置）。
+    // 3Dプレビュー表示中（showMap3D）だけ表示する
+    ASSEMBLY_3D_TOOLBAR_IDS.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = showMap3D ? "" : "none";
+    });
+
+    // 2Dマップ専用のツールバー（画面上部のメニューバーに設置）。
+    // 2Dマップ表示中（showMap2D）だけ表示する
+    MAP_2D_TOOLBAR_IDS.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = showMap2D ? "" : "none";
+    });
+
+    // ヘルプ（#helpBtn/#infoWrap）は「表示をなくす（蓋閉じ）、機能の実装は残す」との
+    // 依頼により、実装（ホバー/ピン留め/ドラッグ移動等）はそのまま残しつつ、常に非表示にしている。
+    // 再度表示したくなった場合は、下の行を`showScore ? "block" : "none"`に戻せばよい
     const infoWrap = document.getElementById("infoWrap");
-    if (infoWrap) infoWrap.style.display = showScore ? "block" : "none";
+    if (infoWrap) infoWrap.style.display = "none";
 
     // タブボタンのアクティブ状態を更新
     TABS.forEach(tab => {
@@ -1733,11 +2217,16 @@ let mapSettings = {
     railDirection: "vertical",   // "vertical" | "horizontal"
     startCorner: "top-left",     // "top-left" | "top-right" | "bottom-left" | "bottom-right"
     sideFirst: "left",           // "left" | "right" （どちら側のセンサーを先にするか）
-    wrapValue: 50,               // 折り返し値（一列あたりのセンサー数。レール1マス=センサー1個のためマス数と同義）
+    wrapValue: 50,               // 「折り返しあり」時は一列の最大レール数、「折り返しなし」時は一列あたりのセンサー数（マス数と同義）
+    railWrapEnabled: true,       // true=曲の拍数ぶんのレール+カーブの繰り返しを敷く（buildFixedRailTrack）、false=拍数連動の独立した帯（従来通り）
     hideUnusedSensors: false,    // true=周りに音符マットがないセンサーを配置しない（カウントにも含めない）
     activeLayer: "middle",       // "middle" | "upper" | "lower" （表示する層）
     skyColor: MAP_SKY_COLOR_DEFAULT,     // 3Dプレビューの空の色（2D側には見た目上の反映は無いが、設定は2D/3D共通で持つ）
     groundColor: MAP_GROUND_COLOR_DEFAULT, // 3Dプレビューの陸の色。2Dではマップの背景色として使う
+    showCharacter: false,        // true=3Dプレビューでトロッコの上にキャラクター（models/char.glb）を表示する
+    showDecorations: true,       // true=3Dプレビューの陸に木・草・花を散りばめる（generateAssemblyDecorations参照）
+    railFloating: true,          // true=レールを地面から浮かせる（従来通り）、false=地面につける
+    showSensorDirection: false,  // true=3Dプレビューで各センサーの反応方向（forwardVec沿い2マス）へ薄い赤の光線を出す（デバッグ用、2026-10-01追加）
 };
 
 // 層名⇔グリッドのz座標の対応。中間層=0（センサーが存在するのはここだけ）、
@@ -1814,12 +2303,56 @@ function getAllBeats() {
     });
 }
 
+// 音符マット配置時の衝突判定（isBlocked）を、渡されたgrid（Set<"x,y,z">）から作る共通ヘルパー。
+// buildFixedRailTrack/buildMapGridそれぞれのローカルなgridを閉じ込めるためファクトリ関数にしている
+function makeIsBlockedForPanel(grid) {
+    return (x, y, z) => grid.has(`${x},${y},${z}`);
+}
+
+// センサー位置そのものの衝突回避（buildFixedRailTrackのカーブ付近で確立し、非wrap時の
+// カーブ接続でも同じ問題が起きるため共有ヘルパーに切り出した）。4マス周期で決まる
+// 本来の位置→左右反転→遠近反転→両方反転の優先順で、既存セル（レール・別ビートの
+// センサー/音符マット）と衝突しない最初の候補を返す。4通り全て衝突していればundefined
+// （呼び出し側で「このビートの配置を諦める」判断をする——無警告のレール上書きはしない）
+function pickSensorPosition(grid, slotX, slotY, awayVec, beatIdx, sideFirst) {
+    const cyclePos = beatIdx % 4;
+    const baseIsLeftSide = sideFirst === "left"
+        ? (cyclePos === 0 || cyclePos === 2)
+        : (cyclePos === 1 || cyclePos === 3);
+    const baseIsFar = cyclePos === 2 || cyclePos === 3;
+    const candidates = [
+        { isLeftSide: baseIsLeftSide, isFar: baseIsFar },
+        { isLeftSide: !baseIsLeftSide, isFar: baseIsFar },
+        { isLeftSide: baseIsLeftSide, isFar: !baseIsFar },
+        { isLeftSide: !baseIsLeftSide, isFar: !baseIsFar },
+    ];
+    for (const cand of candidates) {
+        const lp = (cand.isLeftSide ? -1 : 1) * (cand.isFar ? 2 : 1);
+        const cx = slotX + awayVec.dx * lp;
+        const cy = slotY + awayVec.dy * lp;
+        if (!grid.has(`${cx},${cy},0`)) return { x: cx, y: cy };
+    }
+    return undefined;
+}
+
 // 中間層3枠+上位層4枠+下位層4枠（計11枠、センサー中心を(0,0)としたローカル座標、
 // 斜め隣接は使用しない）への音符マット割り当てを、進行方向ベクトル(forwardVec)・
 // レールと反対方向ベクトル(awayVec)を使って実グリッドオフセットに変換する共通処理。
 // forwardVec/awayVecはどちらも{dx,dy}が-1/0/1のいずれかの単位ベクトル。
 // 直線モードでは常に固定ベクトル、スネークモードでは経路上の位置ごとに変化するベクトルを渡す。
-function calcPanelPositionsCore(pitches, forwardVec, awayVec) {
+// sX/sYはセンサーの絶対座標、isBlocked(x,y)は「そのマスに音符マットを置けない
+// （レールの折り返しコネクタが通る・既に別のセンサーの音符マットが置かれている等）」
+// かどうかを判定する任意のコールバック。
+//
+// 【配置ルール】センサー1個に対する11枠のランク（優先順位）自体は絶対・固定であり、
+// 状況に応じて変えない（実機のセンサー・音符マットの物理的な位置関係が固定であるため）。
+// ただし、2つのセンサーの反応範囲が重なる等の理由であるマスが既に埋まっている場合、
+// そのマスだけは諦めて「死にマス」として扱い、同じセンサーの11枠のうちまだ空いている
+// 別の枠があればそちらへ配置する——1箇所埋まっていたら即座にその音を諦めるのではなく、
+// 11枠を優先順位順に総当たりしてから、本当にどこも空いていない場合にだけ諦める
+// （ユーザー指摘、2026-09-29:「死にマスは、2つ以上のセンサーで反応してしまうのでおけない。
+// それ以外のマスで置ける猶予があるならば、そこに配置してください」）
+function calcPanelPositionsCore(pitches, forwardVec, awayVec, sX, sY, isBlocked) {
     // 音の優先順位（固定）: 中間層(遠い→横→近い) → 上位層(遠い→横→近い→センサー直上) →
     // 下位層(遠い→横→近い→センサー直下)。上位層/下位層の4つ目はセンサーそのものの
     // 位置（lat:0,trav:0）に積む
@@ -1842,19 +2375,43 @@ function calcPanelPositionsCore(pitches, forwardVec, awayVec) {
     ];
     const fullRank = [...midRank, ...upperRank, ...lowerRank]; // 3+4+4=11枠
 
+    const toOffset = (slot) => ({
+        dx: slot.trav * forwardVec.dx - slot.lat * awayVec.dx,
+        dy: slot.trav * forwardVec.dy - slot.lat * awayVec.dy,
+    });
+
+    const claimedIdx = new Set(); // このセンサー（和音）が既に使ったfullRankの枠番号
     const positions = [];
     pitches.forEach((pitch, i) => {
-        if (i >= fullRank.length) return;
-        const slot = fullRank[i];
-        const dx = slot.trav * forwardVec.dx - slot.lat * awayVec.dx;
-        const dy = slot.trav * forwardVec.dy - slot.lat * awayVec.dy;
-        positions.push({ relX: dx, relY: dy, z: slot.z, pitch });
+        if (i >= fullRank.length) return; // 11枠を超える音は物理的に置き場が無いためドロップ（従来通り）
+
+        const primarySlot = fullRank[i];
+        // 探索順: (1)本来の優先枠 (2)trav反転（遠い⇄近い、同じ和音の他の音との重複だけは
+        // 避ける） (3)それ以外の全枠をfullRankの優先順位のまま総当たり。die cellで塞がって
+        // いても即ドロップせず、この和音自身がまだ使っていない枠が他に無いか全て試す
+        const order = [i];
+        if (primarySlot.trav !== 0) {
+            const flipIdx = fullRank.findIndex(s => s.lat === primarySlot.lat && s.trav === -primarySlot.trav && s.z === primarySlot.z);
+            if (flipIdx >= 0) order.push(flipIdx);
+        }
+        fullRank.forEach((_, idx) => { if (!order.includes(idx)) order.push(idx); });
+
+        for (const idx of order) {
+            if (claimedIdx.has(idx)) continue; // 同じ和音の別の音が既に使った枠
+            const slot = fullRank[idx];
+            const { dx, dy } = toOffset(slot);
+            if (isBlocked && isBlocked(sX + dx, sY + dy, slot.z)) continue; // 死にマス（他センサーの領域と重複等）
+            positions.push({ relX: dx, relY: dy, z: slot.z, pitch });
+            claimedIdx.add(idx);
+            return;
+        }
+        console.warn(`音符マットの配置候補(全${fullRank.length}枠)が全て衝突したため、1音(${pitch})の配置をスキップしました（センサー間隔が詰まっている等の既知の限界）。`);
     });
     return positions;
 }
 
 function updateMapToolbarUI() {
-    const { railDirection, startCorner, sideFirst, wrapValue, hideUnusedSensors, activeLayer } = mapSettings;
+    const { railDirection, startCorner, sideFirst, wrapValue, railWrapEnabled, hideUnusedSensors, activeLayer, showCharacter, showDecorations, railFloating, showSensorDirection } = mapSettings;
 
     const setActive = (id, active) => {
         const el = document.getElementById(id);
@@ -1883,6 +2440,16 @@ function updateMapToolbarUI() {
     setActive("mapSideRight", sideFirst === "right");
     setActive("mapShowUnusedSensors", !hideUnusedSensors);
     setActive("mapHideUnusedSensors", hideUnusedSensors);
+    setActive("mapRailWrapOn",  railWrapEnabled);
+    setActive("mapRailWrapOff", !railWrapEnabled);
+    setActive("mapCharacterOn",  showCharacter);
+    setActive("mapCharacterOff", !showCharacter);
+    setActive("mapDecorationsOn",  showDecorations);
+    setActive("mapDecorationsOff", !showDecorations);
+    setActive("mapRailFloatingOn",  railFloating);
+    setActive("mapRailFloatingOff", !railFloating);
+    setActive("mapSensorDirectionOn",  showSensorDirection);
+    setActive("mapSensorDirectionOff", !showSensorDirection);
 
     const wrapInput = document.getElementById("mapWrapValue");
     if (wrapInput) wrapInput.value = wrapValue;
@@ -1890,9 +2457,345 @@ function updateMapToolbarUI() {
 
 // マップのグリッドデータ（レール・センサー・音符マットの配置）を計算する
 // DOM描画には依存しないので、描画不要なカウント表示（レール数・センサー数）からも呼べる
+
+// 「折り返しあり」時のレール敷設。「一列の最大レール数」(wrapValue)ぶん直線にレールを
+// 置いたらカーブを描き、これを曲の総拍数ぶん敷き終わるまで繰り返す、曲の長さに
+// ぴったり合わせた物理的な線路（カーブは行と行の間の接続専用で、拍を消費しない）。
+// 以前はここが「曲の拍数とは無関係な固定300マス」だったため、長い曲では途中から
+// 音符マットが付かなくなり、さらにトロッコの表示位置が拍番号をそのまま物理セル番号
+// として使っていたことと相まって、段数の多い曲では後半のほとんどの段にトロッコが
+// 実質到達できない（センサーは付いているのに表示だけ先頭付近で足踏みする）不具合が
+// あった。曲の拍数に合わせて線路自体を伸ばすことで両方を解消する
+// （「行と行の間もカーブで実際に繋げてワープを無くしたい」との依頼、2026-09-29。
+// 対象は「折り返しあり」であって「折り返しなし」ではない、と後から明確化された）。
+// 段の間隔・ジグザグ配置の考え方（isMirroredBand相当・wrapOffset・カーブの90度回転描画）は
+// 従来の「折り返しあり」実装と同じものを踏襲している
+function buildFixedRailTrack({ railDirection, isVertical, travelSign, wrapSign, wrapValue, turnLength }) {
+    const effectiveTurnLength = turnLength - 1; // 段の間隔から区切り用の1マスを詰める（従来通り）
+    const maxRailsPerRow = Math.max(1, wrapValue);
+
+    const grid = new Map();
+    const setCell = (x, y, z, data) => grid.set(`${x},${y},${z}`, data);
+
+    // 経路上の全セル座標を、実際に辿る順番に並べたもの（直線+カーブ、隙間なく1マスずつ）。
+    // トロッコの定速アニメーションは、この配列を先頭からの通し番号として辿るだけでよい
+    // （どのセルも隣と必ず1マス差のため、resolveTrolleyDisplayPosition側の「大ジャンプ」判定が
+    // 発生せず、コネクタ経路(connectorPaths)を別途持つ必要が無い）
+    const railCenters = [];
+
+    let extentMinX = Infinity, extentMaxX = -Infinity, extentMinY = Infinity, extentMaxY = -Infinity;
+    const markExtent = (x, y) => {
+        extentMinX = Math.min(extentMinX, x);
+        extentMaxX = Math.max(extentMaxX, x);
+        extentMinY = Math.min(extentMinY, y);
+        extentMaxY = Math.max(extentMaxY, y);
+    };
+
+    // keepExisting=trueの場合、既にそのマスにレールが置かれていれば上書きしない
+    // （直線の段の先頭セルが、直前のカーブが既に置いた曲がり角のセルと同じ座標になる場合、
+    // カーブ側の向き＝直角に折れた「真横」の向きを優先して残すため。上書きを許すと、
+    // 曲がり角のうち片方の端だけ直線側の向きに戻ってしまい、U字の向きが左右非対称に見える）
+    const placeRailCell = (x, y, direction, keepExisting = false, corner = null) => {
+        const key = `${x},${y},0`;
+        if (keepExisting && grid.has(key)) {
+            markExtent(x, y);
+            return;
+        }
+        // corner（{inDir,outDir}）が指定されたセルは、直線ではなく1マスぶんの円弧として
+        // 描画する（「カーブの角を1マスだけ弧にしてカーブっぽく」との依頼）。inDir/outDirは
+        // それぞれ「このマスに入ってくる方向」「このマスから出ていく方向」の単位ベクトル
+        // （2D/3D双方のレンダラーがこれを見て円弧の中心・開始角/終了角を計算する）
+        const railData = corner ? { type: "rail", direction, corner } : { type: "rail", direction };
+        setCell(x, y, 0, railData);
+        setCell(x, y, 1, railData);
+        setCell(x, y, -1, railData);
+        markExtent(x, y);
+    };
+
+    // 折り返し軸(wrap軸)・進行軸(travel軸)それぞれの符号から、グリッド単位の単位ベクトル
+    // {dx,dy}を作るヘルパー（角の円弧の始点/終点方向を決めるのに使う）
+    const travelVec = (sign) => isVertical ? { dx: 0, dy: sign } : { dx: sign, dy: 0 };
+    const wrapVec = (sign) => isVertical ? { dx: sign, dy: 0 } : { dx: 0, dy: sign };
+
+    // 行・カーブの構造（何行あるか、各行の長さ、ミラーリングの偶奇）は、曲の「実際の拍数」
+    // だけで決まる（以前のFIXED_RAIL_TOTAL_COUNT=300のような固定値ではない）。
+    const beats = getAllBeats();
+    const totalBeats = beats.length;
+
+    // 「カーブは行の中からturnLength-1マス（中間セルの数）だけ間借りするだけで、レール
+    // 総数（物理セル数）は曲の実際の拍数と常に完全に一致する」という設計（「カーブも直線も
+    // レールはレールで、数は変わらないはず」との指摘、2026-09-30）。カーブが後ろに続く行は
+    // 直線部分の拍数をcurveNewCellsぶん減らし、浮いた拍数をカーブの中間セル自身が引き継いで
+    // 鳴らす。最後の行（後ろにカーブが無い）だけは残り全部をそのまま使う。
+    // 各行が直線部分で消費する拍数のリストを先に1回だけ計算しておく（セルはまだ書き込まない）
+    const curveNewCells = Math.max(0, effectiveTurnLength); // turnLength-1 = 6
+    const rowStraightLengths = [];
+    {
+        let rem = totalBeats;
+        while (rem > 0) {
+            if (rem <= maxRailsPerRow) {
+                rowStraightLengths.push(rem);
+                rem = 0;
+            } else {
+                const cap = Math.max(1, maxRailsPerRow - curveNewCells);
+                rowStraightLengths.push(cap);
+                rem -= cap;
+                rem -= curveNewCells; // カーブが直接引き取る拍数
+            }
+        }
+    }
+    const totalBandCount = rowStraightLengths.length;
+
+    let remaining = totalBeats;
+    let colIdx = 0;
+    while (remaining > 0) {
+        const rowsInThisBand = rowStraightLengths[colIdx];
+        // 奇数番目の段は視覚上の進行方向を逆にする（ジグザグ/ボウストロフェドン配置）。
+        // これにより段の終端と次の段の始端が進行軸上の同じ座標で揃い、間をカーブで
+        // 直角に繋げられるようになる（従来の「折り返しあり」実装と同じ考え方）。
+        // 偶奇は先頭からのcolIdxではなく「末尾から数えた位置」で決める——最後の段だけは
+        // 端数で他より短くなり得るが、この基準なら最後から2番目の段との接続は必ず
+        // 「両方とも行0で繋がる」パターンになり、段の長さが違っても座標がずれない
+        // （先頭基準だと、最後の段が短い場合に接続点の行番号が一致しなくなることがあった）
+        const mirrored = (totalBandCount - 1 - colIdx) % 2 === 1;
+        const wrapOffset = wrapSign * colIdx * (effectiveTurnLength + 1);
+        // この段の後ろにカーブが続くかどうか（最後の段だけは続かない）。段の最後のセル
+        // （カーブの入口の角と同一座標）が、直後のカーブ中間セルではなく自分自身の段の
+        // 向き（forwardVec）を使うべきかどうかの判定に使う（下記isRowEndBeforeCurve参照）
+        const hasFollowingCurve = colIdx < totalBandCount - 1;
+
+        for (let i = 0; i < rowsInThisBand; i++) {
+            const effRowIdx = mirrored ? (rowsInThisBand - 1 - i) : i;
+            const travelPos = travelSign * effRowIdx;
+            const rx = isVertical ? wrapOffset : travelPos;
+            const ry = isVertical ? travelPos : wrapOffset;
+            placeRailCell(rx, ry, railDirection, true);
+            // 段の最初のセル(i===0)は、直前にカーブがある場合（colIdx>0）、そのカーブの
+            // 出口（wB地点）としてカーブ生成ループ側で既にrailCentersへpush済みの座標と
+            // 完全に一致する。ここでも重複してpushすると、経路上に同じ座標が2つ連続で
+            // 並ぶことになり、トロッコの定速アニメーションがその1ステップぶん（1/cellsPerSec秒）
+            // 進んでも見た目の位置が変わらない＝一瞬静止して見えるバグになる
+            // （「U字の2回目のカーブで一瞬止まる」として報告された）
+            if (!(i === 0 && colIdx > 0)) {
+                // 段の最後のセル(i===rowsInThisBand-1)かつ後ろにカーブが続く場合、この
+                // セルはカーブの入口の角と同一座標（=物理的には直線の続きだが、次に
+                // 押し込まれるのはカーブの中間セル）になる。センサーの向き算出（下記
+                // sensorSlots）で「次のセルとの差分」をそのまま使うと、この最後の1マスだけ
+                // 折れ曲がった後のカーブの向きを向いてしまい、同じ直線上に並ぶ他のセンサー
+                // と向きが食い違って見える（「センサーの向きが180度逆で配置されている
+                // ところが散見される」との指摘、2026-10-01）。isRowEndBeforeCurveフラグを
+                // 立てておき、このセルだけ「前のセルとの差分」を使うよう下流で分岐する
+                railCenters.push({ x: rx, y: ry, isBeat: true, isRowEndBeforeCurve: i === rowsInThisBand - 1 && hasFollowingCurve });
+            }
+        }
+        remaining -= rowsInThisBand;
+        if (remaining <= 0) break;
+
+        // カーブ（次の段への接続）。このバンドの終端（最後に置いた行の座標）から、
+        // 折り返し軸方向に直角へ折れ、次の段の始端まで1本のレールで繋ぐ
+        const boundaryEffRowIdx = mirrored ? 0 : rowsInThisBand - 1;
+        const T = travelSign * boundaryEffRowIdx;
+        const wA = wrapOffset;
+        const wB = wrapSign * (colIdx + 1) * (effectiveTurnLength + 1);
+        // コネクタは折り返し軸方向（メインのレールとは直角）に走るため、見た目のレール向き
+        // （drawMapRailLineのdirection、ties/レール本体の向きを決める）もメインの
+        // railDirectionとは直角にする。同じ向きのままだとレールが実際には直角に曲がらず、
+        // ただ横に並んでいるだけに見えてしまう
+        const connectorDirection = isVertical ? "horizontal" : "vertical";
+
+        // カーブの両端（直線からカーブへ曲がる角、カーブから次の直線へ戻る角）だけ、
+        // 「進行方向が変わる1マス」として円弧描画用のinDir/outDirを持たせる
+        // （「トロッコが進む方向に合わせて」なので、実際にその角を通過する際の
+        // 進行方向をそのまま使う）
+        const nextMirrored = (totalBandCount - 1 - (colIdx + 1)) % 2 === 1;
+        const entryCorner = {
+            inDir: travelVec(mirrored ? -travelSign : travelSign),
+            outDir: wrapVec(wrapSign),
+        };
+        const exitCorner = {
+            inDir: wrapVec(wrapSign),
+            outDir: travelVec(nextMirrored ? -travelSign : travelSign),
+        };
+
+        for (let w = wA; wrapSign > 0 ? w <= wB : w >= wB; w += wrapSign) {
+            const rx = isVertical ? w : T;
+            const ry = isVertical ? T : w;
+            const corner = w === wA ? entryCorner : w === wB ? exitCorner : null;
+            placeRailCell(rx, ry, connectorDirection, false, corner);
+            // wA地点は直線側で既にpush済み。ここでpushする残り全部（wB=出口の角を含む）は
+            // isBeat:trueにする——「カーブも直線と同様に扱う」との依頼により、カーブの
+            // 中間セルにも実際の（本物の、行から間借りした）拍が対応するため。
+            // wB地点（出口の角）は次の段のi=0（最初の拍）の座標と幾何学的に完全に一致する
+            // 地点で、次の段側では「直前のカーブのwB地点と重複するため」という理由で
+            // i=0のpushを意図的にスキップしている（下のrowsInThisBandループのコメント参照）。
+            // そのため、この段の最初の拍を代表する実体はここでのpushだけである
+            if (w !== wA) railCenters.push({ x: rx, y: ry, isBeat: true });
+        }
+        // カーブの中間セル(curveNewCells個)は、行の直線部分から間借りした実際の拍を
+        // 引き継いで鳴らすため、remainingからもその分を消費する（rowStraightLengths側の
+        // 計算と一致させる）
+        remaining -= curveNewCells;
+        colIdx += 1;
+    }
+
+    // ここまでで線路（直線+カーブ）のセルは確定した。ここから、実際の曲のビートに合わせて
+    // センサー・音符マットをこの固定線路に配置する（「センサーを配置してください、一回
+    // やってみてください」との依頼、最初の実装）。「カーブも直線と同様に扱う」との依頼
+    // （2026-09-30）により、現在はrailCenters上のisBeat:trueなセルであれば、直線の行の
+    // セルもカーブの中間セルも区別なくセンサー配置の対象にする（判定にはrailCenters側で
+    // 予め付けたisBeatフラグを使う——cell.cornerでの判定は誤り。段の最後/最初の拍のセルは
+    // カーブのentryCorner/exitCorner描画により見た目上cell.cornerが真になるが、実際には
+    // 拍を表すisBeat:trueのrailCentersエントリなので除外してはいけない）。
+    // 経路(railCenters)上の隣接2点は必ず1マス差なので、その差分をそのまま「このセルでの
+    // 進行方向(forwardVec)」として使える——段のミラーリングやカーブでどちらに曲がるかを
+    // 個別に判定しなくても、経路そのものから自然に求まる
+    const sensorSlots = [];
+    for (let i = 0; i < railCenters.length; i++) {
+        const { x, y, isBeat, isRowEndBeforeCurve } = railCenters[i];
+        if (!isBeat) continue;
+        const next = railCenters[i + 1];
+        const prev = railCenters[i - 1];
+        // 段の最後のセル（直後にカーブの中間セルが続く座標）だけは例外的に「前のセルとの
+        // 差分」を使う。「次のセルとの差分」のままだと、直線の続きであるこのセル自身の
+        // 向きが、直後に折れ曲がるカーブの向きに引っ張られてしまい、同じ直線上に並ぶ
+        // 他のセンサーと向きが食い違って見える（isRowEndBeforeCurveのコメント参照）
+        const forwardVec = (next && !isRowEndBeforeCurve)
+            ? { dx: next.x - x, dy: next.y - y }
+            : { dx: x - prev.x, dy: y - prev.y }; // 経路の最後尾・段の最後のセルは直前までの進行方向を引き継ぐ
+        // 進行方向を90度回転させた向きを「外側」とする（常に同じ側に一貫してオフセット
+        // されるよう、回転の向きは固定。どちら回りでも物理的な意味は変わらない）
+        const awayVec = { dx: -forwardVec.dy, dy: forwardVec.dx };
+        // railIndex（railCenters内での本来の通し番号、カーブぶんの欠番を含む）も保持しておく。
+        // 音符マットのbeatIndexに使うのはsensorSlotsの添字（下のbeatIdx、カーブを除いた
+        // 拍だけの通し番号）ではなくこちらでなければならない——トロッコの再生位置
+        // （trackPlayback）はrailCenters（カーブ込みの物理的な経路）上の通し番号を
+        // そのまま使っているため、拍だけの番号とは食い違ってしまう（詳細はbeatIndex:
+        // slot.railIndexの代入箇所のコメント参照）
+        sensorSlots.push({ x, y, forwardVec, awayVec, railIndex: i });
+    }
+
+    // beats/totalBeatsは線路自体を敷くのに使ったものと同じ配列（上で計算済み）。
+    // 線路の総数（行の拍数の合計）は必ずtotalBeatsと一致するはずだが、念のため
+    // 不一致があれば警告に留めて収まる分だけ配置する（レールを壊さない方を優先）
+    const totalBeatsToPlace = Math.min(beats.length, sensorSlots.length);
+    if (beats.length > sensorSlots.length) {
+        console.warn(`固定レール上のセンサー設置可能数(${sensorSlots.length})が曲の拍数(${beats.length})に足りません。超過分の拍にはセンサーが付きません。`);
+    }
+
+    // 拍番号(beatIdx)→railIndex（railCenters内の物理的な通し番号）の対応表。
+    // トロッコの再生位置（updateWrapTrolleyPositionAtTime）が、実際に鳴っている拍の
+    // 物理位置を正確に求めるために使う。センサー自体の配置（pickSensorPosition）が
+    // 衝突で諦められた場合でも、レール自体（railIndex）は必ず存在するのでそのまま使える
+    const beatIndexToRailIndex = sensorSlots.slice(0, totalBeatsToPlace).map(s => s.railIndex);
+
+    for (let beatIdx = 0; beatIdx < totalBeatsToPlace; beatIdx++) {
+        const beat = beats[beatIdx];
+        const slot = sensorSlots[beatIdx];
+
+        const picked = pickSensorPosition(grid, slot.x, slot.y, slot.awayVec, beatIdx, mapSettings.sideFirst);
+        if (!picked) {
+            // 4通り全て衝突していた場合、以前はやむを得ず本来の位置（=既に埋まっている
+            // ことが確認済みのセル）をそのまま使っていたが、これはレール（カーブの通り道
+            // 等）を無警告で上書きしてしまい、線路が欠けて見える不具合になっていた。
+            // 「曲の拍数がセンサー設置可能数を超える」場合と同じ考え方で、このビートの
+            // センサー・音符マットの配置は諦めてスキップする（レールを壊さない方を優先する）
+            console.warn(`拍${beatIdx + 1}: センサーの配置候補（本来位置/左右反転/遠近反転/両方反転）が全て衝突したため、このビートのセンサー・音符マットをスキップしました。`);
+            continue;
+        }
+        const { x: sX, y: sY } = picked;
+
+        const hasPanel = beat.isFirst && beat.note && !beat.note.rest && beat.note.pitches;
+
+        // slot.awayVecは「隣接/遠め・左右」4マス周期の基準となる固定の回転軸であり、
+        // beatIdxが偶数/奇数かで実際にはその正負どちらの側にもセンサーが置かれる
+        // （pickSensorPositionのisLeftSide参照）。そのためレール中心(slot.x,slot.y)から
+        // 実際に置かれたセンサー位置(sX,sY)への差分を正規化した方を、以降（センサーの
+        // 表示向き・音符マットの配置オフセット）すべてで使う——slot.awayVecのまま使うと、
+        // 約半数のセンサーで実際の位置と逆向きになり、「レーザーがそっぽを向く」
+        // （2026-10-01）だけでなく、音符マットがレールと反対側ではなく**レール側へ**
+        // 配置されてしまう実害のあるバグになっていた（「レール、真ん中の音符マット、
+        // センサーの順に配置されている」とのユーザー指摘で発覚。実際に1660枚中104枚で
+        // 音符マットがセンサーよりレールに近い位置に配置されていたことを数値で確認した）
+        const awayDx = sX - slot.x, awayDy = sY - slot.y;
+        const awayMag = Math.hypot(awayDx, awayDy) || 1;
+        const actualAwayVec = { dx: awayDx / awayMag, dy: awayDy / awayMag };
+
+        markExtent(sX, sY);
+        if (!mapSettings.hideUnusedSensors || hasPanel) {
+            setCell(sX, sY, 0, {
+                type: "sensor",
+                beatNum: beatIdx + 1,
+                direction: slot.forwardVec.dy !== 0 ? "vertical" : "horizontal",
+                measureIndex: beat.measureIndex,
+                awayVec: actualAwayVec,
+            });
+        }
+
+        if (hasPanel) {
+            const sorted = [...beat.note.pitches].sort((a, b) => pitchToSemitone(b) - pitchToSemitone(a));
+            // 既に置かれている（レール・別ビートのセンサー/音符マット）セルには重ねない
+            const panelPositions = calcPanelPositionsCore(sorted, slot.forwardVec, actualAwayVec, sX, sY, makeIsBlockedForPanel(grid));
+            panelPositions.forEach(({ relX, relY, z, pitch }) => {
+                const px = sX + relX;
+                const py = sY + relY;
+                setCell(px, py, z, {
+                    type: "panel",
+                    pitch,
+                    direction: northDirection,
+                    measureIndex: beat.measureIndex,
+                    // 「音符マットが踏まれたら凹む」演出（setAssemblyPanelPressed等）は、
+                    // トロッコの再生位置＝railCenters（カーブのセルも含む物理的な経路）上の
+                    // 通し番号でこのbeatIndexを検索する。sensorSlotsの添字beatIdxは拡張
+                    // ビート列（カーブのentry/exit角を除く一部のセルがrailCenters上で
+                    // 欠番になる関係で、通し番号とはズレることがある）上の位置なので、
+                    // 実際にトロッコが辿る通し番号と一致するslot.railIndexを使う
+                    beatIndex: slot.railIndex,
+                });
+                markExtent(px, py);
+            });
+        }
+    }
+
+    const extent = extentMinX === Infinity
+        ? null
+        : { minX: extentMinX, maxX: extentMaxX, minY: extentMinY, maxY: extentMaxY };
+
+    return {
+        grid,
+        totalBeats: railCenters.length,
+        extent,
+        separatorCoords: new Set(),
+        isVertical,
+        deadZoneCoords: new Set(),
+        beatCenters: railCenters,
+        beatIndexToRailIndex,
+    };
+}
+
 function buildMapGrid() {
-    const { railDirection, startCorner, sideFirst, wrapValue } = mapSettings;
+    const { railDirection, startCorner, sideFirst, wrapValue, railWrapEnabled } = mapSettings;
     const turnLength = getTurnLength();
+
+    // レール向き・開始地点から、進行軸/折り返し軸の符号を決める
+    // vertical: 進行軸=Y, 折り返し軸=X / horizontal: 進行軸=X, 折り返し軸=Y
+    const isVertical = railDirection === "vertical";
+    const [vPart, hPart] = startCorner.split("-"); // "top"|"bottom", "left"|"right"
+    const travelSign = isVertical
+        ? (vPart === "top" ? 1 : -1)   // 上開始→進行軸+方向、下開始→-方向
+        : (hPart === "left" ? 1 : -1); // 左開始→進行軸+方向、右開始→-方向
+    const wrapSign = isVertical
+        ? (hPart === "left" ? 1 : -1)  // 左開始→折り返しは+方向に列を増やす、右開始→-方向
+        : (vPart === "top" ? 1 : -1);  // 上開始→折り返しは+方向に行を増やす、下開始→-方向
+
+    // 「折り返しあり」の場合、レール敷設は曲の拍数と完全に切り離した固定長（300個、
+    // カーブも1個として数える）の物理的な線路に置き換える（センサー・音符マットは
+    // まだこの新しい線路には乗せていない、意図的な未実装状態）。「折り返しなし」は
+    // 以下の従来通り拍数連動の独立した帯のまま、一切変更しない
+    if (railWrapEnabled) {
+        return buildFixedRailTrack({ railDirection, isVertical, travelSign, wrapSign, wrapValue, turnLength });
+    }
+
+    const effectiveTurnLength = turnLength;
 
     // 全ビートを取得
     const beats = getAllBeats();
@@ -1907,17 +2810,6 @@ function buildMapGrid() {
     // sideFirst="left": 1個目→隣接左, 2個目→隣接右, 3個目→遠め左, 4個目→遠め右, ...
     // sideFirst="right": 1個目→隣接右, 2個目→隣接左, 3個目→遠め右, 4個目→遠め左, ...
 
-    // レール向き・開始地点から、進行軸/折り返し軸の符号を決める
-    // vertical: 進行軸=Y, 折り返し軸=X / horizontal: 進行軸=X, 折り返し軸=Y
-    const isVertical = railDirection === "vertical";
-    const [vPart, hPart] = startCorner.split("-"); // "top"|"bottom", "left"|"right"
-    const travelSign = isVertical
-        ? (vPart === "top" ? 1 : -1)   // 上開始→進行軸+方向、下開始→-方向
-        : (hPart === "left" ? 1 : -1); // 左開始→進行軸+方向、右開始→-方向
-    const wrapSign = isVertical
-        ? (hPart === "left" ? 1 : -1)  // 左開始→折り返しは+方向に列を増やす、右開始→-方向
-        : (vPart === "top" ? 1 : -1);  // 上開始→折り返しは+方向に行を増やす、下開始→-方向
-
     // グリッドセルを蓄積するMap: key="x,y,z" value={type, pitch, direction, beatNum}
     const grid = new Map();
 
@@ -1925,13 +2817,24 @@ function buildMapGrid() {
         grid.set(`${x},${y},${z}`, data);
     };
 
+    // 「折り返しなし」では段同士は独立しており、コネクタ・境界ビートの再配置は存在しない
+    // （それらは「折り返しあり」時のbuildFixedRailTrack側の話。ここでは常に非ミラー・
+    // 段境界の再配置なしとして扱う）
+    const isMirroredBand = () => false;
+    // 音符マット配置時の衝突判定（isBlocked）。既に別のビートが同じセル（同じzのみ）を
+    // 使っていないかだけ見る（コネクタの概念が無いため接続部分の判定は不要）
+    const isBlockedForPanel = makeIsBlockedForPanel(grid);
+
     // 段と段の間の区切り用空きマスの座標（折り返し軸方向、isVerticalならX・そうでなければY）。
     // レールの1セット（±3=7マス幅）同士の間に、getTurnLength()で決まる間隔のうち
     // 実際に何も配置されない分（turnLength-6マス）だけ区切りとして扱う。
-    // レンダリング側（renderMap）でこの座標に該当するマスをグリッド線無しの背景色にする
+    // レンダリング側（renderMap）でこの座標に該当するマスをグリッド線無しの背景色にする。
+    // 「折り返しあり」の場合はこの間隔を実際のレール（コネクタ）で繋ぐため、区切り自体が
+    // 存在しなくなる（drawMapCellはisSeparatorのマスにはrail描画をしないため、区切りに
+    // すると繋がったはずのコネクタが見えなくなってしまう）
     const separatorCoords = new Set();
     const gapSize = turnLength - 6;
-    if (gapSize > 0 && wrapSensors > 0) {
+    if (!railWrapEnabled && gapSize > 0 && wrapSensors > 0) {
         const maxColIdx = Math.ceil(totalBeats / wrapSensors) - 1;
         for (let colIdx = 0; colIdx < maxColIdx; colIdx++) {
             const base = wrapSign * colIdx * (turnLength + 1);
@@ -1970,7 +2873,7 @@ function buildMapGrid() {
     if (wrapSensors > 0) {
         const maxColIdxInclusive = Math.ceil(totalBeats / wrapSensors) - 1;
         for (let colIdx = 0; colIdx <= maxColIdxInclusive; colIdx++) {
-            const bandWrapOffset = wrapSign * colIdx * (turnLength + 1);
+            const bandWrapOffset = wrapSign * colIdx * (effectiveTurnLength + 1);
             const travelEnd = travelSign * (wrapSensors - 1);
             [0, travelEnd].forEach(tp => {
                 [-3, 3].forEach(lateral => {
@@ -1988,9 +2891,14 @@ function buildMapGrid() {
             // 段の最初/最後のビートだけは、実在しない隣の段へ向かってはみ出さないよう
             // その方向のマスを描画しない（詳しくはレール配置ループ側のコメントを参照）。
             // そのため dead zone は actualBeatsInBand の位置（最後のビートより1マス先、
-            // 従来ならレールがはみ出していた位置）から始めてよい
+            // 従来ならレールがはみ出していた位置）から始めてよい。
+            // 「折り返しあり」で奇数段の場合、実際に描画される座標はミラーリングされた
+            // effRowIdxを使うため、dead zoneの座標もそれに合わせて計算する必要がある
+            // （raw rowIdxのまま計算すると、ミラーリングされた段では逆側を塞いでしまう）
+            const mirrored = isMirroredBand(colIdx);
             for (let rowIdx = actualBeatsInBand; rowIdx < wrapSensors; rowIdx++) {
-                const tp = travelSign * rowIdx;
+                const effRowIdx = mirrored ? (wrapSensors - 1 - rowIdx) : rowIdx;
+                const tp = travelSign * effRowIdx;
                 for (let lateral = -3; lateral <= 3; lateral++) {
                     const bx = isVertical ? bandWrapOffset + lateral : tp;
                     const by = isVertical ? tp : bandWrapOffset + lateral;
@@ -2016,13 +2924,18 @@ function buildMapGrid() {
             : (cyclePos === 1 || cyclePos === 3);
         const isFar = cyclePos === 2 || cyclePos === 3;
 
-        // 段ごとに独立・同じ側から始まる
+        // 段ごとに独立・同じ側から始まる（「折り返しなし」では常に非ミラー）
         const colIdx = Math.floor(beatIdx / wrapSensors);
         const rowIdx = beatIdx % wrapSensors;
+        const mirrored = isMirroredBand(colIdx);
+        const effRowIdx = mirrored ? (wrapSensors - 1 - rowIdx) : rowIdx;
+        const effTravelSign = mirrored ? -travelSign : travelSign;
 
-        const travelPos = travelSign * rowIdx; // レール1マスにつきビート1つ
+        const travelPos = travelSign * effRowIdx; // レール1マスにつきビート1つ
         const lateralPos = (isLeftSide ? -1 : 1) * (isFar ? 2 : 1); // レール中心線からの左右オフセット
-        const wrapOffset = wrapSign * colIdx * (turnLength + 1); // 段ごとの間隔（レール同士の実際の間隔＝見た目の空きマス数+1）
+
+        // 段境界の直前/直後のビート（段の最後のビート、次の段の最初のビート）は、曲の長さ・
+        const wrapOffset = wrapSign * colIdx * (effectiveTurnLength + 1); // 段ごとの間隔（レール同士の実際の間隔＝見た目の空きマス数+1）
 
         // レール自体の中心マス（d=0の位置。センサーはここからlateralPosぶんずれた位置）
         beatCenters[beatIdx] = {
@@ -2033,21 +2946,21 @@ function buildMapGrid() {
         const sX = isVertical ? wrapOffset + lateralPos : travelPos;
         const sY = isVertical ? travelPos : wrapOffset + lateralPos;
 
-        const forwardVec = isVertical ? { dx: 0, dy: travelSign } : { dx: travelSign, dy: 0 };
+        const forwardVec = isVertical ? { dx: 0, dy: effTravelSign } : { dx: effTravelSign, dy: 0 };
         const awayVec = isVertical ? { dx: lateralPos > 0 ? 1 : -1, dy: 0 } : { dx: 0, dy: lateralPos > 0 ? 1 : -1 };
 
-        // 段の最初/最後のビートかどうか（最後の段は総拍数の都合でwrapSensors未満で
-        // 終わることがあるため、totalBeatsの終端も「最後」として扱う）
-        const isFirstInRow = rowIdx === 0;
-        const isLastInRow = rowIdx === wrapSensors - 1 || beatIdx === totalBeats - 1;
+        // 段の最初/最後のビートかどうか。最後の段は総拍数の都合でwrapSensors未満で
+        // 終わることがあるため、totalBeatsの終端も「最後」として扱う
+        const isFirstInRow = effRowIdx === 0;
+        const isLastInRow = effRowIdx === wrapSensors - 1 || beatIdx === totalBeats - 1;
 
-        // dの並びは進行方向の符号に応じて時間順になるようにする
-        const dOrder = travelSign === 1 ? [-1, 0, 1] : [1, 0, -1];
+        // dの並びは実効進行方向の符号に応じて時間順になるようにする
+        const dOrder = effTravelSign === 1 ? [-1, 0, 1] : [1, 0, -1];
         dOrder.forEach((d, posInTriplet) => {
-            // 段の最初のビートは1マス手前（-travelSign方向）、最後のビートは1マス先
-            // （+travelSign方向）のレールマスを描画しない。段同士は実際には接続されておらず
-            // （折り返しは連続した1本のレールではなく、行の先頭に戻る形）、このはみ出しマスが
-            // 隣の段の方向へ向かって描かれると、あたかも段同士がつながっているように見えてしまう
+            // 段の最初のビート（effRowIdx=0）は1マス手前、最後のビート（effRowIdx=wrapSensors-1）は
+            // 1マス先のレールマスを描画しない（段同士は実際には接続されておらず、このはみ出し
+            // マスが隣の段の方向へ向かって描かれると、あたかも段同士がつながっているように
+            // 見えてしまうため）
             if (isFirstInRow && d === -travelSign) return;
             if (isLastInRow && d === travelSign) return;
 
@@ -2098,7 +3011,7 @@ function buildMapGrid() {
                 return pitchToSemitone(b) - pitchToSemitone(a);
             });
 
-            const panelPositions = calcPanelPositionsCore(sorted, forwardVec, awayVec);
+            const panelPositions = calcPanelPositionsCore(sorted, forwardVec, awayVec, sX, sY, isBlockedForPanel);
 
             panelPositions.forEach(({relX, relY, z, pitch}) => {
                 const px = sX + relX;
@@ -2481,7 +3394,8 @@ function renderMap() {
     const cellSize = Math.round(42 * scale * 0.5);
     mapRailCellSize = cellSize;
 
-    const { grid, extent, separatorCoords, isVertical, deadZoneCoords, beatCenters } = buildMapGrid();
+    const { grid, extent, separatorCoords, isVertical, deadZoneCoords, beatCenters, beatIndexToRailIndex } = buildMapGrid();
+    wrapBeatIndexToRailIndex = beatIndexToRailIndex || [];
 
     if (!extent) {
         mapArea.innerHTML = "<p style='color:var(--text-faint);padding:16px;'>音符がありません</p>";
@@ -2673,13 +3587,17 @@ function drawMapCell(ctx, borderPath, { px, py, cellSize, gx, gy, isSeparator, i
     // レールは3Dプレビューと合わせた「細い黒レール2本＋幅広いグレーの横木（穴あき）」の
     // 見た目にするため、単色の塗りつぶし背景は持たない（drawMapRailLine側で直接描く）
     if (!isSeparator && data && data.type === "sensor") {
-        // センサーは正方形ではなく、レールに直角な方向へ長い長方形にする
-        // （「センサーを縦長に、レールに直角に伸びる方が長くなるように」との依頼）。
-        // isVerticalはレールが画面縦方向に伸びる設定かどうか（drawMapCanvas参照）で、
-        // その場合はレールに直角な画面横方向を長くする（＝isVerticalでない時は画面縦方向が長くなる）
+        // センサーは正方形ではなく、レール（トロッコの通り道）に直角な方向へ長い長方形に
+        // する（＝長辺がレールの方を向く）。マップ全体のレール向き設定（isVertical）で
+        // 一律に決めるのではなく、buildMapGrid側でセンサーごとに計算済みのdata.direction
+        // （forwardVec/awayVec由来、そのセンサーの実際のレール向きを反映した値）を使う——
+        // 「センサーはレールのトロッコの方に向けないとダメ」との指摘、2026-09-29。
+        // data.directionが無い（古いデータ等）場合のみ、従来通りマップ全体のisVerticalに
+        // フォールバックする
+        const sensorIsVertical = data.direction ? data.direction === "vertical" : isVertical;
         const sensorCross = cellSize * SENSOR_CROSS_RATIO, sensorAlong = cellSize * SENSOR_ALONG_RATIO;
-        const sensorW = isVertical ? sensorCross : sensorAlong;
-        const sensorH = isVertical ? sensorAlong : sensorCross;
+        const sensorW = sensorIsVertical ? sensorCross : sensorAlong;
+        const sensorH = sensorIsVertical ? sensorAlong : sensorCross;
         // 「センサーを枠の中で、レールから少し遠ざける」との依頼に対応。data.awayVecは
         // レール中心から見てこのセンサーが外側へ向かう方向（buildMapGrid参照、音符マットの
         // 配置にも使っている値と同じ）なので、その方向へマス内で少しずらす
@@ -2713,7 +3631,11 @@ function drawMapCell(ctx, borderPath, { px, py, cellSize, gx, gy, isSeparator, i
     // --- 種別ごとの中身 ---
     if (!isSeparator && data) {
         if (data.type === "rail") {
-            drawMapRailLine(ctx, px, py, cellSize, data.direction);
+            if (data.corner) {
+                drawMapRailCorner(ctx, px, py, cellSize, data.corner.inDir, data.corner.outDir);
+            } else {
+                drawMapRailLine(ctx, px, py, cellSize, data.direction);
+            }
         } else if (data.type === "panel") {
             drawMapPanelImage(ctx, px, py, cellSize, data.pitch);
         }
@@ -2766,6 +3688,26 @@ function drawMapGradientRect(ctx, px, py, w, h, kind) {
     }
 }
 
+// レールが1マスの中で直角に曲がる「角」セル（buildFixedRailTrackのcorner参照）を、
+// 折れ線ではなく1マスぶんの円弧として描くための共通の幾何計算（2D canvas・3Dどちらの
+// レンダラーからも使う）。inDir/outDirは「このマスに入ってくる方向」「出ていく方向」の
+// 単位ベクトル{dx,dy}（マス単位、dxとdyは常にどちらか一方が0の軸並行ベクトル）。
+// 半径はマス1つぶん(0.5)——これにより、隣接する直線レールの中心線とタンジェント連続
+// （弧の両端で滑らかに繋がる）になる。戻り値は全てこのマスの中心を原点(0,0)とした
+// マス単位の相対座標・ラジアン角
+function computeRailCornerArc(inDir, outDir) {
+    const r = 0.5;
+    const ccx = r * (outDir.dx - inDir.dx);
+    const ccy = r * (outDir.dy - inDir.dy);
+    const startAngle = Math.atan2(-outDir.dy, -outDir.dx); // 入口点（直前の直線から辿り着く点）の方向
+    const endAngle = Math.atan2(inDir.dy, inDir.dx);       // 出口点（次の直線へ向かう点）の方向
+    let sweep = endAngle - startAngle;
+    while (sweep <= -Math.PI) sweep += Math.PI * 2;
+    while (sweep > Math.PI) sweep -= Math.PI * 2;
+    const anticlockwise = sweep < 0;
+    return { r, ccx, ccy, startAngle, endAngle, sweep, anticlockwise };
+}
+
 // レール本体の見た目。3Dプレビュー（assemblyRailSideMesh/assemblyRailRungMesh）と
 // 同じ「細い黒レール2本（マスの全長を貫通）＋幅広いグレーの横木（マス内に周期的に
 // 配置、間は穴＝何も描かない）」というデザインを2Dでも再現する。比率は3D側の
@@ -2809,6 +3751,46 @@ function drawMapRailLine(ctx, px, py, size, direction) {
         const w = isVert ? sideCross : size;
         const h = isVert ? size : sideCross;
         ctx.fillRect(cx - w / 2, cy - h / 2, w, h);
+    });
+    ctx.restore();
+}
+
+// カーブの角（1マスぶん）を、直角の折れ線ではなく滑らかな円弧として描く。
+// drawMapRailLineと同じ「黒いレール本体2本＋グレーの横木」の見た目を、直線の代わりに
+// computeRailCornerArc()で求めた円弧に沿って描く（横木は弧の途中2箇所に、半径方向の
+// 短い線として配置——直線版のRUNG_OFFSETS=[-0.25,0.25]に相当する、弧の1/3・2/3地点）
+function drawMapRailCorner(ctx, px, py, size, inDir, outDir) {
+    const SIDE_OFFSET = 0.3, SIDE_WIDTH = 0.15, RUNG_WIDTH = 0.92, RUNG_LENGTH = 0.22;
+    const cx0 = px + size / 2, cy0 = py + size / 2;
+    const { r, ccx, ccy, startAngle, endAngle, sweep, anticlockwise } = computeRailCornerArc(inDir, outDir);
+    const centerX = cx0 + ccx * size, centerY = cy0 + ccy * size;
+
+    ctx.save();
+    ctx.shadowColor = "rgba(0,0,0,0.3)";
+    ctx.shadowBlur = 1;
+    ctx.shadowOffsetY = 1;
+
+    // 横木（グレー、弧の1/3・2/3地点に半径方向の短い線として）
+    ctx.strokeStyle = "#999";
+    ctx.lineCap = "butt";
+    ctx.lineWidth = size * RUNG_LENGTH;
+    [1 / 3, 2 / 3].forEach(t => {
+        const angle = startAngle + sweep * t;
+        const rIn = (r - RUNG_WIDTH / 2) * size, rOut = (r + RUNG_WIDTH / 2) * size;
+        ctx.beginPath();
+        ctx.moveTo(centerX + rIn * Math.cos(angle), centerY + rIn * Math.sin(angle));
+        ctx.lineTo(centerX + rOut * Math.cos(angle), centerY + rOut * Math.sin(angle));
+        ctx.stroke();
+    });
+
+    // レール本体（黒）: 内側・外側2本の同心円弧
+    ctx.shadowColor = "transparent";
+    ctx.strokeStyle = "#585858";
+    ctx.lineWidth = size * SIDE_WIDTH;
+    [(r - SIDE_OFFSET) * size, (r + SIDE_OFFSET) * size].forEach(radius => {
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, radius, startAngle, endAngle, anticlockwise);
+        ctx.stroke();
     });
     ctx.restore();
 }
@@ -2874,9 +3856,19 @@ function ensureThreeLoaded(callback) {
 }
 
 let assemblyScene = null, assemblyCamera = null, assemblyRenderer = null, assemblyControls = null, assemblySun = null;
+// 雲の影専用の第2ライト（assemblyCloudSun）。レール/トロッコ/キャラクター/音符マット用の
+// assemblySunと影用シャドウマップを分けるための仕組み（ASSEMBLY_CLOUD_LAYER参照）
+let assemblyCloudSun = null;
 let assemblySceneReady = false;
 let assemblyAnimFrameId = null;
 let assemblySkyMesh = null, assemblyGroundMesh = null; // 空（グラデーション球）・陸（地面）。色をUIから変更できるよう参照を保持する
+// 「テーマ」（デバッグウィンドウのプルダウン、デフォルト/UNDERTALE）で空の見た目そのものを
+// 差し替えるため、通常時のグラデーションシェーダーと、UNDERTALEテーマ用のバトル画面風
+// （黒地に白い星）テクスチャ材質の両方を保持しておき、テーマに応じてassemblySkyMesh.material
+// を丸ごと差し替える（陸は色を変えるだけなので専用の材質は不要）
+let assemblyGradientSkyMaterial = null;
+// UNDERTALE/マフェット戦テーマの空材質はassemblyDecorationMaterialCache（"undertaleSky"/"muffetSky"キー）で
+// 遅延生成・キャッシュする（花・草・木の共有マテリアルキャッシュと同じ仕組みを流用）
 // 空・陸の色そのものは2D/3D共通のmapSettings.skyColor/groundColorで保持する（保存・共有のため）
 const ASSEMBLY_GROUND_Y = -1.5; // 地面の高さ（カメラがこれより下に潜ったら透明にする判定にも使う）
 const ASSEMBLY_GROUND_TRANSPARENT_OPACITY = 0.12; // 地中に潜った時の地面の不透明度
@@ -2887,20 +3879,41 @@ let assemblyCameraFramed = false; // 初回のみカメラを内容に合わせ�
 // rebuildAssemblyMeshes()で、フレーミング済みの値と現在の値を比較して判定する
 let assemblyFramedWrapValue = null;
 let assemblyFramedRailDirection = null;
-let assemblyRailSideMesh = null, assemblyRailRungMesh = null, assemblySensorMesh = null;
+// レールの見た目（本体+横木）は、セルごとの向き(data.direction)に応じて縦向き/横向きの
+// 2グループに分けてそれぞれ別のInstancedMeshで描く（「トロッコが進む方向に合わせてレールの
+// 向きも変える」ため。1つのInstancedMeshは全インスタンス共通のスケール/回転しか持てないため、
+// 向きごとに別メッシュにする必要がある。要素数は0〜2個（片方の向きしか無ければ1個、
+// レールが無ければ0個）
+let assemblyRailSideMeshes = [], assemblyRailRungMeshes = [];
+let assemblySensorMeshes = []; // レールと同じく向き(data.direction)ごとに分かれる、要素数0〜2個
+let assemblySensorDirectionMesh = null; // mapSettings.showSensorDirection時のみ、デバッグ用の光線（要素数0〜1個）
 let assemblyPanelMeshes = {};   // canonical pitch -> InstancedMesh
 let assemblyPanelEdgesGroup = null; // 音符マット1枚ごとの黒ぶち（THREE.LineSegmentsの集合）
-let assemblyLayerGrids = [];    // 3層それぞれの床グリッド（THREE.GridHelper）
+let assemblyLayerGrids = [];    // 床グリッド（キャンバステクスチャを貼った平面メッシュ。理由はrebuildAssemblyMeshes内のコメント参照）
 let assemblyGridVisible = true; // #assemblyGridToggleBtnで切り替える、rebuildAssemblyMeshes()を跨いで保持する
 // カメラワーク（#assemblyCameraPlayBtn＝再生/一時停止、.assembly-angle-btn＝アングル選択）。
-// assemblyCameraAngleModeは"rotateLeft"|"rotateRight"|"trolleyView"の排他選択、
+// 「5秒（後に3秒）おきに切り替える専用ボタン」は廃止し、代わりに4つのアングルボタン
+// （左回り/トロッコ視点/右回り/トロッコ前視点）自体をトグル（複数選択可）にした：
+// 0個選択＝カメラワーク一時停止と同一、1個選択＝そのアングルに固定、2個以上選択＝
+// 選択中のものだけを3秒おきに順番に切り替える（getEffectiveAssemblyCameraAngleMode参照）。
 // assemblyCameraPlayingがtrueの間だけstartAssemblyRenderLoop()のtick内で実際に
 // カメラを動かす。どちらもrebuildAssemblyMeshes()を跨いで保持する（assemblyGridVisibleと
 // 同じ位置付けの状態）
-let assemblyCameraAngleMode = "rotateRight";
+let assemblySelectedAngleModes = new Set(["rotateRight"]); // トグルON中のアングル集合
 let assemblyCameraPlaying = false;
 let assemblyPlayMarker = null;  // 再生中のトロッコ位置を示す球（initAssemblyScene()で1回だけ作成し使い回す）
 let assemblyBeatCenters = [];   // ビートごとのレール中心のワールド座標（updateAssemblyPlayMarker用、rebuildAssemblyMeshes()のたびに作り直す）
+// resolveTrolleyDisplayPosition用に、toWorld変換前のグリッド論理座標（{x,y}、1マス=1単位）も
+// 保持しておく。ASSEMBLY_CELL_SIZE=1でtoWorldは平行移動+スケール1の変換のため、距離や
+// 経路長の計算は変換前のグリッド座標のままで正しく行え、返ってきた位置だけtoWorld()すればよい
+let assemblyBeatCentersRaw = [];
+// トロッコ視点の直前の進行方向。段の折り返し・曲の終端など次のビート座標が使えない
+// 瞬間に、進行方向を再計算できず視点が一瞬跳ねるのを防ぐため、最後に有効だった
+// 向きを保持しておいて使い回す（updateAssemblyTrolleyViewCamera参照）。
+// トップレベルでTHREE.Vector3を即生成するとTHREE未定義エラーになる（index.htmlの
+// コメント参照）ため、nullで始めて初回のupdateAssemblyTrolleyViewCamera呼び出し時に
+// 遅延生成する
+let assemblyTrolleyLastForward = null;
 // 「トロッコが通過するとき、反応する音符マットをへこます」用。beatIndex -> [{pitch, index}]
 // （そのビートに鳴る音符マットが、assemblyPanelMeshes[pitch]という1つのInstancedMeshの
 // 何番目のインスタンスか）。位置の基準（凹ませる前の元の座標）はassemblyPanelPositionsByPitchに
@@ -2919,29 +3932,547 @@ const ASSEMBLY_ROTATE_SPEED = 0.7; // 自動回転の速さ（OrbitControls既�
 // 3つを個別に調整することで「見下ろし具合」と「引き具合」を別々にコントロールできる。
 // 「もう少しカメラを下げて、遠くが見える感じで」との指定でHEIGHTを下げ、LOOK_AHEADを
 // 伸ばして遠近感を強調した後、「気持ち見下し気味で、水平線は見えるように」との指定で
-// HEIGHTだけ少し戻した（見下ろし角を少し付けつつ、浅めに保って遠くの見通しは保つ）
-const ASSEMBLY_TROLLEY_VIEW_HEIGHT = 2.2; // トロッコ視点のカメラの高さ（トロッコ位置からの上乗せ）
-const ASSEMBLY_TROLLEY_VIEW_BACK_OFFSET = 4; // トロッコ視点のカメラを進行方向と逆へ下げる量
-const ASSEMBLY_TROLLEY_VIEW_LOOK_AHEAD = 4; // 注視点をトロッコの少し先に置く距離
+// HEIGHTだけ少し戻した（見下ろし角を少し付けつつ、浅めに保って遠くの見通しは保つ）。
+// その後「もう少し引き気味に」との指定でBACK_OFFSET/HEIGHTを約1.7倍に拡大（見下ろし角は
+// ほぼ据え置き、単純にカメラとトロッコの距離だけを伸ばす）。さらにその後
+// 「近接グループのカメラはもう少し引きでいい」との指定でBACK_OFFSET/HEIGHT/
+// FRONT_VIEW_OFFSETを約1.35倍に再拡大した
+const ASSEMBLY_TROLLEY_VIEW_HEIGHT = 4.3; // トロッコ視点のカメラの高さ（トロッコ位置からの上乗せ）
+const ASSEMBLY_TROLLEY_VIEW_BACK_OFFSET = 9.5; // トロッコ視点のカメラを進行方向と逆へ下げる量
+const ASSEMBLY_TROLLEY_VIEW_LOOK_AHEAD = 5; // 注視点をトロッコの少し先に置く距離
+// トロッコ前視点: 進行方向の前方にこの距離だけ離れた位置にカメラを置き、トロッコ自身を
+// 振り返って見る（トロッコ視点＝後方追従の対になる構図）。高さはトロッコ視点と共通
+const ASSEMBLY_TROLLEY_FRONT_VIEW_OFFSET = 9.5;
+// 遠隔グループの開始距離レンジ（ASSEMBLY_ROTATE_START_DISTANCE_MIN/MAX、下記）は
+// 「近接グループの距離感を基準にした絶対距離」として設計した経緯があるが、値自体は
+// その依頼当時の近接グループの距離（7）を基準に一度チューニング済みのため、近接グループの
+// FRONT_VIEW_OFFSETを直接参照すると、近接側だけを調整したいときに遠隔側の距離まで
+// 連動して変わってしまう。それを避けるため、当時の基準値をこの定数として切り離して固定した
+const ASSEMBLY_ROTATE_START_DISTANCE_REFERENCE = 7;
+// トロッコ左前視点/右前視点: 前視点と同じ距離感（カメラ〜トロッコ間の距離は前視点と揃える）
+// のまま、進行方向の真正面ではなく斜め45度の位置から見る構図。前方向成分・横方向成分とも
+// OFFSET*cos(45°)/sin(45°)にすることで、前視点と同じ半径の円周上の別の点になるようにしている
+const ASSEMBLY_TROLLEY_FRONT_DIAGONAL_FORWARD = ASSEMBLY_TROLLEY_FRONT_VIEW_OFFSET * Math.SQRT1_2;
+const ASSEMBLY_TROLLEY_FRONT_DIAGONAL_SIDE = ASSEMBLY_TROLLEY_FRONT_VIEW_OFFSET * Math.SQRT1_2;
+// 「カメラワークを改善したい」との依頼で、カメラワークを2グループに整理した。
+// 近接グループ＝トロッコ視点/前視点/左前視点/右前視点（chaseモード、トロッコにぴったり
+// 追従する構図）。一時追加していたトロッコ横視点・俯瞰視点は「消してよい」との指示で
+// 削除済みだが、その後「左前・右前からのアングルを追加してほしい」との依頼で
+// trolleyFrontLeftView・trolleyFrontRightViewを新設した
+// 「カメラモード名を重複して手打ちしている4つの配列があり、新モード追加時の更新漏れの
+// リスクがある」との2026-09コードレビュー指摘を受け、モードごとの定義を1つの配列
+// （ASSEMBLY_CAMERA_MODE_DEFS）に集約し、以前は個別に手打ちしていたASSEMBLY_CHASE_MODES/
+// ASSEMBLY_ANGLE_MODE_ORDER/ASSEMBLY_REMOTE_CAMERA_MODES/ASSEMBLY_REMOTE_CHASE_SUBMODESの
+// 4つはすべてそこから導出する形に整理した（各配列の中身・並び順は変更前と完全に同一）。
+// 新しいアングルを追加する際は、ここに1エントリ追記するだけでよい。
+// - group: "near"（近接、チェイス視点）/"remote"（遠隔、周回視点）
+// - chaseFollow: trueのものだけが「遠隔グループに入った瞬間のランダム開始位置スナップ＋
+//   毎フレームの追従補正」の対象（rotateLeft/rotateRightのみ。rotateLeftFixed/
+//   rotateRightFixedは「カメラ位置はほぼ動かさない」という復活させたい旧挙動のため対象外）
+const ASSEMBLY_CAMERA_MODE_DEFS = [
+    { name: "rotateLeft", group: "remote", chaseFollow: true },
+    { name: "trolleyView", group: "near" },
+    { name: "rotateRight", group: "remote", chaseFollow: true },
+    { name: "trolleyFrontView", group: "near" },
+    { name: "trolleyFrontLeftView", group: "near" },
+    { name: "trolleyFrontRightView", group: "near" },
+    { name: "rotateLeftFixed", group: "remote" },
+    { name: "rotateRightFixed", group: "remote" },
+];
+const ASSEMBLY_CHASE_MODES = ASSEMBLY_CAMERA_MODE_DEFS.filter(d => d.group === "near").map(d => d.name); // 近接グループ（tick()・applyAssemblyCameraAngleAndPlayState()共通の判定に使う）
+// 「トロッコ視点」「トロッコ前視点」は元々OrbitControlsを無効化しカメラを直接固定していたが、
+// 「マウスによる視点変更も許容してほしい」との依頼で、当初は「毎フレームcontrols.targetだけを
+// トロッコへ追従させ、カメラの位置はOrbitControls.update()任せ」という左回り/右回りと同じ
+// 方式に変更した。ところが実測したところ、targetだけを動かしてupdate()を呼んでも
+// カメラがまったく追従しない（トロッコが遠く離れてもカメラが完全に静止したまま）という
+// 不具合が発覚した——OrbitControls.update()は毎回「現在のcamera.position - 現在のtarget」
+// からoffsetを再計算し、そのoffsetをそのまま新しいtargetに足し戻してcamera.positionを
+// 再構成する実装のため、（autoRotate等の角度デルタが無い限り）targetをいくら動かしても
+// 結果的にcamera.positionは変化しない、という数学的な無変化（恒等変換）になっていたのが原因
+// （左回り/右回りで「追従できている」ように見えていたのはautoRotateの角度デルタが
+// 毎フレーム加わっていたおかげで、target追従そのものの効果ではなかった）。
+// 「背面カメラと前面カメラは追従してください」との指摘を受け、一旦「ユーザーがマウスで
+// ドラッグ中でない限り、毎フレームsnapAssemblyChaseCameraToTrolley()でカメラ位置を丸ごと
+// 再計算する」方式にしたが、これだとドラッグをやめた次のフレームで基準構図へ戻ってしまい、
+// 「視点を動かした後、戻すのではなく維持してほしい（遠隔と同じように）」との指摘を受けた。
+// 最終的に、遠隔グループ（左回り/右回り）と同じ「モードに入った瞬間だけ基準構図へ一度
+// スナップし、以降は同じモードが続く限りトロッコの移動ぶんをカメラへ平行移動として
+// 足し込むだけ」という方式に変更した（tick内の分岐、assemblyLastChaseCameraMode/
+// assemblyChaseLastTrolleyPos参照）。ドラッグによる相対オフセットはこの平行移動を挟んでも
+// 保たれるため、ドラッグ中かどうかで分岐する必要が無くなった
+// アングルボタンの固定順序（複数選択時、この順で巡回する）。「5秒おきに切り替える
+// 専用ボタン」は廃止し、代わりにアングルボタン自体をトグルにして、選択中のものだけを
+// この順番で3秒おきに巡回するようにした（0個選択＝一時停止と同一、1個選択＝それに固定）。
+// 「近接グループに、左前・右前からのアングルを追加してほしい」との依頼で
+// trolleyFrontLeftView・trolleyFrontRightViewを末尾に追加した（既存4つの並び順は不変）。
+// その後「昔の（カメラ位置がほぼ動かない）左回り/右回りを別アングルとして復活させたい」
+// との依頼でrotateLeftFixed・rotateRightFixedを追加した
+const ASSEMBLY_ANGLE_MODE_ORDER = ASSEMBLY_CAMERA_MODE_DEFS.map(d => d.name);
+const ASSEMBLY_CYCLE_INTERVAL_MS = 3000;
+let assemblyCycleAngleIndex = 0; // ASSEMBLY_ANGLE_MODE_ORDER内の現在位置（2個以上選択時のみ使う）
+let assemblyCycleTimerId = null;
+
+// 遠隔グループ（左回り/右回り）。「カメラワークを改善したい」との依頼で、この2つに
+// 新しい挙動を追加した——従来は「元々あったカメラの位置のまま」左回り/右回りを開始して
+// いたが、遠隔グループに（何か別のモードや一時停止状態から）入った瞬間だけ、トロッコを
+// 中心にランダムな方位の位置へ一度スナップするようにした。角度そのものの回転は従来通り
+// OrbitControls.autoRotateに任せる（tick()内、snapAssemblyCameraToRandomRemoteStart参照）。
+// 「トロッコに接近する仕様は廃止」との依頼により、開始後に毎フレーム距離を詰めていく
+// 処理（approachAssemblyRemoteCameraTowardTrolley）は削除済み——開始距離は
+// 「可能な限り近くまで寄ること」との指定通り、常にminDistance（これ以上近寄れない下限）
+// に固定し、そのまま距離を変えずに回り続ける（このランダム開始+追従補正の挙動は
+// 下のASSEMBLY_REMOTE_CHASE_SUBMODESだけが対象）。
+// 「最初のころの（カメラ位置がほぼ動かず、注視点だけがトロッコを追う）左回り/右回りも
+// 良かったので別アングルとして復活させてほしい」との依頼で、rotateLeftFixed/
+// rotateRightFixedを遠隔グループに追加した。こちらは`ASSEMBLY_REMOTE_CHASE_SUBMODES`に
+// 含めないことで、ランダム開始スナップ・追従補正のどちらも適用されない（tick()参照）
+// ＝targetだけがトロッコを追い、カメラ自身の位置は当時と同じくOrbitControls.update()の
+// 恒等変換的な挙動に任せたまま（結果、遠くのトロッコを見るとゆっくり画角が変わって見える）
+const ASSEMBLY_REMOTE_CAMERA_MODES = ASSEMBLY_CAMERA_MODE_DEFS.filter(d => d.group === "remote").map(d => d.name);
+const ASSEMBLY_REMOTE_CHASE_SUBMODES = ASSEMBLY_CAMERA_MODE_DEFS.filter(d => d.chaseFollow).map(d => d.name); // ランダム開始+追従補正の対象（Fixed版は対象外）
+// 開始距離：「可能な限り近く(minDistance固定)」→「30%〜55%(minDistance〜maxDistanceの比率)」
+// といくつか試したが、「まだ遠い」との指摘が続いた。原因は、比率の基準にしていた
+// minDistance/maxDistance自体が曲・マップ設定の規模（footprint）に応じて大きく伸び縮みする値
+// だったこと——大きめのトラックだとmaxDistanceが600超になることもあり、その30%でも
+// 絶対距離としては200前後という「近接グループ（トロッコ視点等、距離7程度）」とは
+// 桁違いに離れた位置になってしまっていた。トラック全体を見渡すための距離レンジを
+// 基準にする設計自体が間違っていたため、近接グループの距離感（ASSEMBLY_TROLLEY_FRONT_VIEW_OFFSET
+// =7）を基準にした絶対距離（その2.5〜5倍）に変更した。これによりトラックの規模に
+// 関わらず「近接グループより一回り引いた、それでいて近接寄りの距離感」で安定する
+// （実際にOrbitControls上で選べる範囲かどうかだけ、安全のためminDistance/maxDistanceで
+// クランプする）
+const ASSEMBLY_ROTATE_START_DISTANCE_MIN = ASSEMBLY_ROTATE_START_DISTANCE_REFERENCE * 2.5;
+const ASSEMBLY_ROTATE_START_DISTANCE_MAX = ASSEMBLY_ROTATE_START_DISTANCE_REFERENCE * 5;
+// 開始位置の仰角は、既定の俯瞰視点（frameAssemblyCamera参照、水平から見て約31°）に揃える。
+// 方位角・距離だけをランダムにすることで、真上/真下などの不自然な角度にならないようにした
+const ASSEMBLY_ROTATE_START_ELEVATION_DEG = 31;
+// 直前フレームで実際に効いていた遠隔グループのモード（"rotateLeft"/"rotateRight"/null）。
+// これが変わった瞬間（他モード/一時停止から入った時・左回り⇄右回りが切り替わった時の
+// どちらも）に再スナップする（tick()参照。「左回り⇄右回りの切替でも毎回中央基準の
+// 近づいた地点へ再スナップしてほしい」との依頼で、単純な「入った/入っていない」の
+// 真偽値ではなくモード自体を追跡するよう変更した）
+let assemblyLastRemoteCameraMode = null;
+let assemblyRemoteCameraLastTargetPos = null; // 前フレームのトロッコ位置（target移動ぶんをカメラにも平行移動させ、半径のドリフトを防ぐため）
+
+// 「レースゲームでよくある、数秒おきにランダムにカメラが切り替わるかっこいいモード」
+// （#assemblyRandomCameraBtn）。既存の4アングルトグル（assemblySelectedAngleModes）とは
+// 独立したON/OFFモードとして実装しているが、「ランダム時に使う種類は、トグルで
+// 切りかえられるように戻す」との依頼により、ランダムモード中もassemblySelectedAngleModes
+// 自体は一切書き換えず、あくまで「ランダムモードが選んでよい種類（トグルONのもの）」
+// という意味のまま保つ。実際に今表示しているモードは別変数
+// （assemblyRandomCameraCurrentMode）で持ち、getEffectiveAssemblyCameraAngleModeが
+// ランダムモード中はそちらを返す。こうすることで、ランダムモードを動かしたまま
+// 手動トグルボタンでも自由に候補の増減ができ、かつ「ランダムモードを抜けたら選択集合が
+// 汚れていて解除できない」といった不具合も構造上起きなくなる。
+// 「必ず、近接→遠隔の順に切り替わるようにしてほしい」との依頼で、近接グループ
+// （ASSEMBLY_CHASE_MODES）・遠隔グループ（ASSEMBLY_REMOTE_CAMERA_MODES）を厳密に交互に
+// 選ぶ（pickNextAssemblyRandomCameraMode参照）。間隔も固定3秒ではなく毎回ランダム
+// （2〜4.5秒）にすることで、既存の巡回モードとは違う「予測できない切り替わり方」を
+// 出している。直前と同じアングルが連続で選ばれると変化が無く単調に見えるため、
+// 選択肢からは直前のアングルを除外する
+const ASSEMBLY_RANDOM_CAMERA_MIN_INTERVAL_MS = 2000;
+const ASSEMBLY_RANDOM_CAMERA_MAX_INTERVAL_MS = 4500;
+let assemblyRandomCameraMode = false;
+let assemblyRandomCameraTimerId = null;
+let assemblyRandomCameraCurrentMode = null; // ランダムモードが今選んでいるモード（近接/遠隔どちらも0個ならnull）
+let assemblyRandomCameraNextGroup = "near"; // 次に選ぶべきグループ（"near"/"remote"を交互に）
+// 直前フレームで実際に効いていた近接グループのモード（"trolleyView"等/null）。遠隔グループの
+// assemblyLastRemoteCameraModeと同じ考え方で、これが変わった瞬間（他モード/一時停止から
+// 入った時・トロッコ視点⇄前視点等の切替時）だけ基準構図へ再スナップする。「近接アングルで
+// ユーザーが視点を動かした後、ドラッグをやめても元の構図に戻さず維持してほしい（遠隔と
+// 同じように）」との依頼のため、同じモードが続いている間は一切スナップし直さない
+let assemblyLastChaseCameraMode = null;
+// 前フレームのトロッコ位置（遠隔グループのassemblyRemoteCameraLastTargetPosと同じ考え方で、
+// target移動ぶんをカメラにも平行移動させ、ユーザーがドラッグで作った相対オフセットを
+// 保ったまま追従させるため）
+let assemblyChaseLastTrolleyPos = null;
+// スナップ時点の「トロッコ位置→target」のオフセット（トロッコ視点の注視点は
+// 進行方向へのlook-ahead分ずれているため、target自体もトロッコ位置とは別に持つ必要がある）。
+// 「途中でカクっとなる」というデグレの原因究明: 以前はこのオフセットを毎フレーム
+// computeAssemblyTrolleyForward()から再計算していたが、レールが折り返る区間で進行方向が
+// 急反転すると、target（＝カメラの注視点）だけが1フレームで大きく飛び、OrbitControlsの
+// minDistance/maxDistanceクランプが働いてカメラ位置ごと引っ張られる「カクッ」というスナップが
+// 起きていた。トロッコの移動そのものは連続的（急に飛ばない）なので、target側もforwardを
+// 毎回引き直すのではなく、スナップ時に一度だけ確定させたオフセットをトロッコ位置に
+// 足すだけにすることで、カメラ⇄target間の距離を常に一定に保ち、クランプが発動する余地を
+// 無くした
+let assemblyChaseTargetOffset = null;
+// トロッコマーカー（buildAssemblyTrolleyMesh）の車輪接地面をレール上面付近に合わせる
+// オフセット。レールはy=0中心・高さ0.2（RAIL_HEIGHT、rebuildAssemblyMeshes参照）なので
+// 上面は約0.1。実測しながら調整すること
+const ASSEMBLY_TROLLEY_MARKER_Y_OFFSET = 0.1;
+// トロッコ本体（マーカー）の直前の進行方向。assemblyTrolleyLastForwardと同じ理由で、
+// 折り返し・移動が無い瞬間の不自然な回転を防ぐために使う（updateAssemblyPlayMarker参照）
+let assemblyMarkerLastForward = null;
+// トロッコ本体の向き(rotation.y)を滑らかに回転させるための、前回このフレームを
+// 処理した実時刻（updateAssemblyPlayMarker参照）
+let assemblyMarkerLastRotationTime = null;
 
 const MAP_PANEL_MATERIALS = {}; // canonical pitch -> [6面ぶんのMeshStandardMaterial]（BoxGeometry用）
 let assemblyRailMaterial = null, assemblyRailRungMaterial = null, assemblySensorMaterial = null, assemblyPanelSideMaterial = null, assemblyUnitBoxGeometry = null;
+let assemblySensorDirectionMaterial = null; // センサー向きデバッグ光線（mapSettings.showSensorDirection）用
 let assemblyPanelEdgesGeometry = null, assemblyPanelEdgesMaterial = null; // 音符マットの黒ぶち用（共有、位置/回転/スケールだけ個別に設定する）
 
 // 空の色（#assemblySkyColorInput）を変更する。水平線側（bottomColor）は指定色を白へ
-// 75%寄せた明るい色を自動で作り、グラデーション自体は常に保つ
+// 75%寄せた明るい色を自動で作り、グラデーション自体は常に保つ。
+// デフォルト以外のテーマ適用中は空が専用材質（uniformsを持たない）に差し替わっているため、
+// 何もしない（設定自体はmapSettings.skyColorに保存され、デフォルトテーマに戻した時に反映される）
 function applyAssemblySkyColor(hex) {
-    if (!assemblySkyMesh) return;
+    if (!assemblySkyMesh || debugTheme !== "default") return;
     const top = new THREE.Color(hex);
     const bottom = top.clone().lerp(new THREE.Color(0xffffff), 0.75);
     assemblySkyMesh.material.uniforms.topColor.value.copy(top);
     assemblySkyMesh.material.uniforms.bottomColor.value.copy(bottom);
 }
 
-// 陸の色（#assemblyGroundColorInput）を変更する
+// 陸の色（#assemblyGroundColorInput）を変更する。デフォルト以外のテーマ適用中は陸が
+// 専用の固定色になっているため、同様に何もしない（理由はapplyAssemblySkyColor参照）。
+// 「地面がベタ塗りではなく模様（色ムラ＋小さな花模様）になっている実機の写真を再現できるか」
+// との依頼を受け、地面の色が既定の緑（MAP_GROUND_COLOR_DEFAULT）の時だけ
+// buildAssemblyGroundGrassTexture()で生成した模様テクスチャを使う。「地面色はUIで自由に
+// 選べる仕様だが、模様の種類はどう決めるか」を確認したところ「とりあえずデフォルトの緑のみ
+// 適用」との指定だったため、それ以外の任意色では従来通りベタ塗りのまま（テクスチャなし）にする
 function applyAssemblyGroundColor(hex) {
-    if (!assemblyGroundMesh) return;
-    assemblyGroundMesh.material.color.set(hex);
+    if (!assemblyGroundMesh || debugTheme !== "default") return;
+    if (hex === MAP_GROUND_COLOR_DEFAULT) {
+        if (!assemblyGroundGrassTexture) assemblyGroundGrassTexture = buildAssemblyGroundGrassTexture(hex);
+        assemblyGroundMesh.material.map = assemblyGroundGrassTexture;
+        assemblyGroundMesh.material.color.set(0xffffff); // テクスチャに色を焼き込んでいるので乗算しない
+    } else {
+        assemblyGroundMesh.material.map = null;
+        assemblyGroundMesh.material.color.set(hex);
+    }
+    assemblyGroundMesh.material.needsUpdate = true; // map有無の切替はシェーダー再コンパイルが必要
+}
+
+// 地面（草原）の模様テクスチャを一度だけ生成し使い回す。ユーザー提供の参考写真
+// （茶色い地面=色ムラ＋暗い小さな穴、緑の地面=色ムラ＋花のような小さな色点）のうち、
+// 「とりあえずデフォルトの緑のみ適用」という指定に沿って、緑の草原パターン（色ムラ＋
+// 花模様の点）だけを再現する。900×900の地面全体にASSEMBLY_GROUND_TEXTURE_WORLD_SIZE
+// （ワールド単位、レール1マス=1）ごとに1タイルが来るようリピートさせる
+let assemblyGroundGrassTexture = null;
+// 「見た目が規則的」との指摘対応: タイル1枚あたりの配置数が少ないまま小さいタイルで
+// リピートすると、同じ配置（花5個・パッチ7個の並び）が視界内に何度も同時に見えてしまい、
+// 規則的なスタンプのように見えてしまう。タイル自体のワールド上のサイズを広げ（6→12）、
+// 個数・解像度も同じ倍率（面積比で4倍）で増やすことで、1個1個の見た目の大きさ・密度
+// （見た目の印象としての薄さ）は変えずに、同じ並びが繰り返し視界に入る頻度だけを減らした
+const ASSEMBLY_GROUND_TEXTURE_SIZE = 2048;
+const ASSEMBLY_GROUND_TEXTURE_WORLD_SIZE = 12;
+const ASSEMBLY_GROUND_PLANE_SIZE = 900; // groundGeometryのPlaneGeometry(900, 900)と合わせる
+
+function buildAssemblyGroundGrassTexture(baseHex) {
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = ASSEMBLY_GROUND_TEXTURE_SIZE;
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width, H = canvas.height;
+    const base = new THREE.Color(baseHex);
+    const baseRgb = { r: Math.round(base.r * 255), g: Math.round(base.g * 255), b: Math.round(base.b * 255) };
+
+    ctx.fillStyle = `rgb(${baseRgb.r}, ${baseRgb.g}, ${baseRgb.b})`;
+    ctx.fillRect(0, 0, W, H);
+
+    // タイルの継ぎ目が見えないよう、円/花が端をまたぐ場合に備えて周囲8近傍にも同じものを描く
+    // （リピートで隣り合うタイル同士が、まるで最初から1枚だったかのように繋がって見える）
+    const drawWrapped = (cx, cy, margin, draw) => {
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                const x = cx + dx * W, y = cy + dy * H;
+                if (x + margin < 0 || x - margin > W || y + margin < 0 || y - margin > H) continue;
+                draw(x, y);
+            }
+        }
+    };
+
+    // 色ムラ（雲状の濃淡パッチ）。参考写真同様、単調なベタ塗りに見えないようにする。
+    // タイルのワールドサイズが2倍（6→12）になった分、同じ絶対的な大きさ・密度に見えるよう
+    // 個数を面積比の4倍・半径の割合を半分にしている（上のASSEMBLY_GROUND_TEXTURE_WORLD_SIZE参照）
+    const blotchCount = 20;
+    for (let i = 0; i < blotchCount; i++) {
+        const cx = Math.random() * W, cy = Math.random() * H;
+        const radius = W * (0.025 + Math.random() * 0.045);
+        const darker = Math.random() < 0.6;
+        const amount = (0.08 + Math.random() * 0.1) * (darker ? -1 : 1);
+        const target = amount >= 0 ? 255 : 0;
+        const r = Math.round(baseRgb.r + (target - baseRgb.r) * Math.abs(amount));
+        const g = Math.round(baseRgb.g + (target - baseRgb.g) * Math.abs(amount));
+        const b = Math.round(baseRgb.b + (target - baseRgb.b) * Math.abs(amount));
+        drawWrapped(cx, cy, radius, (x, y) => {
+            const grad = ctx.createRadialGradient(x, y, 0, x, y, radius);
+            grad.addColorStop(0, `rgba(${r}, ${g}, ${b}, 0.5)`);
+            grad.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.arc(x, y, radius, 0, Math.PI * 2);
+            ctx.fill();
+        });
+    }
+
+    // 小さな花模様。中心の円＋周囲6枚の花びら（円の集合）で表現する簡易的な花形
+    const flowerColors = ["#e9cf4a", "#f3efe0", "#5cc2b3", "#d7e696", "#eeb0c9"];
+    const drawFlower = (x, y, r, color) => {
+        ctx.fillStyle = color;
+        const petals = 6;
+        for (let p = 0; p < petals; p++) {
+            const angle = (p / petals) * Math.PI * 2;
+            const px = x + Math.cos(angle) * r * 0.62;
+            const py = y + Math.sin(angle) * r * 0.62;
+            ctx.beginPath();
+            ctx.arc(px, py, r * 0.42, 0, Math.PI * 2);
+            ctx.fill();
+        }
+        ctx.beginPath();
+        ctx.arc(x, y, r * 0.42, 0, Math.PI * 2);
+        ctx.fill();
+    };
+    const flowerCount = 28;
+    for (let i = 0; i < flowerCount; i++) {
+        const cx = Math.random() * W, cy = Math.random() * H;
+        // 「少し小さくして」で0.006〜0.011→0.004〜0.0075、その後「少し大きくしてください」で
+        // 0.005〜0.009に調整
+        const radius = W * (0.005 + Math.random() * 0.004);
+        const color = flowerColors[Math.floor(Math.random() * flowerColors.length)];
+        drawWrapped(cx, cy, radius * 2, (x, y) => drawFlower(x, y, radius, color));
+    }
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+    const repeatCount = ASSEMBLY_GROUND_PLANE_SIZE / ASSEMBLY_GROUND_TEXTURE_WORLD_SIZE;
+    texture.repeat.set(repeatCount, repeatCount);
+    if (assemblyRenderer) texture.anisotropy = assemblyRenderer.capabilities.getMaxAnisotropy();
+    return texture;
+}
+
+// UNDERTALEテーマ用、バトル画面風（黒地に白い星）のテクスチャを一度だけ生成して使い回す
+function buildUndertaleSkyMaterial() {
+    if (assemblyDecorationMaterialCache.has("undertaleSky")) return assemblyDecorationMaterialCache.get("undertaleSky");
+    // 巨大な球（半径450）に貼るため、解像度が低いと1つ1つの星がぼやけた大きな
+    // 四角い光の塊に見えてしまう（実際に低解像度で試して確認）。解像度を上げ、
+    // かつNearestFilterでにじませない（Undertale本編のドット絵らしい、輪郭のくっきりした
+    // 星にする）ことで、ぼやけを解消する
+    const canvas = document.createElement("canvas");
+    canvas.width = 2048;
+    canvas.height = 1024;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    // 大きさ・明るさをランダムに散らした白い点（1〜2px四方の四角、くっきりさせるため円ではなく
+    // 四角にする）で、素朴な星空らしいムラを出す
+    for (let i = 0; i < 900; i++) {
+        const x = Math.floor(Math.random() * canvas.width);
+        const y = Math.floor(Math.random() * canvas.height);
+        const size = Math.random() < 0.85 ? 1 : 2; // ほとんどは1px、たまに2pxの明るい星
+        ctx.fillStyle = `rgba(255,255,255,${(Math.random() * 0.5 + 0.5).toFixed(2)})`;
+        ctx.fillRect(x, y, size, size);
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.magFilter = THREE.NearestFilter;
+    texture.minFilter = THREE.NearestFilter;
+    const material = new THREE.MeshBasicMaterial({ map: texture, side: THREE.BackSide, fog: false });
+    assemblyDecorationMaterialCache.set("undertaleSky", material);
+    return material;
+}
+
+// マフェット戦テーマ用、お店の紫〜マゼンタのグラデーションに蜘蛛の巣模様を重ねたテクスチャを
+// 一度だけ生成して使い回す（UNDERTALEテーマのbuildUndertaleSkyMaterialと同じ考え方）
+function buildMuffetSkyMaterial() {
+    if (assemblyDecorationMaterialCache.has("muffetSky")) return assemblyDecorationMaterialCache.get("muffetSky");
+    const canvas = document.createElement("canvas");
+    canvas.width = 2048;
+    canvas.height = 1024;
+    const ctx = canvas.getContext("2d");
+    const bgGradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    bgGradient.addColorStop(0, "#1a0620");
+    bgGradient.addColorStop(1, "#5c1a4a");
+    ctx.fillStyle = bgGradient;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // 蜘蛛の巣模様: 中心から放射状の糸＋同心円状に糸をつなぐ輪。
+    // 「蜘蛛の巣だと気付きにくいのは、でかいのが1つしかないから」との指摘を受け、
+    // 巨大な巣を1つ（半径がキャンバス全体＝球全体に及ぶ）だけ配置する方式をやめた。
+    // 1つしか無いと、どの向きを見てもその巣の一部（交差する数本の線）しか視界に入らず、
+    // 「蜘蛛の巣の形」として認識しづらい。代わりに、通常の視野角に収まる程度の
+    // 小さめの巣を複数バラまき、どちらを向いても巣の全体像が視界に入りやすくする。
+    // このcanvasは球（THREE.SphereGeometry）に巻きつく横長の1枚絵のため、中心が
+    // キャンバスの左右端付近にある巣は、反対側の脚がキャンバスの外＝反対の端に
+    // 続かなければならない（球ではつながっているため）。単純に1回描くだけだと
+    // 端で切れて「右半分しか無い巣」になってしまっていたので、横方向に
+    // ±canvas.widthずらしたコピーも一緒に描き、端をまたぐ巣も継ぎ目なく繋がるようにした
+    function drawWebAt(cx, cy, radius, spokeCount, rings) {
+        const spokes = [];
+        for (let i = 0; i < spokeCount; i++) {
+            const angle = (i / spokeCount) * Math.PI * 2;
+            const dx = Math.cos(angle), dy = Math.sin(angle);
+            spokes.push({ dx, dy });
+            ctx.beginPath();
+            ctx.moveTo(cx, cy);
+            ctx.lineTo(cx + dx * radius, cy + dy * radius);
+            ctx.stroke();
+        }
+        for (let r = 1; r <= rings; r++) {
+            const ringRadius = (r / rings) * radius;
+            ctx.beginPath();
+            spokes.forEach((s, i) => {
+                const x = cx + s.dx * ringRadius, y = cy + s.dy * ringRadius;
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            });
+            ctx.closePath();
+            ctx.stroke();
+        }
+    }
+    function drawWeb(cx, cy, radius, spokeCount, rings) {
+        [-canvas.width, 0, canvas.width].forEach(offset => drawWebAt(cx + offset, cy, radius, spokeCount, rings));
+    }
+
+    // 蜘蛛（1本の糸で上から垂れているシルエット）。本体は楕円形の腹＋丸い頭、
+    // 脚は4対（片側4本）を斜めに生やすだけの簡略化した見た目にする
+    function drawHangingSpider(x, topY, threadLength) {
+        ctx.strokeStyle = "rgba(255, 235, 250, 0.7)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(x, topY);
+        ctx.lineTo(x, topY + threadLength);
+        ctx.stroke();
+
+        const bodyY = topY + threadLength;
+        const r = 11;
+        ctx.fillStyle = "rgba(15, 5, 15, 0.95)";
+        ctx.beginPath();
+        ctx.ellipse(x, bodyY + r * 1.4, r, r * 1.4, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(x, bodyY, r * 0.6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "rgba(15, 5, 15, 0.95)";
+        ctx.lineWidth = 2;
+        for (let i = 0; i < 4; i++) {
+            const legY = bodyY + r * 0.6 + i * r * 0.5;
+            const spread = r * (1.4 + i * 0.35);
+            [-1, 1].forEach(side => {
+                ctx.beginPath();
+                ctx.moveTo(x, legY);
+                ctx.lineTo(x + side * spread, legY - r * 0.3);
+                ctx.stroke();
+            });
+        }
+    }
+
+    // マフェット本人（他の小さな蜘蛛より一回り大きい、糸で垂れたシルエット）。
+    // 頭＋ツインお団子＋裾の広がったドレス＋蜘蛛脚3対＋ピンクのリボン、という
+    // 簡略化した見た目で「ただの蜘蛛ではない特別な1匹」と分かるようにする
+    function drawMuffet(x, topY, threadLength) {
+        ctx.strokeStyle = "rgba(255, 235, 250, 0.7)";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x, topY);
+        ctx.lineTo(x, topY + threadLength);
+        ctx.stroke();
+
+        const bodyY = topY + threadLength;
+        const r = 11 * 2.6; // 通常の蜘蛛(r=11)より一回り大きくして特別感を出す
+
+        ctx.fillStyle = "rgba(10, 4, 12, 0.97)";
+        ctx.beginPath();
+        ctx.arc(x, bodyY, r * 0.55, 0, Math.PI * 2);
+        ctx.fill();
+        // ツインお団子（左右の小さな丸）
+        [-1, 1].forEach(side => {
+            ctx.beginPath();
+            ctx.arc(x + side * r * 0.55, bodyY - r * 0.15, r * 0.22, 0, Math.PI * 2);
+            ctx.fill();
+        });
+
+        // ドレス（裾が広がる三角形のシルエット）
+        const dressTopY = bodyY + r * 0.4;
+        const dressBottomY = bodyY + r * 1.9;
+        ctx.beginPath();
+        ctx.moveTo(x, dressTopY);
+        ctx.lineTo(x - r * 1.1, dressBottomY);
+        ctx.lineTo(x + r * 1.1, dressBottomY);
+        ctx.closePath();
+        ctx.fill();
+
+        // 蜘蛛脚（ドレスの左右から伸びる細い脚を3対）
+        ctx.strokeStyle = "rgba(10, 4, 12, 0.97)";
+        ctx.lineWidth = 2.2;
+        for (let i = 0; i < 3; i++) {
+            const legY = dressTopY + r * 0.5 + i * r * 0.45;
+            const spread = r * (1.4 + i * 0.35);
+            [-1, 1].forEach(side => {
+                ctx.beginPath();
+                ctx.moveTo(x + side * r * 0.9, legY);
+                ctx.lineTo(x + side * spread, legY - r * 0.25);
+                ctx.stroke();
+            });
+        }
+
+        // 差し色のリボン（頭の上の小さなピンク）
+        ctx.fillStyle = "rgba(255, 140, 200, 0.9)";
+        ctx.beginPath();
+        ctx.ellipse(x, bodyY - r * 0.55, r * 0.18, r * 0.1, 0, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // 「蜘蛛の巣の大きさは大中小様々」との指摘で、細めの線（4px→2px）にした上で、
+    // 小・中・大の3段階からランダムに選ぶようにし、個数も増やして空白が目立ちにくくした
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "rgba(255, 235, 250, 0.85)";
+    const webCount = 12;
+    const sizeTiers = [
+        { min: 0.035, max: 0.06 },  // 小
+        { min: 0.07, max: 0.11 },   // 中
+        { min: 0.13, max: 0.2 },    // 大
+    ];
+    for (let i = 0; i < webCount; i++) {
+        const cx = Math.random() * canvas.width;
+        const cy = Math.random() * canvas.height * 0.75; // 地面に近い下端すれすれには置かない
+        const tier = sizeTiers[Math.floor(Math.random() * sizeTiers.length)];
+        const radius = canvas.width * (tier.min + Math.random() * (tier.max - tier.min));
+        drawWeb(cx, cy, radius, 9 + Math.floor(Math.random() * 5), 4);
+    }
+
+    // 上から1本の糸で垂れている蜘蛛を2匹ほど配置
+    for (let i = 0; i < 2; i++) {
+        const x = canvas.width * (0.2 + Math.random() * 0.6);
+        // 球の極（canvas y=0＝真上）に近すぎると、等長方形図法の歪みで糸が波打って見える
+        // （実際に真上を見上げて確認）ため、極からは少し離す
+        const topY = canvas.height * (0.15 + Math.random() * 0.15);
+        const threadLength = canvas.height * (0.12 + Math.random() * 0.18);
+        drawHangingSpider(x, topY, threadLength);
+    }
+
+    // マフェット本人を1匹。「マフェットも追加できるか」との依頼に対応。見つけやすいよう、
+    // 通常のカメラが最初に向きがちな中央寄りの位置に固定気味に配置する
+    drawMuffet(canvas.width * (0.45 + Math.random() * 0.1), canvas.height * 0.2, canvas.height * 0.22);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    const material = new THREE.MeshBasicMaterial({ map: texture, side: THREE.BackSide, fog: false });
+    assemblyDecorationMaterialCache.set("muffetSky", material);
+    return material;
+}
+
+// 「テーマ」（デバッグウィンドウのプルダウン）に応じて空・陸の見た目を切り替える。
+// デフォルト: 通常のグラデーション空＋mapSettings.groundColor/skyColorの陸/空
+// UNDERTALE: バトル画面風（黒地に白い星）の空＋ほぼ黒の陸
+// マフェット戦: 紫〜マゼンタの空に蜘蛛の巣模様＋深い紫の陸
+// 3Dシーンが未初期化（assemblySkyMesh/assemblyGroundMeshがまだ無い）間は何もしない
+// （initAssemblyScene側で生成直後に改めて呼ばれる）
+function applyAssemblyThemeVisuals() {
+    if (!assemblySkyMesh || !assemblyGroundMesh) return;
+    if (debugTheme === "undertale") {
+        assemblySkyMesh.material = buildUndertaleSkyMaterial();
+        assemblyGroundMesh.material.color.set("#050505");
+    } else if (debugTheme === "muffet") {
+        assemblySkyMesh.material = buildMuffetSkyMaterial();
+        assemblyGroundMesh.material.color.set("#2a0a24");
+    } else {
+        assemblySkyMesh.material = assemblyGradientSkyMaterial;
+        applyAssemblySkyColor(mapSettings.skyColor);
+        applyAssemblyGroundColor(mapSettings.groundColor);
+    }
+    // マフェット戦テーマ限定のバトルUI風オーバーレイ（ハート＋たたかう等）は、このテーマの時だけ出す
+    const battleUI = document.getElementById("muffetBattleUI");
+    if (battleUI) battleUI.style.display = debugTheme === "muffet" ? "flex" : "none";
+    if (assemblyRenderer && assemblyCamera) assemblyRenderer.render(assemblyScene, assemblyCamera);
 }
 
 // 色ピッカーの"input"連打（ドラッグ中の連続発火）を、指を止めた瞬間だけにまとめるための
@@ -3014,7 +4545,7 @@ function initAssemblyScene() {
     // 球の位置をカメラの現在位置に合わせる（startAssemblyRenderLoop参照）ことで、
     // カメラが常に球の中心＝内側に居続けるようにした
     const skyGeometry = new THREE.SphereGeometry(450, 32, 15);
-    const skyMaterial = new THREE.ShaderMaterial({
+    const skyMaterial = assemblyGradientSkyMaterial = new THREE.ShaderMaterial({
         uniforms: {
             topColor: { value: new THREE.Color(mapSettings.skyColor) },
             bottomColor: { value: new THREE.Color(mapSettings.skyColor).lerp(new THREE.Color(0xffffff), 0.75) },
@@ -3052,16 +4583,25 @@ function initAssemblyScene() {
     // 面自体が消えて黒い穴に見えることがないようにする。transparent:trueにしておき、
     // カメラが地面より下に潜り込んだ時だけstartAssemblyRenderLoop()側でopacityを
     // 下げて透明にする（「地中に埋まったら地面を透明にして上を見上げられるように」）
-    const groundGeometry = new THREE.PlaneGeometry(900, 900);
-    const groundMaterial = new THREE.MeshStandardMaterial({ color: mapSettings.groundColor, roughness: 1, side: THREE.DoubleSide, transparent: true, opacity: 1 });
+    const groundGeometry = new THREE.PlaneGeometry(ASSEMBLY_GROUND_PLANE_SIZE, ASSEMBLY_GROUND_PLANE_SIZE);
+    // alphaTestは池の「穴」を切り抜くためのalphaMap用（updateAssemblyGroundHoles参照）。
+    // 穴が無い間はalphaMap未設定＝常にalpha=1なので影響しない
+    const groundMaterial = new THREE.MeshStandardMaterial({ color: mapSettings.groundColor, roughness: 1, side: THREE.DoubleSide, transparent: true, opacity: 1, alphaTest: 0.5 });
     assemblyGroundMesh = new THREE.Mesh(groundGeometry, groundMaterial);
     assemblyGroundMesh.rotation.x = -Math.PI / 2;
     assemblyGroundMesh.position.y = ASSEMBLY_GROUND_Y;
     assemblyGroundMesh.receiveShadow = true;
     assemblyScene.add(assemblyGroundMesh);
 
+    // 3Dシーンの初回構築時点で既にUNDERTALEテーマが選ばれていた場合に備え、
+    // 空・陸をここで一度テーマに応じた見た目へ揃えておく
+    applyAssemblyThemeVisuals();
+
     assemblyCamera = new THREE.PerspectiveCamera(50, 1, 0.1, 500);
     assemblyCamera.position.set(12, 12, 12); // 内容に応じてframeAssemblyCamera()が上書きする
+    // 雲のメッシュはASSEMBLY_CLOUD_LAYERにだけ乗せ、assemblySunの影から除外する（下記）ため、
+    // メインカメラ側では通常のlayer0に加えてこのlayerも見えるようにしておく必要がある
+    assemblyCamera.layers.enable(ASSEMBLY_CLOUD_LAYER);
 
     const hemi = new THREE.HemisphereLight(0xffffff, 0x8a8f98, 0.9);
     assemblyScene.add(hemi);
@@ -3070,39 +4610,105 @@ function initAssemblyScene() {
     // rebuildAssemblyMeshes()のたびにupdateAssemblySunPosition()で設定し直す。ここでは
     // シーン初期化時点でまだnorthDirection等が読めるので、初期値としても一度呼んでおく
     assemblySun.castShadow = true;
-    assemblySun.shadow.mapSize.set(2048, 2048);
+    // 「雲の影がぼんやりしている」との指摘への対応でshadow.cameraの可視範囲に雲の表示範囲
+    // （assemblyCloudRange、ASSEMBLY_GROUND_BLOCK_MARGIN=300ぶんまで広がる）を含めたところ、
+    // 今度は「レール/トロッコ/キャラクター/音符マットの影が薄れた」との指摘が新たに出た。
+    // 解像度4096でも715ユニット幅（実測）を覆うとテクセル1個あたり約0.175ユニットになり、
+    // 1マス(ASSEMBLY_CELL_SIZE=1)より細かいレールの横木やキャラクターの脚等はまともな
+    // 解像度で影が出ない。雲は元々ぼんやりした大きな影で精度が要らない一方、レール等は
+    // シャープさが要るため、両者を同じシャドウマップに収めようとする設計自体が無理があった。
+    // → 雲専用の第2ライト（assemblyCloudSun）を用意し、THREE.Layersで影の描画対象を
+    // 分離する: assemblySun（このライト）の影はlayer0（既定＝雲以外の全て）だけを見るように
+    // 明示し、狭い実内容ぶんの範囲に絞ってテクセル密度を確保する（frustumはrebuildAssembly
+    // Meshes側で内容の実際の広さだけから計算し直す）。雲の影はassemblyCloudSun側で別途、
+    // 広いが粗い解像度のまま担当させる（雲の影はぼやけていても元々目立たない）
+    assemblySun.shadow.camera.layers.set(0);
+    assemblySun.shadow.mapSize.set(4096, 4096);
     // shadow.cameraの見える範囲（デフォルトは左右上下±5の狭い正方形）は、内容の実際の
     // 広がりに応じてrebuildAssemblyMeshes()側で毎回サイズを合わせ直す（この初期値のままだと、
     // 曲が長い/マス数が多いと大半の音符マット・レールが範囲外になり影が出ない、または
     // 範囲の境界付近で影が不自然に切れる原因になる）
     assemblyScene.add(assemblySun);
     assemblyScene.add(assemblySun.target);
+
+    assemblyCloudSun = new THREE.DirectionalLight(0xffffff, 1.4);
+    assemblyCloudSun.castShadow = true;
+    // 雲の影は広範囲・低精度で構わないため、mapSizeはassemblySunより低くしてよい
+    // （テクセル密度が粗くても、元々ぼんやり大きい雲の影では目立たない）
+    assemblyCloudSun.shadow.mapSize.set(2048, 2048);
+    assemblyCloudSun.shadow.camera.layers.set(ASSEMBLY_CLOUD_LAYER); // 雲だけをこのライトの影に描く
+    assemblyScene.add(assemblyCloudSun);
+    assemblyScene.add(assemblyCloudSun.target);
     updateAssemblySunPosition();
 
+    // 【2026-09のコードレビューで検討し、あえて手を付けないことにした設計上の課題】
+    // スクリプト制御（チェイス視点/遠隔視点の自動回転等）もOrbitControls任せにしている
+    // ため、target追従の補正（followAssemblyCameraTarget付近）・minDistance/maxDistance
+    // クランプ・damping一時無効化トリック（frameAssemblyCameraToFit付近）など、OrbitControls
+    // の内部挙動に起因する「カクっ」系の不具合を5回以上個別に回避してきた経緯がある。
+    // 「OrbitControls任せをやめてcamera.position/lookAtを直接制御する」方向への刷新も
+    // 検討したが、現状は上記の回避策が効いて安定動作しており、作り直しは過去に直した
+    // バグ群の再発リスクが最も高い変更になるため、今回は見送った（ユーザーと相談の上での判断）。
+    // 触る場合は、チェイス視点/遠隔視点それぞれの「開始時スナップ」「毎フレーム追従」
+    // 「モード切替時」「ドラッグ→解放」「minDistance復帰」の全パターンをPlaywrightで
+    // 前後比較してから進めること
     assemblyControls = new OrbitControls(assemblyCamera, assemblyRenderer.domElement);
     assemblyControls.enableDamping = true;
     assemblyControls.dampingFactor = 0.08;
     assemblyControls.zoomToCursor = true; // マウス（タッチ）位置を中心にズームする
+    assemblyControls.zoomSpeed = 2.0; // 「マウスロールでもうちょっと拡大したい」との依頼で既定値1.0から引き上げ
     // 「右クリックのドラッグで回転、左クリックのドラッグで移動にしてほしい（今の逆）」との
     // 依頼で、既定のOrbitControls配置（左=回転/右=平行移動）から入れ替えた。OrbitControls
     // 標準の挙動として、割り当てた操作がどちらのボタンでもShift/Ctrl/Metaを押しながらだと
     // 回転⇔平行移動が反転する（こちらで手動切り替えする必要はない）
     assemblyControls.enablePan = true;
+    assemblyControls.panSpeed = 2.2; // 「ドラッグの移動速度を上げてほしい」との依頼で既定値1.0から引き上げ
     assemblyControls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
     assemblyControls.minDistance = 3;
     assemblyControls.maxDistance = 200; // frameAssemblyCamera()で曲ごとに調整
     assemblyControls.autoRotateSpeed = ASSEMBLY_ROTATE_SPEED; // 既定値2.0より遅く、「ゆっくり」回転させる（左回り/右回りボタン）
     canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
+    // 「3Dエリアをクリックすると再生、もう一度クリックすると一時停止」との依頼。
+    // OrbitControlsのドラッグ操作（回転/平行移動/ズーム）と区別するため、単純な"click"
+    // イベントは使わず、pointerdown→pointerupの移動距離が小さい場合だけ「クリック」とみなす
+    // （ブラウザのclickイベントは、同じ要素上で発生した多少のドラッグ後でも発火してしまう
+    // ため、ドラッグでカメラを回すたびに誤って再生/一時停止が切り替わってしまう）
+    let assemblyClickStartPos = null;
+    canvas.addEventListener("pointerdown", (e) => {
+        assemblyClickStartPos = { x: e.clientX, y: e.clientY };
+    });
+    canvas.addEventListener("pointerup", (e) => {
+        if (!assemblyClickStartPos) return;
+        const dx = e.clientX - assemblyClickStartPos.x, dy = e.clientY - assemblyClickStartPos.y;
+        assemblyClickStartPos = null;
+        if (Math.hypot(dx, dy) > 5) return; // ドラッグ操作とみなし、再生トグルはしない
+        if (playState === "stopped") {
+            playScore();
+        } else if (playState === "playing") {
+            pauseScore();
+        } else if (playState === "paused") {
+            resumeScore();
+        }
+    });
+
     // 使い回す共有ジオメトリ・マテリアル（2Dマップの色使いに合わせる: レール=ダークグレー、
-    // センサー=黒、音符マット側面=白系。音符マットの上面だけピッチごとの写真テクスチャを貼る）
+    // センサー=黒。音符マットの上面だけピッチごとの写真テクスチャを貼り、側面は
+    // 「つやありの黒に」との指定でroughnessを低く・metalnessを持たせた黒に変更済み）
     assemblyUnitBoxGeometry = new THREE.BoxGeometry(1, 1, 1);
     assemblyRailMaterial = new THREE.MeshStandardMaterial({ color: 0x585858, roughness: 0.65, metalness: 0.35 });
     // レール中央の横木（左右のレール本体の間に一定間隔で架かる、梯子の"段"に相当）用。
     // 2Dマップの中央帯（drawMapRailLine、#999）と同系色（rebuildAssemblyMeshes参照）
     assemblyRailRungMaterial = new THREE.MeshStandardMaterial({ color: 0x999999, roughness: 0.6, metalness: 0.25 });
     assemblySensorMaterial = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.5, metalness: 0.1 });
-    assemblyPanelSideMaterial = new THREE.MeshStandardMaterial({ color: 0xefefef, roughness: 0.8 });
+    // センサーの反応方向をデバッグ表示する薄い赤の光線。実在の物体ではなく見た目の目印
+    // なので、光の当たり方に左右されない自己発光（MeshBasicMaterial）にし、半透明で
+    // 「うっすら」感を出す。影は落とさない/受けない
+    assemblySensorDirectionMaterial = new THREE.MeshBasicMaterial({ color: 0xff2222, transparent: true, opacity: 0.35, depthWrite: false });
+    // 「音符マットの側面はつやありの黒に」との依頼（従来は0xefefefのマット白系）。
+    // roughnessを低めにして光沢感を、metalnessも少し持たせてハイライトが締まって
+    // 見えるようにした（全面鏡面にすると不自然なため、金属100%は避けた）
+    assemblyPanelSideMaterial = new THREE.MeshStandardMaterial({ color: 0x0a0a0a, roughness: 0.15, metalness: 0.4 });
     // 音符マットの黒ぶち。単位立方体（assemblyUnitBoxGeometry）の辺だけを取り出したジオメトリを
     // 1つ共有し、各マットの実際のサイズ・位置・回転はLineSegments2側のscale/position/quaternionで
     // 個別に与える（InstancedMeshは三角形描画専用でLineSegmentsには使えないため、マット枚数ぶん
@@ -3124,12 +4730,15 @@ function initAssemblyScene() {
     assemblyPanelEdgesMaterial.alphaToCoverage = true;
     assemblyPanelEdgesMaterial.resolution.set(canvas.clientWidth || 1, canvas.clientHeight || 1);
 
-    // 再生中のトロッコ位置マーカー（2Dマップのdraw MapPlayLineの黄色いマーカーと同系色）。
-    // rebuildAssemblyMeshes()では破棄されず使い回すので、ここで1回だけ作る
-    const markerMaterial = new THREE.MeshStandardMaterial({ color: 0xffd100, emissive: 0xffd100, emissiveIntensity: 0.5, roughness: 0.4 });
-    assemblyPlayMarker = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.3, 0.6), markerMaterial);
+    // 再生中のトロッコ位置マーカー。トロッコ本体（プリミティブ組み立て）をぶら下げる
+    // 空のGroupを先に作る（rebuildAssemblyMeshes()では破棄されず使い回すので、ここで
+    // 1回だけ作る。updateAssemblyPlayMarker参照）
+    assemblyPlayMarker = new THREE.Group();
     assemblyPlayMarker.visible = false;
     assemblyScene.add(assemblyPlayMarker);
+
+    loadAssemblyTrolleyBodyModel();
+    initAssemblyClouds();
 
     assemblySceneReady = true;
 }
@@ -3157,9 +4766,18 @@ const ASSEMBLY_SOUTH_VECTOR_BY_NORTH_DIRECTION = [
 function updateAssemblySunPosition() {
     if (!assemblySun) return;
     const south = ASSEMBLY_SOUTH_VECTOR_BY_NORTH_DIRECTION[northDirection] || ASSEMBLY_SOUTH_VECTOR_BY_NORTH_DIRECTION[0];
-    const HORIZONTAL_DISTANCE = 13; // 斜め具合の目安（元のposition(10,18,8)の水平距離≈12.8と近い値）
-    const HEIGHT = 18;
+    // 雲を「空に配置」した結果、雲の高さ(y=65〜85)が元の太陽の高さ(18)を超えてしまい、
+    // 太陽から見て逆側（影用のshadow.cameraの視錐台の外）になって雲の影が落ちなくなって
+    // いた。太陽の高さを雲より確実に高い位置まで引き上げる必要があるが、単純に高さだけ
+    // 変えると光の入射角（陰影の向き・長さ）が変わってしまうため、水平距離も同じ比率で
+    // 拡大し、角度（atan(HEIGHT/HORIZONTAL_DISTANCE)）は元の値（18/13）のまま保つ
+    const HEIGHT = 110;
+    const HORIZONTAL_DISTANCE = 13 * (HEIGHT / 18); // 元の角度を保つための比例拡大
     assemblySun.position.set(south.x * HORIZONTAL_DISTANCE, HEIGHT, south.z * HORIZONTAL_DISTANCE);
+    // 雲専用ライトも同じ向き・高さから当てる（陰影の向きを本物の太陽と一致させる）
+    if (assemblyCloudSun) {
+        assemblyCloudSun.position.copy(assemblySun.position);
+    }
 }
 
 // ピッチごとのテクスチャ+マテリアル（BoxGeometryの6面ぶん）を遅延生成する。
@@ -3196,6 +4814,1726 @@ function getAssemblyPanelMaterials(pitch) {
     return MAP_PANEL_MATERIALS[canon];
 }
 
+// トロッコ本体（荷台+車輪+取っ手）。当初ユーザー用意のmodels/trolley.glb（28MB）をGLTFLoaderで
+// 読み込んでいたが、「trolley.glbを使わずに同じような見た目に」との依頼でプリミティブ組み立てへ
+// 置き換えた（丸みのあるカプセル形状）。さらに「キャラクターは不要」「丸みではなく角ばっている
+// 元のものに近いのがいい」「もう少し大きいサイズで」「色は茶色ベースで」との依頼で、トロッコに
+// 乗せるキャラクター（models/char.glb）を廃止し、本体もBoxGeometryを使った角ばった木箱ふうの
+// 荷台+車輪4つ+取っ手という構成に作り直した（配色は焦げ茶の荷台+黒に近い濃い焦げ茶の車輪/取っ手）。
+// GLTFLoaderは使わない同期関数（2Dアイコン生成用のbuildAssemblyTrolleyIcon2DSnapshot()と、
+// 3D本体表示の両方からこのプリミティブ形状を使う）
+function buildProceduralTrolleyMesh() {
+    const group = new THREE.Group();
+
+    // 荷台（角ばった木箱ふうのBox、焦げ茶）。「トロッコの幅を少し広げてほしい」との
+    // 依頼でX（左右幅）を0.62→0.72に拡張した（Z＝進行方向の長さは1マスにちょうど収まる
+    // よう既に調整済みのため変更していない。getAssemblyTrolleyFootprintScale()は
+    // X/Zの大きい方＝Z基準のままなので、この変更で長さ側の見た目は変わらない）
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x6b4423, roughness: 0.75, metalness: 0.05 });
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.72, 0.42, 0.78), bodyMat);
+    body.position.y = 0.34;
+    body.castShadow = true;
+    body.receiveShadow = true;
+    group.add(body);
+
+    // 上部の縁（濃い焦げ茶、本体よりひとまわり大きい薄い板を上面に重ねてツートンに見せる）
+    const rimMat = new THREE.MeshStandardMaterial({ color: 0x3e2a17, roughness: 0.8, metalness: 0.05 });
+    const rim = new THREE.Mesh(new THREE.BoxGeometry(0.78, 0.08, 0.84), rimMat);
+    rim.position.y = 0.59;
+    rim.castShadow = true;
+    group.add(rim);
+
+    // 車輪×4（濃い焦げ茶、角ばった荷台に合わせて角柱寄りの低ポリ円柱）。本体の拡幅に
+    // 合わせてX位置も±0.29→±0.34へ広げ、荷台の縁の内側に収まる位置関係を保つ
+    const wheelMat = new THREE.MeshStandardMaterial({ color: 0x2b1c10, roughness: 0.7, metalness: 0.1 });
+    const wheelGeo = new THREE.CylinderGeometry(0.15, 0.15, 0.07, 12);
+    [[-0.34, 0.28], [0.34, 0.28], [-0.34, -0.28], [0.34, -0.28]].forEach(([x, z]) => {
+        const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+        wheel.rotation.z = Math.PI / 2; // 円柱の軸を左右(X)方向へ倒す
+        wheel.position.set(x, 0.15, z);
+        wheel.castShadow = true;
+        group.add(wheel);
+    });
+
+    // 取っ手（進行方向(+Z)側、垂直な角材の支柱+その上端で支柱と直角に交わる横棒でL字に見せる。
+    // 横棒は乗っている人から見て左右(X軸)方向に伸びる向き）
+    const handleMat = new THREE.MeshStandardMaterial({ color: 0x3e2a17, roughness: 0.75, metalness: 0.05 });
+    const post = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.44, 0.06), handleMat);
+    post.position.set(0, 0.68, 0.42);
+    post.castShadow = true;
+    group.add(post);
+    // 横棒の幅も本体の拡幅に合わせて0.26→0.30に広げていたが、「持ち手をもう少し横に
+    // 長く」との指示で0.42へ、さらに「もうちょっと長くていい」との指示で0.54へ広げた
+    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.54, 0.06, 0.06), handleMat);
+    grip.position.set(0, 0.9, 0.42);
+    grip.castShadow = true;
+    group.add(grip);
+
+    return group;
+}
+
+// ============================================================
+// 陸の装飾（木・草・花）。「実際のぽこあには木や草、花もある」との依頼で追加した、
+// トロッコ・レール・音符マットの無い空きマスに散りばめる背景オブジェクト群。
+// トロッコと同じ方針で、外部モデルではなくTHREE.jsの基本ジオメトリだけで組み立てる
+// （ユーザー提供の実機参考写真は、白〜ピンクの丸い花弁×5〜9本＋根本の緑の葉、という
+// トイ的にデフォルメされた見た目だったため、それを簡易ジオメトリで再現している）。
+// 生成・配置はgenerateAssemblyDecorations()（rebuildAssemblyMeshes参照）が担当する
+// ============================================================
+
+// 花: 白〜ピンクのグラデーションで色を散らす（参考写真で1株の中に白〜濃いピンクが
+// 混在していたことを再現）
+const ASSEMBLY_FLOWER_PETAL_COLORS = [0xffffff, 0xffe1ec, 0xffc2dc, 0xff9dc4];
+
+// 木・草・花はどれも固定の小さな色パレットしか使わないのに、パーツ（葉・花弁・実…）
+// ごとに毎回new THREE.MeshStandardMaterial(...)していたため、実際には同じ色・同じ
+// 見た目のマテリアルが個数分（500個の装飾×数十パーツ＝数千〜1万個超）重複生成されて
+// いた。「重い」との指摘を受け、色が同じなら常に同じマテリアルインスタンスを再利用する
+// キャッシュを導入（見た目は一切変えず、マテリアルの重複だけを無くす）
+const assemblyDecorationMaterialCache = new Map();
+function getSharedDecorationMaterial(key, factory) {
+    if (!assemblyDecorationMaterialCache.has(key)) assemblyDecorationMaterialCache.set(key, factory());
+    return assemblyDecorationMaterialCache.get(key);
+}
+
+// 1個の装飾（花・草・木）グループ内にある個別メッシュ（花なら葉+茎+花弁+中心で
+// 100個超に及ぶ）を、同じマテリアルを使うものどうしで1つのBufferGeometryに合体させ、
+// 1つのMeshにまとめる。「装飾が重い」との指摘の本質的な原因（500個×数十〜百個超の
+// 個別メッシュ＝合計2万7千個超の描画呼び出し）に対応するための最適化で、各パーツの
+// 位置・回転・見た目は一切変えず、描画回数だけを削減する（マテリアルはキャッシュ共有
+// されているため、装飾1個あたり「使っているマテリアルの種類数」（花なら7種程度、
+// 草なら3種、木なら3〜4種）まで描画回数が減る
+function mergeAssemblyDecorationParts(group) {
+    group.updateMatrixWorld(true); // グループ自体はこの時点では無変形（identity）のはずだが、
+    // 入れ子のflowerHeadグループ等の位置・回転をワールド行列として確定させるために必要
+    const buckets = new Map();
+    const toRemove = [];
+    group.traverse(o => {
+        if (!o.isMesh) return;
+        // このジオメトリは各パーツにつき`new THREE.XxxGeometry(...)`で毎回新規生成された
+        // ものであり、他のメッシュと共有されていない（=このMesh専用）ため、clone()せず
+        // 直接変形して構わない（clone()は内部のFloat32Array丸ごとコピーが発生し、
+        // 装飾500個規模だと無視できないコストになっていた）
+        o.geometry.applyMatrix4(o.matrixWorld);
+        let bucket = buckets.get(o.material);
+        if (!bucket) { bucket = { geometries: [], castShadow: false }; buckets.set(o.material, bucket); }
+        bucket.geometries.push(o.geometry);
+        if (o.castShadow) bucket.castShadow = true;
+        toRemove.push(o);
+    });
+    // traverse中に木構造を変更するのは安全ではないため、走査完了後にまとめて取り除く
+    // （ジオメトリは上のbucketにまだ入っているのでここでは破棄しない）
+    for (const o of toRemove) {
+        if (o.parent) o.parent.remove(o);
+    }
+    for (const [material, bucket] of buckets) {
+        const merged = BufferGeometryUtils.mergeGeometries(bucket.geometries, false);
+        bucket.geometries.forEach(g => g.dispose());
+        const mesh = new THREE.Mesh(merged, material);
+        mesh.castShadow = bucket.castShadow;
+        group.add(mesh);
+    }
+}
+
+function buildProceduralFlowerClusterMesh() {
+    const group = new THREE.Group();
+
+    // 根本の葉（円錐を平たく潰して葉っぱのシルエットにし、放射状に並べる。
+    // 花より目立たないよう小さめ・低めに抑える）
+    const leafMat = getSharedDecorationMaterial("flowerLeaf", () => new THREE.MeshStandardMaterial({ color: 0x2f7a3a, roughness: 0.8 }));
+    const leafCount = 4;
+    for (let i = 0; i < leafCount; i++) {
+        const leaf = new THREE.Mesh(new THREE.ConeGeometry(0.03, 0.09, 3), leafMat);
+        leaf.scale.z = 0.35; // 潰して平たい葉の形にする
+        const angle = (i / leafCount) * Math.PI * 2;
+        leaf.position.set(Math.cos(angle) * 0.035, 0.045, Math.sin(angle) * 0.035);
+        leaf.rotation.y = angle;
+        leaf.rotation.x = Math.PI / 2 - 0.4; // 少し上向きに寝かせる
+        leaf.castShadow = true;
+        group.add(leaf);
+    }
+
+    // 花（茎+花弁+黄色い中心）を9〜13本、株の中心から放射状に生やす。
+    // 「花はもっと正方形より」との指示のため、円形の放射状配置そのままだと株の輪郭が
+    // 真円になってしまう点を補正する：角度に応じて中心からの伸び幅を対角方向
+    // （45度・135度…）ほど伸ばす「スーパー楕円（squircle）」的な係数を掛け、
+    // 輪郭を真円から角のある正方形寄りの丸みへ寄せる
+    const stemMat = getSharedDecorationMaterial("flowerStem", () => new THREE.MeshStandardMaterial({ color: 0x3f8a4a, roughness: 0.8 }));
+    const centerMat = getSharedDecorationMaterial("flowerCenter", () => new THREE.MeshStandardMaterial({ color: 0xffe066, roughness: 0.6 }));
+    const flowerCount = 11 + Math.floor(Math.random() * 6);
+    const FLOWER_SQUARE_LEAN_N = 4;
+    const squareLeanFactor = (angle) => {
+        const c = Math.abs(Math.cos(angle)), s = Math.abs(Math.sin(angle));
+        return 1 / Math.pow(Math.pow(c, FLOWER_SQUARE_LEAN_N) + Math.pow(s, FLOWER_SQUARE_LEAN_N), 1 / FLOWER_SQUARE_LEAN_N);
+    };
+    for (let i = 0; i < flowerCount; i++) {
+        const angle = (i / flowerCount) * Math.PI * 2 + Math.random() * 0.5;
+        const lean_factor = squareLeanFactor(angle);
+        const stemHeight = 0.14 + Math.random() * 0.08;
+        const stemBaseR = Math.random() * 0.03 * lean_factor;
+        const stemX = Math.cos(angle) * stemBaseR;
+        const stemZ = Math.sin(angle) * stemBaseR;
+        const lean = 0.15; // 外側へ少し傾ける角度
+
+        const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.006, stemHeight, 4), stemMat);
+        stem.position.set(stemX, stemHeight / 2, stemZ);
+        stem.rotation.z = Math.cos(angle) * lean;
+        stem.rotation.x = -Math.sin(angle) * lean;
+        group.add(stem);
+
+        // 花弁は丸い小片（CircleGeometry）を5〜6枚、中心の周りに放射状に並べて
+        // 1つの花にする（1枚板の五角形だと「板」に見えてしまうため、参考写真通り
+        // 個々の丸い花弁が分かれて見えるようにする）
+        const headX = stemX + Math.cos(angle) * 0.03 * lean_factor;
+        const headY = stemHeight + 0.01;
+        const headZ = stemZ + Math.sin(angle) * 0.03 * lean_factor;
+        const flowerHead = new THREE.Group();
+        flowerHead.position.set(headX, headY, headZ);
+        // 「花が、角度によっては消えてしまいます」との指摘の原因判定: 花弁は平たい円盤
+        // (CircleGeometry)で、1つのflowerHead内の花弁は全て同じ向き（法線方向）を共有する。
+        // 元々はrotation.xのみ±0.25rad(約14度)という狭い範囲でしか傾きをばらつかせておらず、
+        // かつrotation.z（円盤自身の法線を軸にした回転）は法線の向き自体を一切変えないため、
+        // 1株（11〜16個のflowerHead）のほぼ全てがほぼ真上向きの法線で揃ってしまっていた。
+        // 結果、真横に近い浅い角度から見ると、株全体の花弁がほぼ同時に真横（面積ゼロに近い
+        // 縁）を向いてしまい「消えた」ように見えていた（Playwrightで実際に、特定の浅い仰角・
+        // 近距離のカメラ配置で花弁色のピクセルが0になることを実測して確認済み）。
+        // 対策として、傾きの最大角を約29度に広げ、さらにrotation.y（傾く方向そのもの）も
+        // ランダム化して、株の中のflowerHeadごとに法線の向きがバラバラになるようにした
+        // （どの角度から見ても、株の中の一部のflowerHeadは十分な面積を見せる）
+        flowerHead.rotation.x = -Math.PI / 2 + (Math.random() - 0.5) * 1.0;
+        flowerHead.rotation.y = Math.random() * Math.PI * 2;
+        flowerHead.rotation.z = Math.random() * Math.PI * 2; // 花全体の向きをランダムにして単調にしない
+        const petalCount = 5 + Math.floor(Math.random() * 2);
+        const petalColorIndex = Math.floor(Math.random() * ASSEMBLY_FLOWER_PETAL_COLORS.length);
+        const petalMat = getSharedDecorationMaterial(`flowerPetal${petalColorIndex}`, () =>
+            new THREE.MeshStandardMaterial({ color: ASSEMBLY_FLOWER_PETAL_COLORS[petalColorIndex], roughness: 0.5, side: THREE.DoubleSide }));
+        // 「草と花、もっとマスいっぱいにしていい」との指示で花弁を大きく・広めにした
+        const petalReach = 0.034;
+        const petalRadius = 0.027;
+        for (let p = 0; p < petalCount; p++) {
+            const petalAngle = (p / petalCount) * Math.PI * 2;
+            const petal = new THREE.Mesh(new THREE.CircleGeometry(petalRadius, 8), petalMat);
+            petal.position.set(Math.cos(petalAngle) * petalReach, Math.sin(petalAngle) * petalReach, 0);
+            petal.rotation.z = petalAngle;
+            petal.castShadow = true;
+            flowerHead.add(petal);
+        }
+        group.add(flowerHead);
+
+        const center = new THREE.Mesh(new THREE.SphereGeometry(0.012, 6, 6), centerMat);
+        center.position.set(headX, headY + 0.003, headZ);
+        group.add(center);
+    }
+
+    // 「装飾が重い」との指摘対応。1花クラスタあたり100個超あった個別メッシュ（葉・茎・
+    // 花弁・中心）を、同じマテリアルどうしで合体させ数個のメッシュにまとめる
+    mergeAssemblyDecorationParts(group);
+
+    // 株の横方向の広がりを1マス(ASSEMBLY_CELL_SIZE=1)の正方形いっぱいになるよう正規化する
+    // （getAssemblyTrolleyFootprintScale()と同じ「はみ出ない範囲で目一杯大きくする」考え方。
+    // 高さ(Y)まで一緒に拡大すると茎が不自然に長く突き出てしまうため、X/Zのみ拡大する）。
+    // 「マスの中で正方形にしてほしい」との指示のため、X/Zは同じ倍率ではなく個別に
+    // ターゲットへ合わせる（元の株はX/Zの広がりが不揃いなため、共通倍率だとX/Zどちらかが
+    // 1マスに届かず正方形にならない）
+    const box = new THREE.Box3().setFromObject(group);
+    const size = box.getSize(new THREE.Vector3());
+    const FLOWER_FOOTPRINT_TARGET = 1.0;
+    if (size.x > 0 && size.z > 0) {
+        group.scale.set(FLOWER_FOOTPRINT_TARGET / size.x, 1, FLOWER_FOOTPRINT_TARGET / size.z);
+    }
+
+    return group;
+}
+
+// 草むら: 参考写真（26588_0.jpg）を元に作り直した。以前は韮のように細く直立する葉を
+// マス全体にばらつかせる方式だったが、参考写真は株の中心から幅広の葉が球状（あらゆる
+// 方向）に密生する、ロゼット状（アロエ・多肉植物のような）1株のシルエットだった。
+// 葉1枚1枚は円錐を扁平に潰して幅広の葉先にし、株の中心付近から真上〜真横〜やや下向き
+// まで球状にあらゆる方向へ伸ばすことで、参考写真の丸くふっくらしたシルエットを作る。
+// 色も参考写真の青緑がかったトーンに合わせた
+function buildProceduralGrassTuftMesh() {
+    const group = new THREE.Group();
+    const greens = [0x3f8f82, 0x4a9e8e, 0x357a70];
+    const bladeCount = 26 + Math.floor(Math.random() * 10);
+    const CENTER_SPREAD = 0.04; // 根本は株の中心付近にまとめる（マス全体への分散はやめた）
+    // phiは真上(0)からの角度。真下(π)近くまで許すと葉が地面に潜って見えるため、
+    // 水平よりやや下（約100度）までに制限し、参考写真の丸いドーム状シルエットに寄せる
+    const MAX_PHI = Math.PI * 0.56;
+    for (let i = 0; i < bladeCount; i++) {
+        const colorIndex = Math.floor(Math.random() * greens.length);
+        const mat = getSharedDecorationMaterial(`grassBlade${colorIndex}`, () => new THREE.MeshStandardMaterial({ color: greens[colorIndex], roughness: 0.55 }));
+        // 「細い針のようで、参考写真の幅広の葉に見えない」ため、太さを上げ・高さを
+        // 少し抑えて幅/高さの比を大きくした（幅広の葉先らしいシルエットにする）
+        const height = 0.2 + Math.random() * 0.13;
+        const width = 0.1 + Math.random() * 0.03;
+        const blade = new THREE.Mesh(new THREE.ConeGeometry(width, height, 4), mat);
+        blade.scale.z = 0.32; // 潰して幅広の葉先形状にする
+
+        const theta = Math.random() * Math.PI * 2;
+        // cos(phi)を一様分布させることで、極（真上）付近に偏らせず立体角として均等に散らす
+        const phi = Math.acos(1 - Math.random() * (1 - Math.cos(MAX_PHI)));
+        const dir = new THREE.Vector3(
+            Math.sin(phi) * Math.cos(theta),
+            Math.cos(phi),
+            Math.sin(phi) * Math.sin(theta)
+        );
+        const rootX = (Math.random() - 0.5) * CENTER_SPREAD;
+        const rootZ = (Math.random() - 0.5) * CENTER_SPREAD;
+        // 葉の根本（中心寄り）が株の中心に来るよう、ジオメトリ中心をdir方向へheight/2ぶん
+        // ずらして配置する（葉の先端がdir方向へ伸びる）
+        blade.position.set(rootX, 0, rootZ).addScaledVector(dir, height / 2);
+        blade.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+        blade.castShadow = true;
+        group.add(blade);
+    }
+
+    // 「装飾が重い」との指摘対応。1株あたり数十枚あった個別メッシュ（葉）を、
+    // 同じ色（マテリアル）どうしで合体させ最大3個のメッシュにまとめる
+    mergeAssemblyDecorationParts(group);
+
+    // 花と同様、1マス(ASSEMBLY_CELL_SIZE=1)の正方形いっぱいになるようX/Zを個別に正規化する
+    // （「叢も同様」との指示）。高さ(Y)は据え置き
+    const box = new THREE.Box3().setFromObject(group);
+    const size = box.getSize(new THREE.Vector3());
+    const GRASS_FOOTPRINT_TARGET = 1.0;
+    if (size.x > 0 && size.z > 0) {
+        group.scale.set(GRASS_FOOTPRINT_TARGET / size.x, 1, GRASS_FOOTPRINT_TARGET / size.z);
+    }
+
+    return group;
+}
+
+// 木は2種類: 広葉樹（丸いシルエット）・針葉樹（円錐のシルエット）。
+// 経緯: 当初1種類の木で葉を「もりもり」に増量していったところ、クラスタの位置を
+// 大きくランダムに散らしていたためシルエットが「いびつ」（丸くも円錐でもない不定形）に
+// なってしまった。指摘を受け、(1) 広葉樹は葉の塊を中心付近にまとめて丸いシルエットに
+// なるよう再設計し、(2) 針葉樹という円錐シルエットの新種を追加し、(3) 両方とも
+// 背丈を控えめに戻した（もりもり化の過程で伸びすぎていたため）
+
+// 広葉樹（丸い木）: 参考写真（26585_0.jpg）を元に作り直した。参考写真は樹冠が幹を
+// 覆い隠すほど大きく、表面全体がこんもりした房で密に覆われ、根元は末広がりに張り出し、
+// 赤〜黄の実に緑の葉が添えられていた。幹（円柱）+根本の張り出し+大きめの中心球+表面を
+// 覆う多数の小さな塊、という構成は維持しつつ、房の密度・実の質感をその方向へ寄せた
+function buildProceduralBroadleafTreeMesh() {
+    const group = new THREE.Group();
+    const trunkMat = getSharedDecorationMaterial("treeTrunk", () => new THREE.MeshStandardMaterial({ color: 0x6b4a2f, roughness: 0.9 }));
+    // 参考写真は樹冠に対して幹が短く見えたため、以前よりやや短くした
+    const trunkHeight = 0.85 + Math.random() * 0.25;
+    // 「木の幹は1マス分いっぱいにしてください」との指示で、根元の半径がASSEMBLY_CELL_SIZE
+    // （1マス=1）の半分＝0.5（直径1マスぶん）になるよう太くした
+    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.33, 0.5, trunkHeight, 6), trunkMat);
+    trunk.position.y = trunkHeight / 2;
+    trunk.castShadow = true;
+    group.add(trunk);
+    // 根本の張り出し（参考写真の、幹の根元が末広がりに太くなっている見た目）
+    const rootFlare = new THREE.Mesh(new THREE.ConeGeometry(0.56, 0.16, 6), trunkMat);
+    rootFlare.position.y = 0.08;
+    rootFlare.castShadow = true;
+    group.add(rootFlare);
+
+    const foliageColors = [0x4f9a4a, 0x5aa855, 0x458a41];
+    const foliageColorIndex = Math.floor(Math.random() * foliageColors.length);
+    const foliageMat = getSharedDecorationMaterial(`broadleafFoliage${foliageColorIndex}`, () =>
+        new THREE.MeshStandardMaterial({ color: foliageColors[foliageColorIndex], roughness: 0.85 }));
+    // 葉（樹冠）のサイズだけを拡大する（幹の太さ・高さは対象外なので触れない）。
+    // 「10倍にしてほしい」→「10倍は言い過ぎました2倍で」と訂正が入り、2倍に調整済み
+    const FOLIAGE_SCALE = 2;
+    const mainR = (0.62 + Math.random() * 0.2) * FOLIAGE_SCALE;
+    const canopyCenterY = trunkHeight + mainR * 0.85;
+    // 中心となる大きめの球（detail=1でカクカクしすぎない丸みにする）がシルエットの主体
+    const mainFoliage = new THREE.Mesh(new THREE.IcosahedronGeometry(mainR, 1), foliageMat);
+    mainFoliage.position.set(0, canopyCenterY, 0);
+    mainFoliage.castShadow = true;
+    group.add(mainFoliage);
+    // 表面に小さな塊を数多くくっつけて質感を出す（中心からの距離を主球の半径未満に抑え、
+    // 全体シルエットが丸のまま保たれるようにする＝いびつ化の再発防止）。参考写真の
+    // 「表面全体がこんもりした房で覆われている」密度に寄せるため、個数を増やし1個ずつは
+    // 少し小さくした
+    const bumpCount = 8 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < bumpCount; i++) {
+        const bumpR = mainR * (0.3 + Math.random() * 0.2);
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(Math.random() * 1.6 - 0.8); // 下半分に寄りすぎないよう範囲を絞る
+        const dist = mainR * 0.75;
+        const bump = new THREE.Mesh(new THREE.IcosahedronGeometry(bumpR, 0), foliageMat);
+        bump.position.set(
+            dist * Math.sin(phi) * Math.cos(theta),
+            canopyCenterY + dist * Math.cos(phi) * 0.7,
+            dist * Math.sin(phi) * Math.sin(theta)
+        );
+        bump.castShadow = true;
+        group.add(bump);
+    }
+
+    // リンゴのような実を樹冠の表面に散らす（「広葉樹にはリンゴのような木の実をつけます」
+    // →「実の大きさはもっと大きくていい（ひとつの木につき4つ）」との指示は維持）。
+    // 参考写真同様、実の上部に小さな緑の葉を1枚添え、色も赤〜橙寄りに調整した
+    const appleMat = getSharedDecorationMaterial("apple", () => new THREE.MeshStandardMaterial({ color: 0xd94a2b, roughness: 0.4 }));
+    const appleLeafMat = getSharedDecorationMaterial("appleLeaf", () => new THREE.MeshStandardMaterial({ color: 0x3f8a4a, roughness: 0.7 }));
+    const appleCount = 4;
+    for (let i = 0; i < appleCount; i++) {
+        const appleR = mainR * 0.17;
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(Math.random() * 1.7 - 0.85);
+        const dist = mainR * 0.95; // 樹冠の表面付近にぶら下がるように少し外側
+        const ax = dist * Math.sin(phi) * Math.cos(theta);
+        const ay = canopyCenterY + dist * Math.cos(phi) * 0.7;
+        const az = dist * Math.sin(phi) * Math.sin(theta);
+        const apple = new THREE.Mesh(new THREE.SphereGeometry(appleR, 8, 8), appleMat);
+        apple.position.set(ax, ay, az);
+        apple.castShadow = true;
+        group.add(apple);
+        // 葉は実から樹冠の外側（実自身の中心からの方向）へ向けて生やす。rotation.x/yの
+        // 組み合わせでは向きが安定せず、真正面から見ると平べったい三角形が目立って
+        // しまっていたため、外向きベクトルにquaternionで正確に揃える方式にした
+        const outward = new THREE.Vector3(ax, ay - canopyCenterY, az).normalize();
+        const leaf = new THREE.Mesh(new THREE.ConeGeometry(appleR * 0.4, appleR * 0.9, 3), appleLeafMat);
+        leaf.scale.z = 0.3;
+        leaf.position.set(ax, ay, az).addScaledVector(outward, appleR * 0.6);
+        leaf.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), outward);
+        group.add(leaf);
+    }
+
+    // 「装飾が重い」との指摘対応。幹・根本張り出し・樹冠(main+bump)・実・実の葉で
+    // 個別だったメッシュを同じマテリアルどうしで合体させる（最大5メッシュにまとめる）
+    mergeAssemblyDecorationParts(group);
+    return group;
+}
+
+// 針葉樹（三角形の木）: 参考写真（26584_0.jpg）を元に作り直した。参考写真は1枚の
+// 滑らかな円錐ではなく、段ごとに小さな枝葉の房が輪になって重なり、外側へ垂れ下がる
+// 「うろこ状」のシルエットだった。段の数を増やし（4→7）、各段を1つの円錐ではなく
+// 段の外周に並べた複数の小さな塊（房）で構成することで、その質感に近づけた
+function buildProceduralConiferTreeMesh() {
+    const group = new THREE.Group();
+    const trunkMat = getSharedDecorationMaterial("treeTrunk", () => new THREE.MeshStandardMaterial({ color: 0x6b4a2f, roughness: 0.9 }));
+    const trunkHeight = 0.55 + Math.random() * 0.15;
+    // 「木の幹は1マス分いっぱいにしてください」との指示で、根元の半径が0.5（直径1マスぶん）
+    // になるよう太くした
+    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.375, 0.5, trunkHeight, 6), trunkMat);
+    trunk.position.y = trunkHeight / 2;
+    trunk.castShadow = true;
+    group.add(trunk);
+
+    const foliageColors = [0x3d7a3f, 0x2f6a38, 0x4a8a4a];
+    const foliageColorIndex = Math.floor(Math.random() * foliageColors.length);
+    const foliageMat = getSharedDecorationMaterial(`coniferFoliage${foliageColorIndex}`, () =>
+        new THREE.MeshStandardMaterial({ color: foliageColors[foliageColorIndex], roughness: 0.85 }));
+    // 葉（房）のサイズを拡大する。「10倍にしてほしい」→「10倍は言い過ぎました2倍で」と
+    // 訂正が入り、2倍に調整済み
+    const FOLIAGE_SCALE = 2;
+    const baseRadius = (0.62 + Math.random() * 0.18) * FOLIAGE_SCALE;
+    const segmentCount = 7;
+    let currentY = trunkHeight;
+    for (let i = 0; i < segmentCount; i++) {
+        const frac = i / segmentCount;
+        const segRadius = baseRadius * (1 - frac * 0.78);
+        const segHeight = (0.55 - frac * 0.08) * FOLIAGE_SCALE;
+        const tierY = currentY + segHeight * 0.4;
+        // 房を段の外周に均等に並べる。頂点の段（最後）だけは1つの房にまとめ、
+        // 中心（ringR=0）に置いて尖った頂点にする
+        const isTip = i === segmentCount - 1;
+        const lobeCount = isTip ? 1 : 6;
+        const ringR = isTip ? 0 : segRadius * 0.7;
+        for (let l = 0; l < lobeCount; l++) {
+            // 段ごとに開始角をずらし、真上から見て房の継ぎ目が段を通して一直線に
+            // 揃わないようにする（参考写真のような不規則な重なりに近づける）
+            const angle = (l / lobeCount) * Math.PI * 2 + frac * 2.4;
+            const lobeR = isTip ? segRadius * 0.55 : segRadius * (0.42 + Math.random() * 0.1);
+            const lobe = new THREE.Mesh(new THREE.IcosahedronGeometry(lobeR, 0), foliageMat);
+            lobe.position.set(Math.cos(angle) * ringR, tierY - lobeR * 0.3, Math.sin(angle) * ringR);
+            lobe.scale.y = 0.72; // 房を少し潰し、外側へ垂れ下がった葉房らしくする
+            lobe.castShadow = true;
+            group.add(lobe);
+        }
+        currentY += segHeight * 0.5; // 段同士を重ねて隙間ができないようにする
+    }
+
+    // 「三角の木に木の実は不要」との指摘で、水色のイチゴのような実の装飾は撤去した
+    // （広葉樹の赤い実とは別に付けていたが、針葉樹には無い方が参考写真に近い）
+
+    // 「装飾が重い」との指摘対応。幹・葉（7段の房）で個別だったメッシュを
+    // 同じマテリアルどうしで合体させる
+    mergeAssemblyDecorationParts(group);
+    return group;
+}
+
+// ============================================================
+// 空に浮かぶ雲。「こういった雲を設置して、時間で平行に流れていく。影が地面に移る」
+// との依頼で追加。個々の雲の生成・消滅サイクル自体はトラック・マップ設定と無関係
+// （トロッコ演奏の内容によらず常に同じように空を流れる）なため、木・草・花のように
+// rebuildAssemblyMeshes()のたびに作り直すことはしない。
+// ただし「一列の最大レール数を100とかにすると、雲の流れるエリアが偏ってしまいます。
+// 現在の小節の数などに合わせて動的に広げることは可能ですか？」との指摘の通り、雲が
+// 流れる範囲（assemblyCloudRange）は元々トラックの規模と無関係な固定値だったため、
+// 大きなトラックだと雲がトラックの一部分にしか流れず偏って見えていた。トラックの
+// footprint（frameAssemblyCamera()と同じ考え方）に応じて範囲を動的に広げるよう、
+// 固定constから可変letへ変更し、rebuildAssemblyMeshes()のたびにupdateAssemblyCloudRange()
+// で更新するようにした。「リロードが入るので、再描画でよい」との指示のため、範囲が
+// 実際に変わった時は既存の雲を流れ切るまで待たず、resetAssemblyClouds()でその場で
+// 全て破棄して新しい範囲で撒き直す（雲の生成・消滅サイクル自体＝tickAssemblyClouds()の
+// 挙動は変更していない）
+// 「雲をマップ全体に表示されるようにしてほしい」との依頼で、雲が流れる範囲を
+// トラックのfootprintに毛の生えた程度（footprint*0.9）から、地面ブロック・装飾が
+// 実際に広がる範囲（ASSEMBLY_GROUND_BLOCK_MARGIN分の余白まで）に合わせて大きく広げた。
+// 範囲（面積）が大きく広がる分、密度が薄くなりすぎないよう個数も増やした
+// （30→100→10000（生成に約30秒）→1000（約15〜17秒、見た目も曇り空のように過密）→300→200
+// と調整）
+// 雲のメッシュだけをのせるTHREE.Layers番号。assemblySun（レール/トロッコ/キャラクター/
+// 音符マット等、狭く高精度な影が必要な光源）の影から雲を除外し、assemblyCloudSun（広く
+// 粗い解像度でよい雲専用の影）側にだけ雲を描かせるための分離に使う
+const ASSEMBLY_CLOUD_LAYER = 1;
+const ASSEMBLY_CLOUD_COUNT = 200;
+const ASSEMBLY_CLOUD_DRIFT_SPEED = 1.2; // ワールド単位/秒（「雲の速度はもう少し早くていい」との指示で0.5から引き上げ）
+const ASSEMBLY_CLOUD_RANGE_DEFAULT = 70; // 小さなトラックでの下限（従来の固定値）
+let assemblyCloudRange = ASSEMBLY_CLOUD_RANGE_DEFAULT; // 雲が流れる範囲の半径。これを超えたら消える
+let assemblyClouds = [];
+
+// トラックのfootprintに応じてassemblyCloudRangeを更新する。frameAssemblyCamera()と
+// 同じfootprintの考え方（グリッドの縦横のうち大きい方）を使うことで、カメラが引いて
+// トラック全体を見渡す規模に対して雲の流れる範囲も一緒に広がるようにする。
+// 「リロードが入るので、再描画でよい」との指示のため、範囲が実際に変わった時は
+// 既存の雲が流れ切るのを待たず、その場で全て破棄して新しい範囲で撒き直す
+// （トラックの規模が変わる操作では他の要素（レール・音符マット・装飾等）もどのみち
+// 即座に作り直されるため、雲だけ滑らかに移行させる必要は無いという判断）
+function updateAssemblyCloudRange(extent) {
+    const gridW = (extent.maxX - extent.minX + 1) * ASSEMBLY_CELL_SIZE;
+    const gridH = (extent.maxY - extent.minY + 1) * ASSEMBLY_CELL_SIZE;
+    const footprint = Math.max(gridW, gridH, 4);
+    // 地面ブロック・装飾が実際に広がる範囲（footprint/2 + マージン）まで雲の範囲を広げ、
+    // 「マップ全体」に雲が見えるようにする（以前のfootprint*0.9だと、トラックの近くだけに
+    // 雲が集まり、その外側の広い地面ブロック・装飾エリアには一切流れて来なかった）
+    const newRange = Math.max(ASSEMBLY_CLOUD_RANGE_DEFAULT, footprint * 0.9, footprint / 2 + ASSEMBLY_GROUND_BLOCK_MARGIN);
+    if (Math.abs(newRange - assemblyCloudRange) > 0.01) {
+        assemblyCloudRange = newRange;
+        resetAssemblyClouds();
+    }
+}
+
+// 「雲ってそんな縦長いものばかりではない」「雲は3Dでなくても、平面でいい」との指摘で
+// 再設計。3Dの塊を横一列に並べる方式は、どの雲も同じような細長い形になりがちで、かつ
+// 立体的すぎた。丸い平面（CircleGeometry、地面と水平に寝かせる）を中心から2Dクラスタ状に
+// ランダムな角度・距離でばら撒く方式に変え、(1) 完全に平ら（3Dの厚みが無い）にしつつ、
+// (2) 雲ごとに丸く固まったものから横に広がったものまで、形にばらつきが出るようにした
+function buildProceduralCloudMesh() {
+    const group = new THREE.Group();
+    // 「雲はもっと白い」との指示でクリーム掛かった色から純白に近い色へ変更。
+    // 「下から見上げたら黒い」との指摘のため、光源の向きで陰影が付くMeshStandardMaterial
+    // ではなく、常に同じ色で見えるMeshBasicMaterial（陰影計算をしない）に変更した——
+    // 平らな板（厚み0）は太陽光が真上からしか当たらないため、下向きの面は必然的に
+    // 直射光を受けられず暗く沈んでしまう（アンビエント光頼みで黒に近くなる）。
+    // フェードイン用にtransparent:trueにし、初期opacityは0（spawnAssemblyCloud側で
+    // 毎フレーム引き上げる）にしておく
+    const cloudMat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide, transparent: true, opacity: 0 });
+    group.userData.cloudMaterial = cloudMat; // tickAssemblyCloudsからフェード制御するための参照
+    const lumpCount = 5 + Math.floor(Math.random() * 4); // 5〜8枚の円盤を散らす
+    for (let i = 0; i < lumpCount; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = Math.random() * 1.0; // 中心からの距離をランダムにし、丸みも横広がりも出るようにする
+        const r = 0.6 + Math.random() * 0.5;
+        const disc = new THREE.Mesh(new THREE.CircleGeometry(r, 10), cloudMat);
+        disc.rotation.x = -Math.PI / 2; // 地面と水平に寝かせる（平面の雲）
+        disc.position.set(Math.cos(angle) * dist, 0, Math.sin(angle) * dist);
+        // assemblySunの影から除外し、assemblyCloudSun側にだけ影を描かせるための分離
+        // （ASSEMBLY_CLOUD_LAYER参照）。メインカメラはlayer0に加えてこのlayerも
+        // 有効化済み（initAssemblyScene）なので、通常の見た目には影響しない
+        disc.layers.set(ASSEMBLY_CLOUD_LAYER);
+        // 影はここではまだ有効にしない（castShadowはopacityを見ないため、フェード中の
+        // 半透明な雲がいきなり真っ黒な影を落とし、境目が不自然に見えてしまう。
+        // フェードが完了した時にtickAssemblyCloudsからまとめて有効化する）
+        disc.castShadow = false;
+        group.add(disc);
+    }
+    return group;
+}
+
+// 新規生成時、範囲の境界ぴったりではなくさらに外側から生やす（「もう少し離れた距離から
+// 生成してください」との指示）。フェードインが目に入る前に済ませやすくする狙いもある
+const ASSEMBLY_CLOUD_SPAWN_MARGIN = 35;
+// フェードインに掛ける時間（秒）。「急に出現すると変」との指摘で追加
+const ASSEMBLY_CLOUD_FADE_DURATION = 3;
+
+// 影の最大の濃さ（0〜1のalpha）
+const ASSEMBLY_CLOUD_SHADOW_MAX_ALPHA = 0.45;
+
+// 疑似影（地面に落とす、雲と同じ配置の暗い半透明の複製）を作る。「雲の影もフェードイン
+// してほしい」との指摘に対応するため——本物のcastShadowはopacityを見ずに常にくっきり
+// 影を落とすため、フェード完了までは代わりにこの疑似影を使い、opacityを雲本体と同じ
+// 進行度で連動させて滑らかにフェードインさせる。
+// 「本物のcastShadowを使わず疑似影だけを雲が存在する間ずっと使い続ける」方式も試したが、
+// 複数の雲の疑似影（半透明の黒）が地面上で重なると、アルファブレンドにより濃さが
+// 積み重なってほぼ真っ黒になってしまい（本物の影は光源1つぶんの濃さで頭打ちになり
+// 重なっても濃くならないのに対し、半透明の板を重ねるとどんどん濃くなる）、「さっきより
+// おかしい」との指摘につながった。そのため、フェード完了後は本物のcastShadowに切り替える
+// 方式に戻した（フェード中の一瞬の切り替わりより、常時発生しうる濃さの重なりの方が
+// 実害が大きいと判断）
+function buildAssemblyCloudShadowBlob(cloud) {
+    const blob = cloud.clone(); // ジオメトリ配置だけ複製（マテリアルは共有されるので直後に差し替える）
+    const blobMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0, depthWrite: false });
+    blob.traverse(o => { if (o.isMesh) { o.material = blobMat; o.castShadow = false; } });
+    blob.userData.blobMaterial = blobMat;
+    blob.scale.copy(cloud.scale);
+    blob.rotation.y = cloud.rotation.y;
+    return blob;
+}
+
+// 太陽光の向きに沿って、指定した高さにある点が地面(ASSEMBLY_GROUND_Y)のどこに
+// 影を落とすかのXZオフセットを求める（平行光源なので高さだけで決まる）
+function getAssemblyCloudShadowOffset(heightAboveGround) {
+    const dir = new THREE.Vector3().subVectors(assemblySun.target.position, assemblySun.position).normalize();
+    const t = -heightAboveGround / dir.y; // dir.yは負（下向き）なので、tは正になる
+    return { x: dir.x * t, z: dir.z * t };
+}
+
+// フェードが完了した雲の疑似影を片付け、全ての円盤にcastShadowをまとめて有効化する
+// （本物の影は複数重なっても濃くなりすぎないため、定常状態はこちらを使う）
+function enableAssemblyCloudShadow(cloud) {
+    if (cloud.userData.shadowEnabled) return;
+    cloud.userData.shadowEnabled = true;
+    cloud.traverse(o => { if (o.isMesh) o.castShadow = true; });
+    if (cloud.userData.shadowBlob) {
+        assemblyScene.remove(cloud.userData.shadowBlob);
+        cloud.userData.shadowBlob.traverse(o => {
+            if (o.geometry) o.geometry.dispose();
+            if (o.material) o.material.dispose();
+        });
+        cloud.userData.shadowBlob = null;
+    }
+}
+
+// 1個の雲を生成して指定したX座標に配置する（initAssemblyClouds/spawnAssemblyCloud共通）。
+// Y/Zはランダムに決める
+function spawnAssemblyCloud(x) {
+    const cloud = buildProceduralCloudMesh();
+    // 「もう少し大小の雲があっていい」との指示で、大きさのばらつきの幅を広げた
+    // 「雲のサイズが全体的に大きい」との指摘で全体的に縮小しつつ、大小のばらつきは維持
+    cloud.scale.setScalar(1.5 + Math.random() * 5.5);
+    const cloudY = 90 + Math.random() * 14; // 「雲の高さをもっと高くして」との指示で34→60→90に引き上げ（太陽の高さ110より低いまま）
+    cloud.position.set(x, cloudY, (Math.random() * 2 - 1) * assemblyCloudRange);
+    cloud.rotation.y = Math.random() * Math.PI * 2;
+    cloud.userData.fadeElapsed = 0; // tickAssemblyCloudsでopacityを毎フレーム引き上げる
+    assemblyScene.add(cloud);
+    assemblyClouds.push(cloud);
+
+    // フェード中だけ表示する疑似影を、太陽の向きに応じたオフセット位置の地面に置く
+    const offset = getAssemblyCloudShadowOffset(cloudY - ASSEMBLY_GROUND_Y);
+    const blob = buildAssemblyCloudShadowBlob(cloud);
+    blob.position.set(x + offset.x, ASSEMBLY_GROUND_Y + 0.01, cloud.position.z + offset.z);
+    cloud.userData.shadowBlob = blob;
+    cloud.userData.shadowGroundOffset = offset; // 雲がX方向へ流れるのに追従させるため保持
+    assemblyScene.add(blob);
+}
+
+// 1個の雲（疑似影があればそれも含め）をシーンから取り除き、GPUリソースを解放する
+function disposeAssemblyCloud(cloud) {
+    assemblyScene.remove(cloud);
+    cloud.traverse(o => {
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) o.material.dispose();
+    });
+    if (cloud.userData.shadowBlob) {
+        assemblyScene.remove(cloud.userData.shadowBlob);
+        cloud.userData.shadowBlob.traverse(o => {
+            if (o.geometry) o.geometry.dispose();
+            if (o.material) o.material.dispose();
+        });
+    }
+}
+
+// 今ある雲を全て破棄し、現在のassemblyCloudRangeで撒き直す。updateAssemblyCloudRange()が
+// 範囲の変化を検知した時に呼ぶ（雲だけ滑らかに移行させる必要は無いという判断、詳細は
+// updateAssemblyCloudRangeのコメント参照）
+function resetAssemblyClouds() {
+    assemblyClouds.forEach(disposeAssemblyCloud);
+    assemblyClouds = [];
+    initAssemblyClouds();
+}
+
+// 3Dシーン初期化時、最初から画面に雲がある状態にするため範囲全体に散らして生成する
+// （以降の追加生成はtickAssemblyCloudsが端から生やす。initAssemblyScene参照）。
+// トラックの規模変更でassemblyCloudRangeが変わった時（resetAssemblyClouds経由）にも呼ばれる。
+// 初回表示時にフェードインの間が空いて不自然に見えないよう、開始時点で既にフェード済み
+// （opacity=1、影も有効）にしておく
+function initAssemblyClouds() {
+    for (let i = 0; i < ASSEMBLY_CLOUD_COUNT; i++) {
+        spawnAssemblyCloud((Math.random() * 2 - 1) * assemblyCloudRange);
+        const cloud = assemblyClouds[assemblyClouds.length - 1];
+        cloud.userData.fadeElapsed = ASSEMBLY_CLOUD_FADE_DURATION;
+        cloud.userData.cloudMaterial.opacity = 1;
+        enableAssemblyCloudShadow(cloud); // 疑似影をすぐ片付け、本物の影を有効化する
+    }
+}
+
+// 次に新しい雲を生やすまでの残り時間（秒）。「定期的に新しい雲もどんどん生成してください」
+// との指示のため、ランダムな間隔で生やし続ける
+let assemblyCloudSpawnTimer = 3;
+
+// 毎フレーム、雲をX方向へゆっくり平行移動させる（「時間で平行に流れていく」）。
+// 「陸のエリアからはみ出たら消え、定期的に新しい雲もどんどん生成してください」との指示で、
+// 反対側へ折り返す（テレポートする）方式から、範囲外に出たら消して片側から新しい雲を
+// 生やし続ける方式に変更した
+function tickAssemblyClouds(dt) {
+    for (let i = assemblyClouds.length - 1; i >= 0; i--) {
+        const cloud = assemblyClouds[i];
+        cloud.position.x += ASSEMBLY_CLOUD_DRIFT_SPEED * dt;
+        if (cloud.userData.shadowBlob) {
+            // 雲のX移動に追従させる（Zは流れないので変化しない）
+            cloud.userData.shadowBlob.position.x = cloud.position.x + cloud.userData.shadowGroundOffset.x;
+        }
+        // 「雲と影は、消える時はフェードアウトすること。ぱっと消えないこと」との指摘対応。
+        // 以前は表示エリアを出た瞬間にdisposeAssemblyCloud()で即座に消していた（フェード
+        // イン側は既に対応済みだったが、退出側だけ非対称に「ぱっと消える」ままだった）。
+        // 表示エリアを出た最初のフレームでexiting状態に入り、以降はASSEMBLY_CLOUD_FADE_DURATION
+        // かけてopacityを1→0へ戻し、完全に消えてから実際にdisposeする
+        if (cloud.position.x > assemblyCloudRange && !cloud.userData.exiting) {
+            cloud.userData.exiting = true;
+            cloud.userData.fadeElapsed = 0;
+            // 定常状態では複数の疑似影が重なって濃さが積み重なるのを避けるため本物の
+            // castShadowへ切り替え済み（enableAssemblyCloudShadow参照）だが、本物の影は
+            // opacityを見ず常にくっきり落ちるためフェードアウトできない。退出時だけ
+            // 疑似影を作り直し、フェードイン時と同じ仕組みで雲本体と同期してフェード
+            // させられるようにする（本物のcastShadowは無効化する）
+            if (cloud.userData.shadowEnabled) {
+                cloud.traverse(o => { if (o.isMesh) o.castShadow = false; });
+                cloud.userData.shadowEnabled = false;
+                const offset = getAssemblyCloudShadowOffset(cloud.position.y - ASSEMBLY_GROUND_Y);
+                const blob = buildAssemblyCloudShadowBlob(cloud);
+                blob.position.set(cloud.position.x + offset.x, ASSEMBLY_GROUND_Y + 0.01, cloud.position.z + offset.z);
+                cloud.userData.shadowBlob = blob;
+                cloud.userData.shadowGroundOffset = offset;
+                cloud.userData.shadowBlob.userData.blobMaterial.opacity = ASSEMBLY_CLOUD_SHADOW_MAX_ALPHA; // 直前まで本物の影で全力表示だった状態を引き継ぐ
+                assemblyScene.add(blob);
+            }
+        }
+        if (cloud.userData.exiting) {
+            cloud.userData.fadeElapsed = Math.min(ASSEMBLY_CLOUD_FADE_DURATION, cloud.userData.fadeElapsed + dt);
+            const progress = 1 - cloud.userData.fadeElapsed / ASSEMBLY_CLOUD_FADE_DURATION; // 1→0
+            cloud.userData.cloudMaterial.opacity = progress;
+            const shadowProgress = progress * progress * progress; // フェードイン側と同じイージングを逆向きに使う
+            cloud.userData.shadowBlob.userData.blobMaterial.opacity = shadowProgress * ASSEMBLY_CLOUD_SHADOW_MAX_ALPHA;
+            if (cloud.userData.fadeElapsed >= ASSEMBLY_CLOUD_FADE_DURATION) {
+                disposeAssemblyCloud(cloud);
+                assemblyClouds.splice(i, 1);
+            }
+            continue;
+        }
+        // フェードイン（「急に出現すると変」との指摘のため、生成直後は透明から少しずつ現れる）。
+        // 「早くフェードインすると見切れてしまう」との指摘のため、通常の表示エリア
+        // （-assemblyCloudRange〜assemblyCloudRange、雲が完全に収まって見える範囲）に
+        // 入るまではフェードを開始しない（生成時のさらに外側のマージン区間は透明のまま素通りする）
+        const withinDisplayArea = cloud.position.x >= -assemblyCloudRange;
+        if (withinDisplayArea && cloud.userData.fadeElapsed < ASSEMBLY_CLOUD_FADE_DURATION) {
+            cloud.userData.fadeElapsed = Math.min(ASSEMBLY_CLOUD_FADE_DURATION, cloud.userData.fadeElapsed + dt);
+            const progress = cloud.userData.fadeElapsed / ASSEMBLY_CLOUD_FADE_DURATION;
+            cloud.userData.cloudMaterial.opacity = progress;
+            // 「雲はじわ～っと表示されるのに、影は一瞬で表示されてしまう」との指摘対応。
+            // 進行度(progress)自体は雲本体と全く同じ値を使っており、alphaの数値としては
+            // 同期して線形に増えていたが、実測（Playwrightでprogressごとにスクリーンショット
+            // を比較）したところ、白い雲が淡い青空に乗るケースは低コントラストなため序盤の
+            // 薄いopacityでもほぼ見えないのに対し、黒に近い影が緑の地面に乗るケースは
+            // 高コントラストなため、ごく薄いopacity（例: progress=0.15時点でalpha≈0.07）
+            // でも既にはっきり「影がある」と分かってしまい、体感的に「影だけ一瞬で出る」
+            // ように見えていた。影側だけ3乗のイージングを掛け、序盤はほぼ見えないまま
+            // 終盤で一気に濃くなるようにすることで、雲本体の体感的な出現速度に合わせた
+            const shadowProgress = progress * progress * progress;
+            cloud.userData.shadowBlob.userData.blobMaterial.opacity = shadowProgress * ASSEMBLY_CLOUD_SHADOW_MAX_ALPHA;
+            // フェードが完了した瞬間に本物の影へ切り替える（複数の雲の疑似影が重なって
+            // 濃さが積み重なるのを避けるため、定常状態では本物の影を使う）
+            if (cloud.userData.fadeElapsed >= ASSEMBLY_CLOUD_FADE_DURATION) {
+                enableAssemblyCloudShadow(cloud);
+            }
+        }
+    }
+    assemblyCloudSpawnTimer -= dt;
+    if (assemblyCloudSpawnTimer <= 0) {
+        // 流れてくる側（左端）よりもさらに外側から生やす
+        spawnAssemblyCloud(-assemblyCloudRange - ASSEMBLY_CLOUD_SPAWN_MARGIN);
+        assemblyCloudSpawnTimer = 2 + Math.random() * 3; // 次の生成までの間隔をランダムにする
+    }
+}
+
+// 木・草・花の生成・配置本体。トラックの外周（extentをASSEMBLY_DECORATION_MARGINぶん
+// 広げた範囲）のうち、grid上でレール/センサー/音符マットが無い（＝空いている）マスから
+// ランダムに間引いて選び、ランダムな種類（草が最も多く、花・木の順に少なくする）を
+// 生やす。曲・マップ設定が変わるたびrebuildAssemblyMeshes()から毎回呼び直され、
+// 前回ぶんは必ず一度破棄してから作り直す
+// 「グリッドエリアの周りにしか咲いていない、水平線の奥の方までまばらせないのか」との
+// 指摘で4→60に拡大した（地面プレーンは900x900と広いため、直近の数マスだけでなく
+// 遠景にも点在させることで奥行きのある景色にする）
+const ASSEMBLY_DECORATION_MARGIN = 120; // トラック外周に広げる範囲（マス）。「範囲を広げてください」との依頼で60→120に試験的に拡大
+// 「周りを囲っているように見える、もっとまばらに」との指摘で0.14→0.05に下げた
+// （グリッド外周のリング状の範囲は非常に長いため、密度を下げないと途切れ目のない
+// 壁のように見えてしまう）
+const ASSEMBLY_DECORATION_DENSITY = 0.05; // 空きマス1つあたりに何かを置く確率
+// 上記のASSEMBLY_DECORATION_MARGIN拡大（60→120）で対象エリアが約2.5倍になった分、
+// 合計個数の上限を固定していると花・草・木の密度が薄まって見えてしまう。「植物の
+// 上限は5倍」との指示で100→500に拡大
+const ASSEMBLY_DECORATION_MAX_COUNT = 500; // 大きなトラックでも重くなりすぎないための上限
+let assemblyDecorationMeshes = [];
+// 前回配置した時点のextent（トラックの形）を覚えておき、変わっていなければ
+// 再配置をスキップする（「何かの設定を変えるたびに植物や雲の再描画をやめたい」との
+// 指示のため。extentは曲・レール方向・段の幅など、実際にグリッドの形が変わる設定でしか
+// 変化しないので、それ以外の設定（色・カメラ等）を変更した際の無駄な再抽選を防げる）
+let assemblyDecorationsExtentSignature = null;
+
+// 除外すべき「グリッドエリア」は、トラックの生の矩形(extent)そのものではなく、
+// 3D画面に実際に表示される正方形グリッド（rebuildAssemblyMeshesのgridSize算出と
+// 同じ式：長辺+4を一辺とする正方形）に合わせる。トラックが細長い場合、extentの
+// 矩形だけを除外すると、正方形グリッドの中の余白部分にも装飾が生成されてしまい
+// 「グリッドの中に生えている」ように見える不具合があったため。木・草・花の配置と
+// 地面ブロックの色分けの両方で使う共通ロジックなのでヘルパーとして切り出した
+function computeAssemblyGridSquareBounds(extent) {
+    const gridCenterX = (extent.minX + extent.maxX) / 2;
+    const gridCenterY = (extent.minY + extent.maxY) / 2;
+    const gridHalf = (Math.max(extent.maxX - extent.minX, extent.maxY - extent.minY) + 4) / 2;
+    return {
+        gridMinX: gridCenterX - gridHalf, gridMaxX: gridCenterX + gridHalf,
+        gridMinY: gridCenterY - gridHalf, gridMaxY: gridCenterY + gridHalf,
+    };
+}
+
+// 「一列の最大レール数を変えると重い」との指摘を受けた計測で、3D再構築（平均約550ms）の
+// うち装飾（花・草・木）の生成だけで474ms（全体の約85%）を占め、特に花が単価1.56ms×191個で
+// 断トツに重いと判明。個々の花・草・木を毎回ゼロから手続き的に構築（花弁の配置計算等）する
+// のをやめ、「1マス分（1個）だけ本物を作ったら、あとは複製で使い回す」方式にした
+// （ユーザー了承済み：同じ種類の花/草/木は全部同じ形・同じ色になるが、位置・回転は
+// 複製後に個別設定するため従来通りバラバラになる）。Object3D.clone()はジオメトリ・
+// マテリアルを複製せず参照を共有するため、複製自体はほぼノーコストになる
+let assemblyFlowerClusterTemplate = null;
+let assemblyGrassTuftTemplate = null;
+let assemblyBroadleafTreeTemplate = null;
+let assemblyConiferTreeTemplate = null;
+function getAssemblyFlowerClusterInstance() {
+    if (!assemblyFlowerClusterTemplate) assemblyFlowerClusterTemplate = buildProceduralFlowerClusterMesh();
+    return assemblyFlowerClusterTemplate.clone();
+}
+function getAssemblyGrassTuftInstance() {
+    if (!assemblyGrassTuftTemplate) assemblyGrassTuftTemplate = buildProceduralGrassTuftMesh();
+    return assemblyGrassTuftTemplate.clone();
+}
+function getAssemblyBroadleafTreeInstance() {
+    if (!assemblyBroadleafTreeTemplate) assemblyBroadleafTreeTemplate = buildProceduralBroadleafTreeMesh();
+    return assemblyBroadleafTreeTemplate.clone();
+}
+function getAssemblyConiferTreeInstance() {
+    if (!assemblyConiferTreeTemplate) assemblyConiferTreeTemplate = buildProceduralConiferTreeMesh();
+    return assemblyConiferTreeTemplate.clone();
+}
+
+function generateAssemblyDecorations(extent, toWorld) {
+    // マテリアルはgetSharedDecorationMaterial()で色ごとに共有・キャッシュされているため
+    // （「装飾が重い」対策でマテリアル重複を無くした際に導入）、個々の装飾を破棄する時に
+    // マテリアルまでdispose()してしまうと、他の（まだ使用中の）装飾や次回以降の生成で
+    // 同じマテリアルを使う全ての装飾が壊れる。同様に、ジオメトリも今は花/草/木それぞれ
+    // 1個だけ本物を作って複製（Object3D.clone()、ジオメトリは参照共有）で使い回している
+    // ため、個々の装飾のジオメトリをdispose()すると、まだ使用中の他の複製や次回以降の
+    // 複製元（テンプレート）まで壊れてしまう。scene.remove()だけ行い、ジオメトリ・
+    // マテリアルどちらもdispose()しない
+    if (!mapSettings.showDecorations) {
+        assemblyDecorationMeshes.forEach(m => assemblyScene.remove(m));
+        assemblyDecorationMeshes = [];
+        assemblyDecorationsExtentSignature = null; // 次に表示をONにした時は必ず新しく配置し直す
+        return;
+    }
+    // extentが前回と変わっていなければ、既存の配置をそのまま維持する（無駄な再抽選をしない）
+    const signature = `${extent.minX},${extent.maxX},${extent.minY},${extent.maxY}`;
+    if (signature === assemblyDecorationsExtentSignature && assemblyDecorationMeshes.length > 0) return;
+    assemblyDecorationsExtentSignature = signature;
+
+    assemblyDecorationMeshes.forEach(m => assemblyScene.remove(m));
+    assemblyDecorationMeshes = [];
+
+    const { gridMinX, gridMaxX, gridMinY, gridMaxY } = computeAssemblyGridSquareBounds(extent);
+
+    // gridHalfが端数(奇数のgridSizeを2で割った場合など)になり得るため、外周の探索範囲は
+    // 整数グリッド座標を確実に網羅できるようfloor/ceilで丸める(内外判定自体はgridMinX等の
+    // 端数のまま比較して問題ない)
+    const minX = Math.floor(gridMinX - ASSEMBLY_DECORATION_MARGIN);
+    const maxX = Math.ceil(gridMaxX + ASSEMBLY_DECORATION_MARGIN);
+    const minY = Math.floor(gridMinY - ASSEMBLY_DECORATION_MARGIN);
+    const maxY = Math.ceil(gridMaxY + ASSEMBLY_DECORATION_MARGIN);
+
+    // 正方形グリッドの外側にある有効なマス目を全て洗い出す（「かならず、グリッドエリアと
+    // 同じような升目を意識して、1マスの中に1つの草や花が収まるように配置してください」
+    // との指示のため、花・草も含め全て整数グリッド座標に1個ずつ配置する。以前試した
+    // 「グリッドに縛られない自由配置」は明確に不要と指摘されたため撤回した）
+    const validCellKeys = [];
+    const validCellSet = new Set();
+    for (let gx = minX; gx <= maxX; gx++) {
+        for (let gy = minY; gy <= maxY; gy++) {
+            if (gx >= gridMinX && gx <= gridMaxX && gy >= gridMinY && gy <= gridMaxY) continue;
+            const key = `${gx},${gy}`;
+            // 「茶色ブロックには草ははやさないでください」との指摘対応。地面ブロック・池が
+            // 既に使っているマスには木・草・花を生やさない（どちらもこの時点で確定済み。
+            // generateAssemblyPonds/generateAssemblyGroundBlocksを先に呼んでいるため）
+            if (assemblyGroundBlockCellSet.has(key) || assemblyPondCellSet.has(key)) continue;
+            validCellKeys.push(key);
+            validCellSet.add(key);
+        }
+    }
+
+    // シードとなる候補マス（花・草・木の「群れ」の起点）を密度に応じて間引く
+    const seedKeys = validCellKeys.filter(() => Math.random() < ASSEMBLY_DECORATION_DENSITY);
+    // 端に偏らないようシャッフルしてから、上限に達するまで順に処理する
+    for (let i = seedKeys.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [seedKeys[i], seedKeys[j]] = [seedKeys[j], seedKeys[i]];
+    }
+
+    const usedCellSet = new Set();
+    let placedCount = 0;
+    for (const seedKey of seedKeys) {
+        if (placedCount >= ASSEMBLY_DECORATION_MAX_COUNT) break;
+        if (usedCellSet.has(seedKey)) continue; // 既に他の群れがこのマスを使っている
+        const [gx, gy] = seedKey.split(",").map(Number);
+
+        const roll = Math.random();
+        // 草が一番多く、次に花、木は控えめ。木は元々8%だったが、花・草がクラスタ化して
+        // 1シードあたり複数マスを消費するようになった影響で上限に達するまでに評価される
+        // シード数自体が減り、「木がまったく映っていない」という体感になっていたため20%に
+        // 引き上げた
+        const isTree = roll < 0.2;
+        const isFlower = !isTree && roll < 0.55;
+        // 「花や草は、1つではなく2〜4個、ランダムな形で密集していることが多い」との
+        // 指摘のため、花・草はシードのマスを含め近隣の未使用マスも使って2〜4マスへ広がる
+        // 群れにする（木は単体のまま）。1マスには必ず1個だけ収める
+        const clusterSize = isTree ? 1 : 2 + Math.floor(Math.random() * 3);
+
+        let neighborKeys = [];
+        if (clusterSize > 1) {
+            // 隣接マスをランダムな順で集める（「ランダムな形」）。「独立してしまっている
+            // （斜めはカウントしない）」との指摘のため、対角（8近傍）ではなく上下左右
+            // （4近傍）のみを隣接として扱う
+            const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+            for (const [dx, dy] of dirs) {
+                const key = `${gx + dx},${gy + dy}`;
+                if (validCellSet.has(key) && !usedCellSet.has(key)) neighborKeys.push(key);
+            }
+            for (let i = neighborKeys.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [neighborKeys[i], neighborKeys[j]] = [neighborKeys[j], neighborKeys[i]];
+            }
+        }
+        // 「花や草は、必ず1マス以上横に別の花や草が隣接しています」との指示のため、
+        // 隣接マス（上下左右）が1つも確保できなかった花・草のシードは孤立した1マス
+        // だけの株になってしまうので、その場合はこのシードを丸ごと使わない（孤立株を作らない）
+        if (!isTree && neighborKeys.length === 0) continue;
+
+        const cellKeys = [seedKey];
+        usedCellSet.add(seedKey);
+        for (let i = 0; i < clusterSize - 1 && i < neighborKeys.length; i++) {
+            cellKeys.push(neighborKeys[i]);
+            usedCellSet.add(neighborKeys[i]);
+        }
+        // 群れ（cellKeys）の途中で上限に達すると、種となったマスだけが配置され隣接する
+        // 仲間が配置されずに孤立してしまう（「花や草は、必ず1マス以上横に別の花や草が
+        // 隣接しています」という前提が崩れる）。そのため群れは全部まとめて置けるかを
+        // 先に確認し、置けない場合はこの群れを丸ごとスキップする（全部か無しか）
+        if (placedCount + cellKeys.length > ASSEMBLY_DECORATION_MAX_COUNT) continue;
+
+        for (const cellKey of cellKeys) {
+            const [cgx, cgy] = cellKey.split(",").map(Number);
+            // 木は広葉樹/針葉樹を半々でランダムに選ぶ
+            const mesh = isTree ? (Math.random() < 0.5 ? getAssemblyBroadleafTreeInstance() : getAssemblyConiferTreeInstance())
+                : isFlower ? getAssemblyFlowerClusterInstance()
+                : getAssemblyGrassTuftInstance();
+
+            // 花・木・草は全て下位層（MAP_LAYER_Z.lower）に配置する（「花や木は下位レイヤーに
+            // してください」→「草むらも下位レイヤーで」との指示）。
+            // Yは「下位層＝地面に接触する層」という実機の位置づけ（ユーザー確認済み）に合わせて
+            // 地面そのものの高さ(ASSEMBLY_GROUND_Y)を使う。MAP_LAYER_Z.lowerのY(-1)のままだと
+            // 地面との間に0.5の隙間が空き、影が足元から離れた位置にずれて落ちる不自然な見た目に
+            // なっていたため（木・花で先に対応済みの問題と同じ）
+            const base = toWorld(cgx, cgy, MAP_LAYER_Z.lower);
+            // 花・草は footprint がちょうど1マス分（はみ出ない範囲で目一杯）なので、
+            // 少しでもjitterを掛けるとマスからはみ出してしまう。「花も草も1マス内に
+            // はまっていません」との指摘を受け、花・草はjitterを掛けずマスの中心に
+            // 正確に置く。木は1マスぴったりである必要が無いため従来通り小さなjitterを残す
+            const jitterScale = isTree ? ASSEMBLY_CELL_SIZE * 0.6 : 0;
+            const jitterX = (Math.random() - 0.5) * jitterScale;
+            const jitterZ = (Math.random() - 0.5) * jitterScale;
+            mesh.position.set(base.x + jitterX, ASSEMBLY_GROUND_Y, base.z + jitterZ);
+            // 花・草は構築時点でX/Zの footprint を正方形に正規化しているが、任意角度で回転させると
+            // （形状自体は正方形の輪郭ではないため）回転後のワールド座標AABBが再び正方形からずれて
+            // しまう。90度刻みの回転ならローカルのX/Z軸が入れ替わるだけで正方形が保たれるため、
+            // 花・草はそれに限定する（「もうちょい正方形寄りで」「叢も同様」との指示）。
+            // 木は正方形である必要が無いため従来通り任意角度で回転させる
+            mesh.rotation.y = (isTree ? Math.random() * Math.PI * 2 : Math.floor(Math.random() * 4) * (Math.PI / 2));
+            // 「まだ草や花にばらつきがある」「升目いっぱいに出すことを忘れずに」との指摘のため、
+            // 草も含め花・木・草すべてランダムな拡大縮小を掛けない（サイズを毎回一定にする）。
+            // 以前は草だけランダムな大きさのばらつき(0.85〜1.15倍)を残していたが、
+            // これだと1マス丸ごとを埋めきれない（最大15%小さくなる）ことがあり、
+            // 「升目を意識できていない・密集できていない」ように見える一因になっていた
+            assemblyScene.add(mesh);
+            assemblyDecorationMeshes.push(mesh);
+            placedCount++;
+        }
+    }
+}
+
+// ============================================================
+// 地面ブロックの色分け。「ぽこあポケモンのように、グリッドエリアより外側に対し、
+// 地面のブロックの色をランダムで変えてほしい。黄土色で、必ず1マス以上同じ黄土色の
+// ブロックと隣接したランダムな配置にしてほしい」との依頼。当初は合計10〜100個の
+// 「群れ」をまばらに撒く方式だったが、「全然増えていない」「見えている陸の3分の2
+// くらい茶色でいい」との指摘で、面積そのものを大きく塗るスケールに作り直した。
+// 木・草・花と同じ「グリッド外側のマスを使う」考え方だが、こちらは装飾物を生やすの
+// ではなく、地面そのものの色を1マス単位で塗り替える（薄い正方形の板を地面に重ねる）。
+// 対象マス数が数千〜数万に達しうるため、個別Meshではなく1つのInstancedMeshにまとめて
+// 描画負荷を抑える
+// ============================================================
+const ASSEMBLY_GROUND_BLOCK_COLOR = 0xd6b678; // 黄土色。「もう少し薄くていい」との指示で0xc19a49より明るく淡い色に調整
+// 「見えている陸の3分の2くらい茶色でいい」→「半分程度にしてください」→「3分の1にしてみて
+// ください」と段階的に調整された、対象マスのうち茶色にする割合
+const ASSEMBLY_GROUND_BLOCK_FILL_FRACTION = 1 / 3;
+// 「地面は一回の描画（InstancedMesh）なら、目に見えている陸全部に反映してほしい」との
+// 指示で、木・草・花のASSEMBLY_DECORATION_MARGIN（120マス、合計個数上限があるため
+// 広げすぎると密度が薄まる制約がある）とは別に、地面ブロック専用のより広いマージンを
+// 用意した。地面ブロックは合計個数の上限が無く1回の描画で済むため、広げても表示コストは
+// 増えない（生成コスト・メモリだけがマス数に応じて増える）
+const ASSEMBLY_GROUND_BLOCK_MARGIN = 300;
+// 極端に大きなトラックでもタイル数が暴走しないための安全上限（これを超える場合は
+// フラクションを維持できる範囲まで対象マス数を絞る＝マージンいっぱいまでは広がらず
+// グリッドに近い側から優先して塗られる）。
+// 「途中でカクっとなる」というデグレ報告の調査中、ASSEMBLY_GROUND_BLOCK_MARGIN=300が
+// 大きすぎて、トラックの規模に関わらずほぼ常にこの上限（当初150,000）に張り付いた
+// 状態になっていたことが判明した（小さいデフォルトのトラックでも150,000枚に到達）。
+// 上限が「滅多に発動しない安全弁」ではなく「常に効いている実質的な固定値」になって
+// しまっており、装飾（500個）と合わせて描画負荷が常に高い状態が続いていた。
+// カメラの不具合そのものとは別の切り分けだが、確実に負荷を下げられる対策として
+// 上限を150,000→30,000に引き下げた（生成時のBFS成長ループもこの上限で打ち切られる
+// ため、GPU側のインスタンス数だけでなくCPU側の生成コストも下がる）
+const ASSEMBLY_GROUND_BLOCK_MAX_INSTANCES = 30000;
+let assemblyGroundBlockMesh = null;
+let assemblyGroundBlockGeometry = null;
+let assemblyGroundBlockMaterial = null;
+// 木・草・花と同じ理由（「何かの設定を変えるたびに再描画をやめたい」）で、extentが
+// 前回と変わっていなければ再配置をスキップする
+let assemblyGroundBlocksExtentSignature = null;
+
+// 「茶色のところは参考写真を参考にしてほしい」との依頼を受け、当初はブロック1枚1枚に
+// アトラス状の模様テクスチャ・ランダム回転・色ムラを持たせる作り込んだ実装を試したが、
+// 「一回元に戻して、斑点だけつければいい」との指摘で撤回。ブロック自体は元のベタ塗り単色
+// InstancedMeshのまま維持し、参考写真の黒い斑点だけを、その上に重ねる別の小さな
+// InstancedMesh（黒い円板、まばらな一部のブロックにだけ乗せる）として追加する方式にした
+// 「黒が強調しすぎ、もっと小さい点でいい、色も茶色よりほんの少し黒っぽい感じでいい」との
+// 指摘で、真っ黒ではなくブロック本体の色を暗くしただけの色に、サイズも小さく調整した
+const ASSEMBLY_GROUND_SPOT_DARKEN = 0.4; // ブロック本体の色にこの倍率を掛けて少し暗くするだけ（真っ黒にしない）。「ちょっと見えるかな程度」との指摘で0.55→0.4に
+// 「点々を増やしてください」→「もうちょっとふやして」と段階的に引き上げ、0.05→0.15→0.25に
+const ASSEMBLY_GROUND_SPOT_FRACTION = 0.25; // ブロックのうち斑点を乗せる割合
+// 「今の点を最大として、大中小をもう少し散らしてほしい」との指摘で、固定半径から
+// MIN〜MAXのランダムな大中小に変更した（MAXはこれまでの固定値0.05のまま）
+// 「もうちょっと茶色の粒大きくてもいいかも」との指摘で0.05/0.02→0.07/0.03に引き上げ
+const ASSEMBLY_GROUND_SPOT_RADIUS_MAX = 0.07;
+const ASSEMBLY_GROUND_SPOT_RADIUS_MIN = 0.03;
+let assemblyGroundSpotMesh = null;
+let assemblyGroundSpotGeometry = null;
+let assemblyGroundSpotMaterial = null;
+// 「茶色ブロックには草ははやさないでください」との指摘対応。地面ブロック（brownSet）が
+// 使っているマス目を、木・草・花の配置（generateAssemblyDecorations）が避けられるよう、
+// 生成結果を外から参照できる形で保持しておく（rebuildAssemblyMeshes側で地面ブロックを
+// 木・草・花より先に生成させ、こちらを先に確定させる必要がある）
+let assemblyGroundBlockCellSet = new Set();
+
+function generateAssemblyGroundBlocks(extent, toWorld, grid) {
+    const signature = `${extent.minX},${extent.maxX},${extent.minY},${extent.maxY}`;
+    if (signature === assemblyGroundBlocksExtentSignature && assemblyGroundBlockMesh) return;
+    assemblyGroundBlocksExtentSignature = signature;
+
+    if (assemblyGroundBlockMesh) {
+        assemblyScene.remove(assemblyGroundBlockMesh);
+        assemblyGroundBlockMesh = null;
+    }
+    if (assemblyGroundBlockGeometry) assemblyGroundBlockGeometry.dispose();
+    if (assemblyGroundBlockMaterial) assemblyGroundBlockMaterial.dispose();
+    if (assemblyGroundSpotMesh) {
+        assemblyScene.remove(assemblyGroundSpotMesh);
+        assemblyGroundSpotMesh = null;
+    }
+    if (assemblyGroundSpotGeometry) assemblyGroundSpotGeometry.dispose();
+    if (assemblyGroundSpotMaterial) assemblyGroundSpotMaterial.dispose();
+
+    const { gridMinX, gridMaxX, gridMinY, gridMaxY } = computeAssemblyGridSquareBounds(extent);
+    const minX = Math.floor(gridMinX - ASSEMBLY_GROUND_BLOCK_MARGIN);
+    const maxX = Math.ceil(gridMaxX + ASSEMBLY_GROUND_BLOCK_MARGIN);
+    const minY = Math.floor(gridMinY - ASSEMBLY_GROUND_BLOCK_MARGIN);
+    const maxY = Math.ceil(gridMaxY + ASSEMBLY_GROUND_BLOCK_MARGIN);
+    // 「グリッドエリアでも茶色が混ざってもいい」との指摘で、以前の「グリッドの正方形の
+    // 内側は完全に除外する」判定をやめ、実際にレール・センサー・音符マットが存在する
+    // マスだけを避けるようにした（gridの各キーは"gx,gy,gz"で、レールは3層に複製されている
+    // ため、layerを無視してgx,gyだけを集めればよい）
+    const occupiedCellSet = new Set();
+    for (const key of grid.keys()) {
+        const parts = key.split(",");
+        occupiedCellSet.add(`${parts[0]},${parts[1]}`);
+    }
+    // 池の上に地面ブロックが重ならないよう、池が使っているマス目（assemblyPondCellSet、
+    // generateAssemblyPondsを地面ブロックより先に呼ぶことでこの時点で確定済み）も避ける
+    const isAvailableCell = (gx, gy) => {
+        const key = `${gx},${gy}`;
+        return !occupiedCellSet.has(key) && !assemblyPondCellSet.has(key);
+    };
+    const isInSearchArea = (gx, gy) => gx >= minX && gx <= maxX && gy >= minY && gy <= maxY;
+
+    // 対象マス数は非常に大きくなりうる（マージン300マス四方）ため、木・草・花のように
+    // 全マスを配列に洗い出す（O(マージン^2)のループ+配列確保）のは避け、面積を掛け算だけで
+    // 算出する。シードも「配列から取り出す」のではなく「範囲内の座標を乱数で直接引いて、
+    // 実際に使われていないマスか確認する（ダメなら引き直す）」という乱数の当たり外れ方式に
+    // することで、実際に使うマス数（targetFillCount、上限あり）に近い計算量だけで済むようにした
+    const totalOuterCells = (maxX - minX + 1) * (maxY - minY + 1);
+    const totalAvailableCells = Math.max(0, totalOuterCells - occupiedCellSet.size);
+    const targetFillCount = Math.min(
+        Math.round(totalAvailableCells * ASSEMBLY_GROUND_BLOCK_FILL_FRACTION),
+        ASSEMBLY_GROUND_BLOCK_MAX_INSTANCES
+    );
+
+    // 各マスを独立に確率判定するだけだと細かい斑点模様（ノイズ）になってしまい、
+    // 「見えている陸の3分の2くらい茶色でいい」という自然な地形の塊には見えなかった。
+    // そこで複数のシード地点から同時に波状に広がるBFSで育てる方式を試したが、全シードが
+    // 同じ速度で同時に育つため、どれも似たような大きさの円形に近い塊ばかりになり、
+    // 「ワンパターンのみで面白くない、いろんな形があっていい」との指摘を受けた。
+    // 修正として、塊を1つずつ順番に育てる方式に変更。各塊ごとに目標マス数を
+    // （小さな点状〜大きく入り組んだ塊まで）大きくばらつかせ、育て方も「フロンティアを
+    // 一度に全部広げる」のではなく「フロンティアの中からランダムに1マスだけ選んで
+    // 隣へ1マス伸ばす」を繰り返す方式（花・草の群れ作りと同じ考え方）にすることで、
+    // 円形ではなく蛇行した不規則な輪郭の塊になり、塊どうしの形・大きさに変化が出る
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+
+    const brownSet = new Set();
+    let seedGuard = 0;
+    const maxSeedGuard = targetFillCount * 20 + 5000; // シード探索の空振り上限（無限ループ対策）
+    while (brownSet.size < targetFillCount && seedGuard < maxSeedGuard) {
+        seedGuard++;
+        // 範囲内の座標を直接乱数で引き、実際に使われていない（レール・センサー・音符マットが
+        // 無い）マスだけをシードにする
+        const candidate = [
+            minX + Math.floor(Math.random() * (maxX - minX + 1)),
+            minY + Math.floor(Math.random() * (maxY - minY + 1)),
+        ];
+        if (!isAvailableCell(candidate[0], candidate[1])) continue;
+        const seed = brownSet.has(`${candidate[0]},${candidate[1]}`) ? null : candidate;
+        if (!seed) continue;
+
+        // 塊1つあたりの目標マス数を、小さいものが多く・大きいものも時々混ざるよう
+        // べき乗分布ふうに決める（Math.random()**3で0付近に偏らせつつ、稀に大きな
+        // 値も出るようにする）。これで点状の小さな塊から広く入り組んだ塊まで混在する
+        const remaining = targetFillCount - brownSet.size;
+        const patchTarget = Math.max(1, Math.min(remaining, Math.round(2 + Math.pow(Math.random(), 3) * 350)));
+
+        const seedKey = `${seed[0]},${seed[1]}`;
+        brownSet.add(seedKey);
+        let patchCount = 1;
+        const frontier = [seed];
+        while (patchCount < patchTarget && frontier.length > 0) {
+            const idx = Math.floor(Math.random() * frontier.length);
+            const [gx, gy] = frontier[idx];
+            const shuffledDirs = shuffleArray(dirs);
+            let extended = false;
+            for (const [dx, dy] of shuffledDirs) {
+                const nx = gx + dx, ny = gy + dy;
+                const key = `${nx},${ny}`;
+                if (isInSearchArea(nx, ny) && isAvailableCell(nx, ny) && !brownSet.has(key)) {
+                    brownSet.add(key);
+                    frontier.push([nx, ny]);
+                    patchCount++;
+                    extended = true;
+                    break;
+                }
+            }
+            if (!extended) frontier.splice(idx, 1); // これ以上広げられないマスは候補から外す
+        }
+    }
+    assemblyGroundBlockCellSet = brownSet; // 木・草・花側が避けられるよう公開する
+
+    assemblyGroundBlockGeometry = new THREE.PlaneGeometry(ASSEMBLY_CELL_SIZE, ASSEMBLY_CELL_SIZE);
+    // 「茶色の床ブロックがちらついて見える」との指摘（z-fighting）のため、地面からの
+    // 高さの余白を0.003→0.02に広げ、さらにGPU側のポリゴンオフセット（奥行きをカメラ側へ
+    // わずかにずらす、z-fighting対策の定番）も併用して確実に手前に描画されるようにした
+    assemblyGroundBlockMaterial = new THREE.MeshStandardMaterial({
+        color: ASSEMBLY_GROUND_BLOCK_COLOR, roughness: 0.95,
+        polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4,
+    });
+    assemblyGroundBlockMesh = new THREE.InstancedMesh(assemblyGroundBlockGeometry, assemblyGroundBlockMaterial, brownSet.size);
+    assemblyGroundBlockMesh.receiveShadow = true;
+    const dummy = new THREE.Object3D();
+    dummy.rotation.x = -Math.PI / 2;
+    let idx = 0;
+    for (const key of brownSet) {
+        const [gx, gy] = key.split(",").map(Number);
+        const world = toWorld(gx, gy, MAP_LAYER_Z.middle);
+        dummy.position.set(world.x, ASSEMBLY_GROUND_Y + 0.02, world.z);
+        dummy.updateMatrix();
+        assemblyGroundBlockMesh.setMatrixAt(idx++, dummy.matrix);
+    }
+    assemblyScene.add(assemblyGroundBlockMesh);
+
+    // 斑点。ブロックの一部（ASSEMBLY_GROUND_SPOT_FRACTION）にだけ、まばらに小さな円板を
+    // 重ねる。ブロック本体の色・材質は変更しない
+    const spotKeys = [...brownSet].filter(() => Math.random() < ASSEMBLY_GROUND_SPOT_FRACTION);
+    if (spotKeys.length > 0) {
+        // 半径1の円を1つだけ作り、インスタンスごとにscaleで大中小を表現する
+        // （個体ごとに違うジオメトリを用意しなくて済む）
+        assemblyGroundSpotGeometry = new THREE.CircleGeometry(1, 12);
+        const spotColor = new THREE.Color(ASSEMBLY_GROUND_BLOCK_COLOR).multiplyScalar(ASSEMBLY_GROUND_SPOT_DARKEN);
+        assemblyGroundSpotMaterial = new THREE.MeshBasicMaterial({
+            color: spotColor,
+            polygonOffset: true, polygonOffsetFactor: -8, polygonOffsetUnits: -8,
+        });
+        assemblyGroundSpotMesh = new THREE.InstancedMesh(assemblyGroundSpotGeometry, assemblyGroundSpotMaterial, spotKeys.length);
+        const spotDummy = new THREE.Object3D();
+        spotDummy.rotation.x = -Math.PI / 2;
+        let spotIdx = 0;
+        for (const key of spotKeys) {
+            const [gx, gy] = key.split(",").map(Number);
+            const world = toWorld(gx, gy, MAP_LAYER_Z.middle);
+            // ブロックの中心からわずかにずらし、マス目に整列した並びに見えないようにする
+            const jitterX = (Math.random() - 0.5) * 0.4;
+            const jitterZ = (Math.random() - 0.5) * 0.4;
+            spotDummy.position.set(world.x + jitterX, ASSEMBLY_GROUND_Y + 0.03, world.z + jitterZ);
+            const radius = ASSEMBLY_GROUND_SPOT_RADIUS_MIN + Math.random() * (ASSEMBLY_GROUND_SPOT_RADIUS_MAX - ASSEMBLY_GROUND_SPOT_RADIUS_MIN);
+            spotDummy.scale.setScalar(radius);
+            spotDummy.updateMatrix();
+            assemblyGroundSpotMesh.setMatrixAt(spotIdx++, spotDummy.matrix);
+        }
+        assemblyScene.add(assemblyGroundSpotMesh);
+    }
+}
+
+// ============================================================
+// 池。「池を大・中で2個作ってください、場所はランダム」→「池も、土と同じようなブロックの
+// 塊です。ただし、陸より1マス下げてください」との依頼で追加・作り直した。初版は雲と同じ
+// 「円盤を重ねる」有機的な輪郭だったが、指摘を受け、地面ブロック（generateAssemblyGroundBlocks）
+// と全く同じ「グリッド1マス単位の正方形タイルをBFSで塊状に育てる」方式に作り直し、
+// 陸（ASSEMBLY_GROUND_Y）より1マス(ASSEMBLY_CELL_SIZE)下げた高さに沈めることで、
+// 池が周りの陸より低い窪地に見えるようにした
+// ============================================================
+const ASSEMBLY_POND_SIZES = [280, 140, 70]; // 大・中・小それぞれの目標マス数
+const ASSEMBLY_POND_COLOR = 0x4a90d9;
+// トラック（グリッド正方形）の外周からの距離の範囲（マス）。近すぎるとトラックに重なり、
+// 遠すぎると視界から外れて見えなくなるため、両方に制限を設ける
+const ASSEMBLY_POND_MIN_DISTANCE_FROM_TRACK = 15;
+const ASSEMBLY_POND_MAX_DISTANCE_FROM_TRACK = 60;
+let assemblyPondMesh = null;
+let assemblyPondGeometry = null;
+let assemblyPondMaterial = null;
+let assemblyPondWallMesh = null;    // 池の縁の「崖」を隠す水色の壁（下記generateAssemblyPonds末尾参照）
+let assemblyPondWallGeometry = null;
+let assemblyPondsExtentSignature = null;
+// 地面ブロック（generateAssemblyGroundBlocks）・木/草/花（generateAssemblyDecorations）が
+// 池の上に重ならないよう避けられるようにするため、使用中のマス目を外から参照できる形で
+// 保持しておく（generateAssemblyPondsをそれらより先に呼ぶ必要がある）
+let assemblyPondCellSet = new Set();
+
+function generateAssemblyPonds(extent, toWorld) {
+    const signature = `${extent.minX},${extent.maxX},${extent.minY},${extent.maxY}`;
+    if (signature === assemblyPondsExtentSignature && assemblyPondMesh) return;
+    assemblyPondsExtentSignature = signature;
+
+    if (assemblyPondMesh) {
+        assemblyScene.remove(assemblyPondMesh);
+        assemblyPondMesh = null;
+    }
+    if (assemblyPondWallMesh) {
+        assemblyScene.remove(assemblyPondWallMesh);
+        assemblyPondWallMesh = null;
+    }
+    if (assemblyPondGeometry) assemblyPondGeometry.dispose();
+    if (assemblyPondWallGeometry) assemblyPondWallGeometry.dispose();
+    if (assemblyPondMaterial) assemblyPondMaterial.dispose();
+
+    const { gridMinX, gridMaxX, gridMinY, gridMaxY } = computeAssemblyGridSquareBounds(extent);
+    const gridCenterX = (gridMinX + gridMaxX) / 2;
+    const gridCenterY = (gridMinY + gridMaxY) / 2;
+    // グリッド外周（正方形）を確実に包む円の半径（対角線の半分）
+    const gridHalf = Math.max(gridMaxX - gridMinX, gridMaxY - gridMinY) / 2 * Math.SQRT2;
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    // BFSでの成長時、トラック（グリッド正方形）の内側へ向かって伸びてしまうと池がレール・
+    // 音符マットに重なってしまうため、正方形の外側のマスにしか広がれないようにする
+    const isOutsideGridSquare = (gx, gy) => !(gx >= gridMinX && gx <= gridMaxX && gy >= gridMinY && gy <= gridMaxY);
+
+    const pondSet = new Set();
+    ASSEMBLY_POND_SIZES.forEach(targetCells => {
+        // シード探索: グリッド外周からMIN〜MAX距離のリング上のランダムな1マスを探す
+        // （地面ブロックと違い、池は個数も位置の自由度も小さいため、単純なリトライ方式で十分）
+        let seed = null;
+        for (let attempt = 0; attempt < 200 && !seed; attempt++) {
+            const angle = Math.random() * Math.PI * 2;
+            const dist = gridHalf + ASSEMBLY_POND_MIN_DISTANCE_FROM_TRACK
+                + Math.random() * (ASSEMBLY_POND_MAX_DISTANCE_FROM_TRACK - ASSEMBLY_POND_MIN_DISTANCE_FROM_TRACK);
+            const gx = Math.round(gridCenterX + Math.cos(angle) * dist);
+            const gy = Math.round(gridCenterY + Math.sin(angle) * dist);
+            const key = `${gx},${gy}`;
+            if (!pondSet.has(key)) seed = [gx, gy];
+        }
+        if (!seed) return;
+
+        // 地面ブロックと同じBFS成長（フロンティアからランダムに1マス選び隣へ1マス伸ばす）
+        const seedKey = `${seed[0]},${seed[1]}`;
+        pondSet.add(seedKey);
+        let count = 1;
+        const frontier = [seed];
+        while (count < targetCells && frontier.length > 0) {
+            const idx = Math.floor(Math.random() * frontier.length);
+            const [gx, gy] = frontier[idx];
+            const shuffledDirs = shuffleArray(dirs);
+            let extended = false;
+            for (const [dx, dy] of shuffledDirs) {
+                const nx = gx + dx, ny = gy + dy;
+                const key = `${nx},${ny}`;
+                if (!pondSet.has(key) && isOutsideGridSquare(nx, ny)) {
+                    pondSet.add(key);
+                    frontier.push([nx, ny]);
+                    count++;
+                    extended = true;
+                    break;
+                }
+            }
+            if (!extended) frontier.splice(idx, 1);
+        }
+    });
+    assemblyPondCellSet = pondSet;
+    if (pondSet.size === 0) return;
+
+    assemblyPondGeometry = new THREE.PlaneGeometry(ASSEMBLY_CELL_SIZE, ASSEMBLY_CELL_SIZE);
+    // metalness付きだと環境マップが無いため反射が真っ黒に近く沈んで見えてしまい、さらに
+    // 陸より1マス低い窪地のため周りの陸に遮られて影が落ちやすく、思った以上に暗くなって
+    // いた（実測で確認）。metalnessをやめ、素直な拡散反射だけの水色にした
+    assemblyPondMaterial = new THREE.MeshStandardMaterial({
+        color: ASSEMBLY_POND_COLOR, roughness: 0.6, metalness: 0,
+        polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4,
+    });
+    assemblyPondMesh = new THREE.InstancedMesh(assemblyPondGeometry, assemblyPondMaterial, pondSet.size);
+    assemblyPondMesh.receiveShadow = true;
+    const dummy = new THREE.Object3D();
+    dummy.rotation.x = -Math.PI / 2;
+    let idx = 0;
+    for (const key of pondSet) {
+        const [gx, gy] = key.split(",").map(Number);
+        const world = toWorld(gx, gy, MAP_LAYER_Z.middle);
+        // 「陸より1マス下げてください」との指定通り、地面ブロック(ASSEMBLY_GROUND_Y+0.02)より
+        // ASSEMBLY_CELL_SIZE(=1マス)ぶん低い高さに沈める
+        dummy.position.set(world.x, ASSEMBLY_GROUND_Y - ASSEMBLY_CELL_SIZE + 0.02, world.z);
+        dummy.updateMatrix();
+        assemblyPondMesh.setMatrixAt(idx++, dummy.matrix);
+    }
+    assemblyScene.add(assemblyPondMesh);
+
+    // 「1マス下げて青、それだけ」のつもりが、陸〜水面間の切り立った崖に壁が無いため、
+    // 斜めから見ると崖の隙間から背景（空）が覗いて白っぽく見えてしまっていた
+    // （「湖の白いところ？」との指摘で判明。真上から見ないと気付きにくいバグだった）。
+    // 当初は境界の辺1つにつき独立した1枚の板（InstancedMesh）を置く方式にしたが、
+    // 池の輪郭が1マス単位でかなりギザギザなため、板同士がバラバラの独立した面として
+    // 描画され「くし状に割れた」ような見た目になってしまった（「池のふちがおかしいかも」
+    // との指摘で判明）。輪郭を1本の連続した多角形（複数の池があれば複数ループ）として
+    // 抽出し、角も含めて頂点を共有する1枚の連続したメッシュへ組み立てることで解消する。
+    //
+    // 各マスの4隅を、隣接マスと整数座標を共有できるよう2倍のグリッド座標（奇数の整数）で
+    // 表す（マス(gx,gy)の4隅は(2gx±1, 2gy±1)）。露出している辺（池ではない隣接マスと接する
+    // 辺）を頂点グラフとして集め、次数2（通常）の頂点を辿って閉じたループへ分解する
+    const cornerGraph = new Map(); // "cx,cy" -> { pos:[cx,cy], neighbors:[key,...] }
+    const edgeOutward = new Map(); // "kA|kB"(ソート済み) -> [dx,dy]（このマスから見た外向き）
+    const edgeId = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
+    const addCorner = (cx, cy) => {
+        const k = `${cx},${cy}`;
+        if (!cornerGraph.has(k)) cornerGraph.set(k, { pos: [cx, cy], neighbors: [] });
+        return k;
+    };
+    for (const key of pondSet) {
+        const [gx, gy] = key.split(",").map(Number);
+        for (const [dx, dy] of dirs) {
+            if (pondSet.has(`${gx + dx},${gy + dy}`)) continue;
+            let c1, c2;
+            if (dx === 1) { c1 = [2 * gx + 1, 2 * gy - 1]; c2 = [2 * gx + 1, 2 * gy + 1]; }
+            else if (dx === -1) { c1 = [2 * gx - 1, 2 * gy - 1]; c2 = [2 * gx - 1, 2 * gy + 1]; }
+            else if (dy === 1) { c1 = [2 * gx - 1, 2 * gy + 1]; c2 = [2 * gx + 1, 2 * gy + 1]; }
+            else { c1 = [2 * gx - 1, 2 * gy - 1]; c2 = [2 * gx + 1, 2 * gy - 1]; }
+            const k1 = addCorner(...c1), k2 = addCorner(...c2);
+            cornerGraph.get(k1).neighbors.push(k2);
+            cornerGraph.get(k2).neighbors.push(k1);
+            edgeOutward.set(edgeId(k1, k2), [dx, dy]);
+        }
+    }
+    // 未訪問の辺が無くなるまで、閉じたループを1つずつ切り出す（池が複数あれば複数ループになる）。
+    // 稀に池の形が対角線上でしか接しない「ピンチポイント」（次数4の頂点）ができることがあるが、
+    // その場合は単に最初に見つかった未訪問の辺へ進む（見た目への影響はごく軽微）
+    const edgeVisited = new Set();
+    const loops = [];
+    for (const [startKey, startNode] of cornerGraph) {
+        for (const firstNext of startNode.neighbors) {
+            const firstId = edgeId(startKey, firstNext);
+            if (edgeVisited.has(firstId)) continue;
+            edgeVisited.add(firstId);
+            const loop = [startKey];
+            let curKey = firstNext;
+            let guard = 0;
+            while (curKey !== startKey && guard++ < 100000) {
+                loop.push(curKey);
+                const curNode = cornerGraph.get(curKey);
+                let nextKey = null;
+                for (const cand of curNode.neighbors) {
+                    if (edgeVisited.has(edgeId(curKey, cand))) continue;
+                    nextKey = cand;
+                    break;
+                }
+                if (nextKey == null) break;
+                edgeVisited.add(edgeId(curKey, nextKey));
+                curKey = nextKey;
+            }
+            if (loop.length >= 3) loops.push(loop);
+        }
+    }
+
+    // 各ループを、頂点を共有する連続したリボン状の崖メッシュ（三角形2枚/辺）に変換する。
+    // 三角形の頂点順（＝法線の向き）は、辺ごとに記録しておいた本来の外向き方向
+    // （edgeOutward）と実際の法線を外積で比較し、一致する向きになるよう個別に選ぶ
+    // （ループを辿る方向が辺ごとに一定とは限らないため、辺単位で安全に判定する）
+    const wallTopY = ASSEMBLY_GROUND_Y + 0.02;
+    const wallBottomY = ASSEMBLY_GROUND_Y - ASSEMBLY_CELL_SIZE + 0.02;
+    const wallPositions = [];
+    loops.forEach(loopKeys => {
+        const n = loopKeys.length;
+        for (let i = 0; i < n; i++) {
+            const k1 = loopKeys[i], k2 = loopKeys[(i + 1) % n];
+            const outward = edgeOutward.get(edgeId(k1, k2));
+            if (!outward) continue; // ループを閉じるための最後の辺が元の境界辺と一致しない場合はスキップ
+            const [cx1, cy1] = cornerGraph.get(k1).pos;
+            const [cx2, cy2] = cornerGraph.get(k2).pos;
+            const w1 = toWorld(cx1 / 2, cy1 / 2, MAP_LAYER_Z.middle);
+            const w2 = toWorld(cx2 / 2, cy2 / 2, MAP_LAYER_Z.middle);
+            const e1 = [0, wallBottomY - wallTopY, 0];
+            const e2 = [w2.x - w1.x, wallBottomY - wallTopY, w2.z - w1.z];
+            const normalX = e1[1] * e2[2] - e1[2] * e2[1];
+            const normalZ = e1[0] * e2[1] - e1[1] * e2[0];
+            const forward = normalX * outward[0] + normalZ * outward[1] >= 0;
+            const top1 = [w1.x, wallTopY, w1.z], bot1 = [w1.x, wallBottomY, w1.z];
+            const top2 = [w2.x, wallTopY, w2.z], bot2 = [w2.x, wallBottomY, w2.z];
+            const quad = forward
+                ? [...top1, ...bot1, ...bot2, ...top1, ...bot2, ...top2]
+                : [...bot1, ...top1, ...bot2, ...top1, ...top2, ...bot2];
+            wallPositions.push(...quad);
+        }
+    });
+
+    if (wallPositions.length > 0) {
+        assemblyPondWallGeometry = new THREE.BufferGeometry();
+        assemblyPondWallGeometry.setAttribute("position", new THREE.Float32BufferAttribute(wallPositions, 3));
+        assemblyPondWallGeometry.computeVertexNormals();
+        assemblyPondWallMesh = new THREE.Mesh(assemblyPondWallGeometry, assemblyPondMaterial);
+        assemblyScene.add(assemblyPondWallMesh);
+    }
+}
+
+// 「池が一つも表示されていません。陸が上に表示されていないと見えないので、そのせいですかね？」
+// との指摘で判明: 陸（assemblyGroundMesh）は900×900の穴の無い1枚の板で、池は「陸より1マス
+// 下げる」との指定通りその板よりさらに低い高さに沈めているため、上から見ると常に陸の板
+// そのものに完全に隠れて池が一切見えなくなっていた（ユーザー自身の見立て通りの原因）。
+// 板のジオメトリを池の形に合わせて毎回切り抜くのは重く複雑なため、alphaMap（透明度だけの
+// 別テクスチャ）で「池のマスだけ透明にする」穴あきマスクを作り、陸の板のその部分だけ
+// 透過させて下にある池を見せる方式にした（色用のmap/グラス模様テクスチャとは独立した
+// スロットなので、地面の色・模様設定とは干渉しない）
+// 512だと900マス四方の板全体に対して1マス=0.57pxしか無く、下の穴の大きさ計算の
+// Math.max(1,...)フロアが常に働いて「1マス分の穴のつもりが実際は3.5マス分」に
+// 膨れ上がり、池の周りに実際の水面より大きく地面が透けた縁（背景が透けて白っぽく
+// 見える）ができてしまっていた（「湖の白いところ？」との指摘で判明、実測で確認済み）。
+// 1マスが十分な解像度（2px強）を持つよう引き上げて解消する
+const ASSEMBLY_GROUND_HOLE_TEXTURE_SIZE = 2048;
+let assemblyGroundHoleTexture = null;
+
+function updateAssemblyGroundHoles(pondCellSet, toWorld) {
+    if (!assemblyGroundMesh) return;
+    const size = ASSEMBLY_GROUND_HOLE_TEXTURE_SIZE;
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "white"; // 不透明＝穴なし
+    ctx.fillRect(0, 0, size, size);
+
+    if (pondCellSet.size > 0) {
+        ctx.fillStyle = "black"; // 透明＝穴（alphaTest=0.5で切り抜く）
+        // PlaneGeometry(900,900)をrotation.x=-90度で寝かせているため、
+        // ワールドのX→キャンバスX、ワールドのZ→キャンバスYへそのまま対応する
+        // （実機で実測して確認済み。詳細はproject_pokoa_map_tab_spec参照）
+        const pxPerUnit = size / ASSEMBLY_GROUND_PLANE_SIZE;
+        const half = ASSEMBLY_GROUND_PLANE_SIZE / 2;
+        // 継ぎ目に隙間が出ないよう1px弱だけ余裕を持たせる（解像度を上げたことで、この
+        // 余裕が実際のマスサイズに対して不釣り合いに大きくならないようにした）
+        const cellPx = ASSEMBLY_CELL_SIZE * pxPerUnit + 0.75;
+        for (const key of pondCellSet) {
+            const [gx, gy] = key.split(",").map(Number);
+            const world = toWorld(gx, gy, MAP_LAYER_Z.middle);
+            const px = (world.x + half) * pxPerUnit;
+            const py = (world.z + half) * pxPerUnit;
+            ctx.fillRect(px - cellPx / 2, py - cellPx / 2, cellPx, cellPx);
+        }
+    }
+
+    if (assemblyGroundHoleTexture) assemblyGroundHoleTexture.dispose();
+    assemblyGroundHoleTexture = new THREE.CanvasTexture(canvas);
+    assemblyGroundMesh.material.alphaMap = pondCellSet.size > 0 ? assemblyGroundHoleTexture : null;
+    assemblyGroundMesh.material.needsUpdate = true;
+}
+
+let assemblyTrolleyBodyModelLoadStarted = false;
+let assemblyTrolleyIcon2DDataURL = null;
+let assemblyTrolleyBodyModel = null;
+
+// buildProceduralTrolleyMesh()自体はシーン非依存の純粋なジオメトリ構築のため、
+// このスケール算出（幅=1マスに正規化する倍率）も3Dタブを開く前から計算できる。
+// キャラクター（models/char.glb）のプリロードをタブ非依存で開始できるようにするため、
+// loadAssemblyTrolleyBodyModel()と共通のヘルパーとして切り出した（一度計算したら使い回す）
+let assemblyTrolleyFootprintScaleCache = null;
+function getAssemblyTrolleyFootprintScale() {
+    if (assemblyTrolleyFootprintScaleCache != null) return assemblyTrolleyFootprintScaleCache;
+    const probe = buildProceduralTrolleyMesh();
+    const box = new THREE.Box3().setFromObject(probe);
+    const size = box.getSize(new THREE.Vector3());
+    const FOOTPRINT_TARGET = 1.0; // 1マス（ASSEMBLY_CELL_SIZE=1）からはみ出ない範囲で目一杯大きくする基準
+    const footprint = Math.max(size.x, size.z);
+    assemblyTrolleyFootprintScaleCache = footprint > 0 ? FOOTPRINT_TARGET / footprint : 1;
+    return assemblyTrolleyFootprintScaleCache;
+}
+
+// 荷台の縁（rim、buildProceduralTrolleyMesh参照）の上面ワールドY。
+// rim.position.y(0.59)+厚みの半分(0.08/2=0.04)=0.63がスケール前のローカルY。
+// キャラクター（models/char.glb）を荷台に乗せる際の足元の高さ算出に使う
+function getAssemblyTrolleyBedTopY() {
+    return 0.63 * getAssemblyTrolleyFootprintScale();
+}
+
+function loadAssemblyTrolleyBodyModel() {
+    if (assemblyTrolleyBodyModelLoadStarted) return;
+    assemblyTrolleyBodyModelLoadStarted = true;
+    const model = buildProceduralTrolleyMesh();
+
+    // 幅(footprint)が1マスからはみ出ない範囲で目一杯大きくなるよう、X/Zの大きい方を
+    // 基準に一律スケールする（trolley.glb版から引き継いだ「マス境界ちょうど」というサイズ基準）
+    const scale = getAssemblyTrolleyFootprintScale();
+    model.scale.setScalar(scale);
+
+    const scaledBox = new THREE.Box3().setFromObject(model);
+    const center = scaledBox.getCenter(new THREE.Vector3());
+    model.position.x -= center.x;
+    model.position.z -= center.z;
+    model.position.y -= scaledBox.min.y; // 接地面（車輪の下端）をローカルy=0に
+
+    assemblyTrolleyBodyModel = model;
+    assemblyPlayMarker.add(model);
+
+    if (mapSettings.showCharacter) loadAssemblyCharacterModel();
+    attachAssemblyCharacterIfReady();
+}
+
+// トロッコの上に乗せるキャラクター（models/char.glb）。以前「キャラクターは不要」との
+// 依頼で本体をGLTFLoaderから現在のプリミティブ組み立て（buildProceduralTrolleyMesh）へ
+// 置き換えた際に廃止した機能だが、「トロッコの上にキャラクター載せる載せないの設定を
+// ドロワーに追加してほしい」との依頼で、既定オフのドロワー設定（mapSettings.showCharacter）
+// として復活させた。3Dプレビュー限定（2Dの簡易アイコンには反映しない）で、
+// assemblyPlayMarker配下にトロッコ本体と並べて1回だけ読み込み、以降は表示/非表示の
+// 切り替えのみvisibleで行う。
+// 57MBと大きいファイルのため、「表示に切り替えた瞬間だけ読み込み開始」だと初回再生時に
+// キャラクターだけ数秒遅れて出現するのが目立つ、との指摘を受け、シーン（assemblyScene/
+// assemblyPlayMarker）の有無に依存せず読み込みだけは先に始められるようにした
+// （3Dタブを開く前、main()の起動処理からでもプリロードできる）。読み込み完了時に
+// assemblyPlayMarkerがまだ存在しなければ、attachAssemblyCharacterIfReady()を
+// loadAssemblyTrolleyBodyModel()側からも呼び直すことで後から取り付ける
+let assemblyCharacterModel = null;
+let assemblyCharacterLoadStarted = false;
+function loadAssemblyCharacterModel() {
+    if (assemblyCharacterLoadStarted) return;
+    assemblyCharacterLoadStarted = true;
+    ensureThreeLoaded(() => {
+        const loader = new window.GLTFLoader();
+        loader.load(
+            "models/char.glb",
+            (gltf) => {
+                const model = gltf.scene;
+                const box = new THREE.Box3().setFromObject(model);
+                const size = box.getSize(new THREE.Vector3());
+                // トロッコの足元幅（footprint=1.0）に対する目安の背丈
+                const CHARACTER_HEIGHT_TARGET = 1.3;
+                const scale = size.y > 0 ? CHARACTER_HEIGHT_TARGET / size.y : 1;
+                model.scale.setScalar(scale);
+
+                const scaledBox = new THREE.Box3().setFromObject(model);
+                const center = scaledBox.getCenter(new THREE.Vector3());
+                model.position.x -= center.x;
+                model.position.z -= center.z;
+                model.position.y += getAssemblyTrolleyBedTopY() - scaledBox.min.y; // 荷台の上に足を乗せる
+                model.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+
+                // 「キャラクターが暗い」との指摘への対策。実測したところ、モデル本体の
+                // metalness/roughness/colorを補正してもほぼ見た目が変わらなかった一方、
+                // シーン全体の光源を強めると明確に明るくなることを確認した（=素材の問題では
+                // なく光量不足）。ただし全体の光源は2D/3Dの明るさを揃えるために既に「実測」で
+                // 慎重にチューニング済み（他の要素にも影響するため触りたくない）。そこで、
+                // キャラクター自身に追従する局所的なフィルライトだけを追加する方式にした。
+                // 「もう少し明るくてもいい」との指摘でintensity/distance/decayを一度強めたが
+                // （intensity:10, distance:6, decay:0.7）、そのままだと光の届く範囲が
+                // キャラクターの足元より下の地面（トロッコの荷台や真下の地面）まで届いてしまい、
+                // 「キャラだけでなく周りの地面まで明るくなってしまっている」と指摘された。
+                // three.jsのlight.layers（Object3D.layersの一種）による「特定オブジェクトだけを
+                // 照らす」制御を試したが、実測するとレンダラーの光源収集自体がカメラのlayersとの
+                // 一致判定で行われるらしく、layersをカメラと不一致にした時点でキャラクター自身への
+                // 効果も消えてしまい狙った選択照射にはならなかった（実測で確認済み、機能しない）。
+                // 代わりに、光源の高さをキャラクターの胸の高さ付近（足元からy=0.9）まで下げつつ、
+                // distance（届く範囲の上限）を1.6まで絞ることで、キャラクター自身は十分照らしつつ
+                // 光源からの垂直距離が離れている地面には物理的に届かなくなるよう調整した
+                // （実測: 地面付近のピクセル平均輝度がフィルライト無し時と完全に同じ値に戻り、
+                // 胴体付近の輝度は約54→75前後を維持）。
+                // 「後頭部はもう少し暗くていいです」との指摘を受け再度弱めた。なお実測したところ、
+                // このフィルライト（y=0.9・distance=1.6のどちらの設定でも）は頭部（モデル上部）
+                // まではそもそも届いておらず、頭部付近のピクセル値はフィルライトの有無に関わらず
+                // 完全に同一だった——つまり後頭部の明るさ自体は本フィルライトが原因ではなく、
+                // シーン共通の環境光（hemisphere/directional、2D/3Dの明るさを揃えるため触らない
+                // 方針）由来と考えられる。ただし全体の見た目を少し抑えたいという要望と解釈し、
+                // 胸〜首元まわりに影響するフィルライト自体は控えめに調整した
+                // （intensity:15→9, distance:1.6→1.2, position.y:0.9→0.75）
+                const fillLight = new THREE.PointLight(0xffffff, 9, 1.2, 1);
+                fillLight.position.set(0, 0.75, 0);
+                model.add(fillLight);
+
+                // 「軽く縦横にぷよぷよ躍動させたい」との依頼向けに、既存のmodel自身の
+                // 位置・スケール（トロッコの荷台の上に足が来るよう既に調整済み）はそのまま
+                // 保ち、揺れアニメーション専用の外側Groupで包む。assemblyCharacterModelは
+                // 以後このGroupを指す（visible切り替え・assemblyPlayMarkerへの追加は
+                // Groupに対して行えばmodel側にも自動的に伝わる）。揺れの実処理は
+                // tickAssemblyCharacterWobble()がこのGroup自身のscale/position.yを
+                // 毎フレーム書き換えることで実現する（modelのローカル変形には触れない）
+                const wobbleGroup = new THREE.Group();
+                wobbleGroup.add(model);
+
+                assemblyCharacterModel = wobbleGroup;
+                attachAssemblyCharacterIfReady();
+            },
+            undefined,
+            (err) => { console.warn("キャラクターモデル(models/char.glb)の読み込みに失敗しました", err); }
+        );
+    });
+}
+
+// 読み込み済み（assemblyCharacterModel）かつアタッチ先（assemblyPlayMarker）が
+// 用意できていれば、シーンに追加する。読み込み完了・3Dタブ初期化のどちらが先でも
+// 正しく組み合わさるよう、両方の完了地点から呼ぶ
+let assemblyCharacterWarmedUp = false;
+function attachAssemblyCharacterIfReady() {
+    if (assemblyCharacterModel && assemblyPlayMarker && !assemblyCharacterModel.parent) {
+        assemblyPlayMarker.add(assemblyCharacterModel);
+    }
+    applyAssemblyCharacterVisibility();
+
+    // 「再生を押すとキャラクターが数秒表示されない」との指摘の実測原因：char.glbは
+    // 約194万ポリゴンという非常に高精度（AI生成モデルにありがち）なメッシュで、
+    // three.jsはオブジェクトが最初に「実際に見える状態でrender()される瞬間」まで
+    // GPUへの頂点バッファアップロード・シェーダーのコンパイルを遅延させる。これまでは
+    // 再生開始時（assemblyPlayMarker.visible が初めてtrueになる瞬間）にこの初回コストが
+    // 発生していたため、まさに「再生を押した直後」に数秒のカクつきとして現れていた
+    // （Playwrightで実測: 通常は再生開始から1秒前後でトロッコが表示されるのに対し、
+    // このアップロード待ちで4.5〜5.7秒かかっていた）。
+    // 対策として、シーンの準備ができ次第——ユーザー操作を待たずに——ここで一度だけ
+    // 「一瞬だけ可視にしてrender()を強制発行→元の可視状態に戻して再度render()」という
+    // ウォームアップを行い、この重いアップロード処理を体感の無いタイミングに前倒しする
+    // （2回目のrender()で表示バッファを正しい状態に戻すため、画面上には一切見えない）
+    if (!assemblyCharacterWarmedUp && assemblyCharacterModel && assemblyRenderer && assemblyScene && assemblyCamera) {
+        assemblyCharacterWarmedUp = true;
+        const wasCharVisible = assemblyCharacterModel.visible;
+        const wasMarkerVisible = assemblyPlayMarker.visible;
+        assemblyCharacterModel.visible = true;
+        assemblyPlayMarker.visible = true;
+        assemblyRenderer.render(assemblyScene, assemblyCamera);
+        assemblyCharacterModel.visible = wasCharVisible;
+        assemblyPlayMarker.visible = wasMarkerVisible;
+        assemblyRenderer.render(assemblyScene, assemblyCamera);
+    }
+}
+
+function applyAssemblyCharacterVisibility() {
+    if (assemblyCharacterModel) assemblyCharacterModel.visible = !!mapSettings.showCharacter;
+}
+
+// 「キャラクターを軽く縦横にぷよぷよ躍動させたい（Y軸移動そのものより、伸び縮みする
+// イメージ）」との依頼への対応。assemblyCharacterModel（＝loadAssemblyCharacterModel内で
+// 作る揺れ専用のGroup、実際のモデルはその子）のscale/position.yを、サイン波で
+// 継続的に揺らす。トロッコの再生状態に関わらず、キャラクターが表示されている間は
+// 常に（アイドル時も）動き続ける——「躍動させる」という依頼の趣旨（常に生き生きして
+// 見えること）に合わせた
+// 「もう少し弾みを抑えられますか」との指摘（4回目）で振幅を段階的に控えめにした
+// （Y:0.07→0.045→0.025→0.012→0.006, XZ:0.045→0.028→0.016→0.008→0.004,
+// 位置ゆれ:0.02→0.012→0.006→0.003→0.0015。4回目は「さらに半分程度に」と明示的に確認の上で反映。
+// 周波数は「生き生き感」を保つためそのまま）
+const ASSEMBLY_CHARACTER_WOBBLE_HZ = 2.2;         // 1秒あたりの伸縮サイクル数
+const ASSEMBLY_CHARACTER_WOBBLE_AMOUNT_Y = 0.006; // 縦方向の伸縮量（比率、±0.6%）
+const ASSEMBLY_CHARACTER_WOBBLE_AMOUNT_XZ = 0.004; // 横方向の伸縮量（縦と逆位相＝伸びると縮む「ぷよぷよ」感、±0.4%）
+const ASSEMBLY_CHARACTER_WOBBLE_BOB_Y = 0.0015;   // 上下のごく軽い位置ゆれ（ワールド単位）
+let assemblyCharacterWobblePhase = 0;
+
+function tickAssemblyCharacterWobble(dt) {
+    if (!assemblyCharacterModel || !assemblyCharacterModel.visible) return;
+    assemblyCharacterWobblePhase += dt * ASSEMBLY_CHARACTER_WOBBLE_HZ * Math.PI * 2;
+    const s = Math.sin(assemblyCharacterWobblePhase);
+    assemblyCharacterModel.scale.set(
+        1 - s * ASSEMBLY_CHARACTER_WOBBLE_AMOUNT_XZ,
+        1 + s * ASSEMBLY_CHARACTER_WOBBLE_AMOUNT_Y,
+        1 - s * ASSEMBLY_CHARACTER_WOBBLE_AMOUNT_XZ
+    );
+    // 伸びている（s>0）タイミングだけ少し浮かせ、縮んでいる時は接地させたままにする
+    // （ジャンプするたびに一瞬だけ体が伸びて着地でつぶれる、という自然な跳ねに近づける）
+    assemblyCharacterModel.position.y = Math.max(0, s) * ASSEMBLY_CHARACTER_WOBBLE_BOB_Y;
+}
+
+// 2Dマップのトロッコアイコン用。3D側（loadAssemblyTrolleyBodyModel）はassemblyPlayMarkerが
+// できる3Dタブを開いた時にしか呼ばれないため、2D専用タブしか開かないユーザーでは
+// いつまでもSVGの簡易アイコンのままになってしまう。そのため3Dシーンの初期化とは切り離し、
+// main()から常に（どのタブでも）独立して呼ぶ
+let assemblyTrolleyIcon2DLoadStarted = false;
+function loadAssemblyTrolleyIcon2D() {
+    if (assemblyTrolleyIcon2DLoadStarted) return;
+    assemblyTrolleyIcon2DLoadStarted = true;
+    ensureThreeLoaded(() => {
+        assemblyTrolleyIcon2DDataURL = buildAssemblyTrolleyIcon2DSnapshot(buildProceduralTrolleyMesh());
+        // 現在マーカーが表示中なら、SVG仮アイコンのままにせずすぐ差し替える
+        // （通常はdrawMapPlayLine()が再生の毎フレーム呼ばれる中で自然に切り替わるが、
+        // 一時停止中は次にdrawMapPlayLine()が呼ばれるまで古いままになってしまうため）
+        if (currentHighlightBeatIndex !== null) {
+            drawMapPlayLine(currentHighlightBeatIndex, currentHighlightBeatT);
+        }
+    });
+}
+
+// 2Dマップのトロッコアイコン用に、トロッコ本体のプリミティブ形状を専用の小さな
+// オフスクリーンシーンで1回だけレンダリングし、data URL画像にして返す
+function buildAssemblyTrolleyIcon2DSnapshot(sourceModel) {
+    const SIZE = 256;
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(SIZE, SIZE, false);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.35;
+
+    const scene = new THREE.Scene();
+    const model = sourceModel;
+    scene.add(model);
+
+    const box = new THREE.Box3().setFromObject(model);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    model.position.sub(center);
+
+    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+    const cam = new THREE.OrthographicCamera(-maxDim * 0.75, maxDim * 0.75, maxDim * 0.75, -maxDim * 0.75, 0.01, maxDim * 10);
+    cam.position.set(maxDim * 0.9, maxDim * 1.1, maxDim * 0.9);
+    cam.lookAt(0, 0, 0);
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8f98, 1.1));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.4);
+    dirLight.position.set(maxDim, maxDim * 2, maxDim);
+    scene.add(dirLight);
+
+    renderer.render(scene, cam);
+    const dataURL = renderer.domElement.toDataURL("image/png");
+    renderer.dispose();
+    return dataURL;
+}
+
 // 位置の配列から1つのInstancedMeshを組み立てる共通処理
 function buildAssemblyInstancedMesh(positions, geometry, material, sx, sy, sz, rotY) {
     const mesh = new THREE.InstancedMesh(geometry, material, Math.max(positions.length, 1));
@@ -3209,6 +6547,23 @@ function buildAssemblyInstancedMesh(positions, geometry, material, sx, sy, sz, r
         mesh.setMatrixAt(i, m);
     });
     mesh.count = positions.length;
+    mesh.instanceMatrix.needsUpdate = true;
+    return mesh;
+}
+
+// buildAssemblyInstancedMesh()の汎用版。全インスタンス共通の位置リスト+1つの回転/スケールでは
+// 表現できない場合（カーブの角の円弧セグメントのように、インスタンスごとに向きが異なる場合）に使う。
+// instancesは{position, quaternion, scale}の配列
+function buildAssemblyInstancedMeshCustom(instances, geometry, material) {
+    const mesh = new THREE.InstancedMesh(geometry, material, Math.max(instances.length, 1));
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    const m = new THREE.Matrix4();
+    instances.forEach((inst, i) => {
+        m.compose(inst.position, inst.quaternion, inst.scale);
+        mesh.setMatrixAt(i, m);
+    });
+    mesh.count = instances.length;
     mesh.instanceMatrix.needsUpdate = true;
     return mesh;
 }
@@ -3259,16 +6614,25 @@ function updateAssemblyEmptyState(isEmpty) {
 // 前回分のInstancedMeshだけ破棄して作り直す）
 function rebuildAssemblyMeshes() {
     updateAssemblySunPosition(); // コンパスの向き（northDirection）が変わっても常に南から光が当たるようにする
-    [assemblyRailSideMesh, assemblyRailRungMesh, assemblySensorMesh, ...Object.values(assemblyPanelMeshes)].forEach(m => {
+    [...assemblyRailSideMeshes, ...assemblyRailRungMeshes, ...assemblySensorMeshes, ...Object.values(assemblyPanelMeshes)].forEach(m => {
         if (m) assemblyScene.remove(m);
     });
-    assemblyRailSideMesh = null;
-    assemblyRailRungMesh = null;
-    assemblySensorMesh = null;
+    if (assemblySensorDirectionMesh) assemblyScene.remove(assemblySensorDirectionMesh);
+    assemblySensorDirectionMesh = null;
+    assemblyRailSideMeshes = [];
+    assemblyRailRungMeshes = [];
+    assemblySensorMeshes = [];
     assemblyPanelMeshes = {};
     if (assemblyPanelEdgesGroup) assemblyScene.remove(assemblyPanelEdgesGroup);
     assemblyPanelEdgesGroup = null;
-    assemblyLayerGrids.forEach(g => assemblyScene.remove(g));
+    assemblyLayerGrids.forEach(g => {
+        assemblyScene.remove(g);
+        if (g.geometry) g.geometry.dispose();
+        if (g.material) {
+            if (g.material.map) g.material.map.dispose();
+            g.material.dispose();
+        }
+    });
     assemblyLayerGrids = [];
     // メッシュを作り直すと以前のインスタンスは失われるため、「凹み」の追跡状態もリセットする
     // （リセットしないと、次にupdateAssemblyPlayMarker()が同じbeatIndexで呼ばれた時に
@@ -3278,22 +6642,46 @@ function rebuildAssemblyMeshes() {
     assemblyPanelEdgeOffsetByPitch = {};
     assemblyPressedBeatIndex = null;
     assemblyPanelPressAnimations = new Map();
+    // 「音符マットが踏まれたらきらきらエフェクトを出す」用のバースト。作り直しの
+    // タイミングで再生中のバーストが残っていても見た目上は問題ないが、他の
+    // ビート追跡状態と同じくクリーンな状態から再開するため、ここで破棄しておく
+    assemblySparkleEffects.forEach(fx => {
+        assemblyScene.remove(fx.points);
+        fx.geometry.dispose();
+        fx.material.dispose();
+    });
+    assemblySparkleEffects = [];
 
-    const { grid, extent, beatCenters } = buildMapGrid();
+    const { grid, extent, beatCenters, beatIndexToRailIndex } = buildMapGrid();
+    wrapBeatIndexToRailIndex = beatIndexToRailIndex || [];
     if (!extent) {
         updateAssemblyEmptyState(true);
         assemblyBeatCenters = [];
+        assemblyBeatCentersRaw = [];
         if (assemblyPlayMarker) assemblyPlayMarker.visible = false;
         assemblyRenderer.render(assemblyScene, assemblyCamera);
         return;
     }
     updateAssemblyEmptyState(false);
+    updateAssemblyCloudRange(extent);
 
     const centerX = (extent.minX + extent.maxX) / 2;
     const centerY = (extent.minY + extent.maxY) / 2;
+    // 「レールを地面につけるか、浮かす（今の状態）かを決める」設定（mapSettings.railFloating）。
+    // 層（gz）は中間層=0（レール・センサー・パネルは全てここ。上位/下位層はデータ上
+    // レールが複製されているだけで3D描画側では使わない）を基準にASSEMBLY_LAYER_HEIGHTずつ
+    // 上下するが、ここへ一律のYオフセットを足すだけで「地面につける/浮かす」を切り替える。
+    // 「地面につける」時は、レール本体の底面（中心からRAIL_HEIGHT/2下）がちょうど地面の
+    // 高さ(ASSEMBLY_GROUND_Y)に来るようにする。「浮かす」時は底面が地面から1マス分
+    // 浮いた高さに来るようにする（固定値0だと実測で1.4マス分浮いており、「地面に固定した
+    // グリッドが導入されてから浮きが目立って見える」との指摘を受けて1マス分に調整した）
+    const RAIL_HEIGHT = 0.2;
+    const railYOffset = mapSettings.railFloating
+        ? (ASSEMBLY_GROUND_Y + ASSEMBLY_CELL_SIZE + RAIL_HEIGHT / 2)
+        : (ASSEMBLY_GROUND_Y + RAIL_HEIGHT / 2);
     const toWorld = (gx, gy, gz) => new THREE.Vector3(
         (gx - centerX) * ASSEMBLY_CELL_SIZE,
-        gz * ASSEMBLY_LAYER_HEIGHT,
+        gz * ASSEMBLY_LAYER_HEIGHT + railYOffset,
         (gy - centerY) * ASSEMBLY_CELL_SIZE
     );
 
@@ -3301,12 +6689,31 @@ function rebuildAssemblyMeshes() {
     // 中心座標をワールド座標へ変換しておく。トロッコは物理的な中間層のレール上しか
     // 走らないためz=0固定でよい（2DマップのmapBeatPositionsと同じ役割）
     assemblyBeatCenters = beatCenters.map(c => toWorld(c.x, c.y, 0));
+    assemblyBeatCentersRaw = beatCenters;
 
-    const railPositions = [];
-    const sensorPositions = [];
+    // レールはセルごとの向き(data.direction)ごとに分けて集める（トロッコの進行方向に
+    // 合わせてレールの見た目の向きも変えるため。direction未設定のセルは無いはずだが、
+    // 念のためdefault値としてmapSettings.railDirectionへフォールバックする）
+    const railPositionsByDirection = { vertical: [], horizontal: [] };
+    // カーブの角（1マスぶんの円弧、data.corner参照）は直線グループには入れず別途集める
+    const railCornerCells = []; // {pos, inDir, outDir}
+    // センサーもレールと同じくdata.direction（そのセンサーの実際のレール向き）ごとに
+    // 分けて集める。InstancedMeshは1つにつき共通のスケールしか持てないため、向きごとに
+    // 別のメッシュにする必要がある
+    const sensorPositionsByDirection = { vertical: [], horizontal: [] };
     const panelPositionsByPitch = {}; // canonical pitch -> Vector3[]
     const rotY = northDirection * Math.PI / 2;
     const SENSOR_AWAY_OFFSET = 0.08; // 2D側のSENSOR_AWAY_OFFSET_RATIOと同じ比率（ASSEMBLY_CELL_SIZE=1なのでそのまま距離になる）
+    // センサーの向き（forwardVec）デバッグ表示用。各センサー位置を中心に、forwardVec沿いへ
+    // 2マス分の薄い赤の光線インスタンスを積む（「反応する方向2マスに、うっすら赤い光線を
+    // 出してほしい」との依頼、2026-10-01）。mapSettings.showSensorDirectionがtrueの時だけ収集する
+    const sensorDirectionInstances = [];
+    const showSensorDirection = mapSettings.showSensorDirection;
+    // センサー本体（下のSENSOR_CROSS/SENSOR_ALONGと同じ値）のawayVec方向の半幅。光線の
+    // 起点をセンサーの中心ではなく本体の縁に合わせるため、この分だけ余計に押し出す
+    // （「長さが半マス分足りません」との指摘、2026-10-01。center基準のままだと見た目上の
+    // 可視長がセンサー本体に食われて2マスより短く見えていた）
+    const SENSOR_CROSS = 0.65;
 
     for (const [key, data] of grid) {
         const parts = key.split(",").map(Number);
@@ -3317,14 +6724,39 @@ function rebuildAssemblyMeshes() {
             // 3層を同時に表示するこのプレビューではそのまま描くとレールが3本重なって見えて
             // しまう。実際のレールは1本しか無いので、中間層（z===0）ぶんだけ描画する
             if (parts[2] !== 0) continue;
-            railPositions.push(pos);
+            if (data.corner) {
+                railCornerCells.push({ pos, inDir: data.corner.inDir, outDir: data.corner.outDir });
+                continue;
+            }
+            const dir = data.direction === "horizontal" ? "horizontal" : "vertical";
+            railPositionsByDirection[dir].push(pos);
         } else if (data.type === "sensor") {
             // 「センサーを枠の中で、レールから少し遠ざける」との依頼に対応。data.awayVecは
             // レール中心から見てこのセンサーが外側へ向かう方向（buildMapGrid参照、2D側の
             // drawMapCellと同じSENSOR_AWAY_OFFSET_RATIOに相当する値をそのまま使う）
             const away = data.awayVec || { dx: 0, dy: 0 };
             const sensorPos = pos.clone().add(new THREE.Vector3(away.dx * SENSOR_AWAY_OFFSET, 0, away.dy * SENSOR_AWAY_OFFSET));
-            sensorPositions.push(sensorPos);
+            const sensorDir = data.direction === "horizontal" ? "horizontal" : "vertical";
+            sensorPositionsByDirection[sensorDir].push(sensorPos);
+            if (showSensorDirection && (away.dx !== 0 || away.dy !== 0)) {
+                // センサーが実際に反応する方向は、レールに平行（forwardVec）ではなく、
+                // センサーからレール中心線の方（awayVecの逆方向）——トロッコ自体はレール上を
+                // 通るため、センサーはそちらを検知する。センサー自身の位置を起点に、
+                // その方向へ2マス分だけ片側に伸ばす（中心から両方向ではない）
+                // （「今のは真横に両方に伸びていて間違っている」との指摘、2026-10-01）
+                const toRailX = -away.dx, toRailY = -away.dy;
+                const beamLength = 2;
+                const startOffset = SENSOR_CROSS / 2; // センサー本体の縁（中心からの半幅）
+                const angle = Math.atan2(toRailX, toRailY);
+                sensorDirectionInstances.push({
+                    // 起点はセンサー本体の縁（中心からstartOffset先）、そこからさらに
+                    // beamLengthぶん先までの中点をボックスの中心位置にする
+                    position: sensorPos.clone()
+                        .add(new THREE.Vector3(toRailX * (startOffset + beamLength / 2), 0.02, toRailY * (startOffset + beamLength / 2))),
+                    quaternion: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), angle),
+                    scale: new THREE.Vector3(0.06, 0.02, beamLength), // レール方向へ2マス分、細く平たい光線
+                });
+            }
         } else if (data.type === "panel") {
             const canon = toCanonicalPitch(data.pitch);
             if (!PITCH_TO_FILE[canon]) continue; // 2D版と同じ「対応画像が無ければ描かない」ガード
@@ -3355,7 +6787,11 @@ function rebuildAssemblyMeshes() {
     // さらに「横部分（横木）はもっと太く、横部分じゃない部分は穴をあけてほしい」との
     // 追加修正を反映）。溝の底を塗りつぶすのはやめ、左右のレール本体の間は横木以外
     // 完全に何も描かない（＝素通しの穴）ことで「穴をあけて」を文字通り実現している。
-    // mapSettings.railDirectionは全レール共通の設定なので、向き（縦/横）もセル単位ではなく一括で決まる
+    // レールの向き（縦/横）はセルごとのdata.directionで決まる（「トロッコが進む方向に
+    // 合わせてレールの向きも変える」ため。メインの直線区間はmapSettings.railDirection、
+    // 折り返しのカーブ区間はそれと直角、という向きがbuildMapGrid側で既に決まっている）。
+    // 1つのInstancedMeshは全インスタンス共通のスケール/回転しか持てないため、縦向き・
+    // 横向きのセルをそれぞれ別のInstancedMeshに分けて作る
     // 「黒を太く、グレーは黒より横に突き出す＆凹んでいる」という組み合わせは、黒本体が
     // セル端まで塞ぐ単純な形状だと、重なった部分でグレーが黒の陰に完全に隠れてしまい両立
     // できなかった（凹み＝グレーの上面が黒より低い→重なる範囲では常に黒が上に来て隠す）。
@@ -3365,8 +6801,7 @@ function rebuildAssemblyMeshes() {
     // 内外どちらにも入り込む幅にすることで、黒に隠れない領域（内側の穴・外側の余白）では
     // 素直に見え、黒と重なる中央部分だけ凹んで隠れる＝結果として「黒の脇からグレーが
     // 突き抜けて見える」状態になる
-    const railIsVertical = mapSettings.railDirection === "vertical";
-    const RAIL_HEIGHT = 0.2;
+    // （RAIL_HEIGHTは上のtoWorld直前で既に宣言済み。railYOffset計算にも使っている）
     const RAIL_SIDE_OFFSET = 0.3;                             // 中心から黒本体中心までの距離（固定）
     const RAIL_SIDE_WIDTH = 0.15;                             // 黒本体の幅（0.4→0.15、大幅に細く）
     const RAIL_RUNG_WIDTH = 0.92;                             // 横木の幅。黒本体の内側の穴だけでなく外側の余白にも届く広さ
@@ -3376,38 +6811,126 @@ function rebuildAssemblyMeshes() {
     const RAIL_RUNG_LENGTH = 0.22;                            // 横木の（レール方向の）太さ
     const RAIL_RUNG_OFFSETS = [-0.25, 0.25];                  // 1マスあたり2本。隣接マスと合わせ0.5間隔の等間隔になる（0.22幅でも重ならない）
 
-    const sideAxis = railIsVertical ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 0, 1);
-    const railSidePositions = [];
-    railPositions.forEach(p => {
-        railSidePositions.push(p.clone().addScaledVector(sideAxis, RAIL_SIDE_OFFSET));
-        railSidePositions.push(p.clone().addScaledVector(sideAxis, -RAIL_SIDE_OFFSET));
-    });
-    assemblyRailSideMesh = buildAssemblyInstancedMesh(
-        railSidePositions, assemblyUnitBoxGeometry, assemblyRailMaterial,
-        railIsVertical ? RAIL_SIDE_WIDTH : 1, RAIL_HEIGHT, railIsVertical ? 1 : RAIL_SIDE_WIDTH, 0
-    );
-    assemblyScene.add(assemblyRailSideMesh);
+    ["vertical", "horizontal"].forEach(dir => {
+        const positions = railPositionsByDirection[dir];
+        if (positions.length === 0) return;
+        const dirIsVertical = dir === "vertical";
 
-    const railAxis = railIsVertical ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(1, 0, 0);
-    const railRungPositions = [];
-    railPositions.forEach(p => {
-        RAIL_RUNG_OFFSETS.forEach(offset => {
-            railRungPositions.push(p.clone().addScaledVector(railAxis, offset).add(new THREE.Vector3(0, RAIL_RUNG_Y_OFFSET, 0)));
+        const sideAxis = dirIsVertical ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 0, 1);
+        const railSidePositions = [];
+        positions.forEach(p => {
+            railSidePositions.push(p.clone().addScaledVector(sideAxis, RAIL_SIDE_OFFSET));
+            railSidePositions.push(p.clone().addScaledVector(sideAxis, -RAIL_SIDE_OFFSET));
         });
+        const sideMesh = buildAssemblyInstancedMesh(
+            railSidePositions, assemblyUnitBoxGeometry, assemblyRailMaterial,
+            dirIsVertical ? RAIL_SIDE_WIDTH : 1, RAIL_HEIGHT, dirIsVertical ? 1 : RAIL_SIDE_WIDTH, 0
+        );
+        assemblyScene.add(sideMesh);
+        assemblyRailSideMeshes.push(sideMesh);
+
+        const railAxis = dirIsVertical ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(1, 0, 0);
+        const railRungPositions = [];
+        positions.forEach(p => {
+            RAIL_RUNG_OFFSETS.forEach(offset => {
+                railRungPositions.push(p.clone().addScaledVector(railAxis, offset).add(new THREE.Vector3(0, RAIL_RUNG_Y_OFFSET, 0)));
+            });
+        });
+        const rungMesh = buildAssemblyInstancedMesh(
+            railRungPositions, assemblyUnitBoxGeometry, assemblyRailRungMaterial,
+            dirIsVertical ? RAIL_RUNG_WIDTH : RAIL_RUNG_LENGTH, RAIL_RUNG_HEIGHT, dirIsVertical ? RAIL_RUNG_LENGTH : RAIL_RUNG_WIDTH, 0
+        );
+        assemblyScene.add(rungMesh);
+        assemblyRailRungMeshes.push(rungMesh);
     });
-    assemblyRailRungMesh = buildAssemblyInstancedMesh(
-        railRungPositions, assemblyUnitBoxGeometry, assemblyRailRungMaterial,
-        railIsVertical ? RAIL_RUNG_WIDTH : RAIL_RUNG_LENGTH, RAIL_RUNG_HEIGHT, railIsVertical ? RAIL_RUNG_LENGTH : RAIL_RUNG_WIDTH, 0
-    );
-    assemblyScene.add(assemblyRailRungMesh);
-    // センサーは正方形ではなく、レールに直角な方向へ長い長方形にする（2D側のSENSOR_CROSS_RATIO/
-    // SENSOR_ALONG_RATIOと同じ比率。「センサーを縦長に、レールに直角に伸びる方が長くなるように」）
-    const SENSOR_CROSS = 0.65, SENSOR_ALONG = 0.35;
-    assemblySensorMesh = buildAssemblyInstancedMesh(
-        sensorPositions, assemblyUnitBoxGeometry, assemblySensorMaterial,
-        railIsVertical ? SENSOR_CROSS : SENSOR_ALONG, 0.25, railIsVertical ? SENSOR_ALONG : SENSOR_CROSS, 0
-    );
-    assemblyScene.add(assemblySensorMesh);
+
+    // カーブの角（railCornerCells、1マスぶんの円弧）も同じ見た目（本体2本+横木2本）を、
+    // 弧に沿って並べた短いセグメントの箱で近似して描く（2D側のdrawMapRailCornerと同じ
+    // computeRailCornerArc()の幾何計算を使う）。1つのInstancedMeshは全インスタンス共通の
+    // 回転しか持てないため、buildAssemblyInstancedMesh()ではなく、セグメントごとに
+    // 個別の位置・回転行列を組み立てるbuildAssemblyInstancedMeshCustom()を使う
+    const CORNER_ARC_SEGMENTS = 6;
+    if (railCornerCells.length > 0) {
+        const sideInstances = [];
+        const rungInstances = [];
+        const upAxis = new THREE.Vector3(0, 1, 0);
+        railCornerCells.forEach(({ pos, inDir, outDir }) => {
+            const { r, ccx, ccy, startAngle, sweep, anticlockwise } = computeRailCornerArc(inDir, outDir);
+            const centerX = pos.x + ccx * ASSEMBLY_CELL_SIZE;
+            const centerZ = pos.z + ccy * ASSEMBLY_CELL_SIZE;
+            // 弧に沿って進む向き（tがtからt+dtへ増える方向）は、sweepが負(anticlockwise)なら
+            // 角度が減る向きなので、接線方向は角度から-90度、正なら+90度
+            const tangentSign = anticlockwise ? -1 : 1;
+            const segSweep = sweep / CORNER_ARC_SEGMENTS;
+
+            // レール本体: 内側・外側それぞれの半径で、弧をCORNER_ARC_SEGMENTS個の短い箱に分割
+            [r - RAIL_SIDE_OFFSET, r + RAIL_SIDE_OFFSET].forEach(radius => {
+                // 隣接セグメント間に隙間ができないよう、コード長よりわずかに長めにする
+                const segLen = radius * Math.abs(segSweep) * ASSEMBLY_CELL_SIZE * 1.15;
+                for (let s = 0; s < CORNER_ARC_SEGMENTS; s++) {
+                    const angle = startAngle + segSweep * (s + 0.5);
+                    const tangentAngle = angle + tangentSign * Math.PI / 2;
+                    sideInstances.push({
+                        position: new THREE.Vector3(
+                            centerX + radius * Math.cos(angle) * ASSEMBLY_CELL_SIZE,
+                            pos.y,
+                            centerZ + radius * Math.sin(angle) * ASSEMBLY_CELL_SIZE
+                        ),
+                        quaternion: new THREE.Quaternion().setFromAxisAngle(upAxis, Math.atan2(Math.cos(tangentAngle), Math.sin(tangentAngle))),
+                        scale: new THREE.Vector3(RAIL_SIDE_WIDTH, RAIL_HEIGHT, segLen),
+                    });
+                }
+            });
+
+            // 横木（弧の1/3・2/3地点に、半径方向を向けて1本ずつ）
+            [1 / 3, 2 / 3].forEach(t => {
+                const angle = startAngle + sweep * t;
+                rungInstances.push({
+                    position: new THREE.Vector3(
+                        centerX + r * Math.cos(angle) * ASSEMBLY_CELL_SIZE,
+                        pos.y + RAIL_RUNG_Y_OFFSET,
+                        centerZ + r * Math.sin(angle) * ASSEMBLY_CELL_SIZE
+                    ),
+                    quaternion: new THREE.Quaternion().setFromAxisAngle(upAxis, Math.atan2(Math.cos(angle), Math.sin(angle))),
+                    scale: new THREE.Vector3(RAIL_RUNG_LENGTH, RAIL_RUNG_HEIGHT, RAIL_RUNG_WIDTH),
+                });
+            });
+        });
+
+        const cornerSideMesh = buildAssemblyInstancedMeshCustom(sideInstances, assemblyUnitBoxGeometry, assemblyRailMaterial);
+        assemblyScene.add(cornerSideMesh);
+        assemblyRailSideMeshes.push(cornerSideMesh);
+
+        const cornerRungMesh = buildAssemblyInstancedMeshCustom(rungInstances, assemblyUnitBoxGeometry, assemblyRailRungMaterial);
+        assemblyScene.add(cornerRungMesh);
+        assemblyRailRungMeshes.push(cornerRungMesh);
+    }
+
+    // センサーは正方形ではなく、レール（トロッコの通り道）に直角な方向、つまり長辺が
+    // レールの方を向くように長い長方形にする（2D側のSENSOR_CROSS_RATIO/SENSOR_ALONG_RATIOと
+    // 同じ比率）。長辺の軸はマップ全体のrailDirection設定で一律に決めるのではなく、レールと
+    // 同じくセンサーごとのdata.direction（そのセンサーの実際のレール向き）で決める——
+    // 「センサーはレールのトロッコの方に向けないとダメ」との指摘、2026-09-29。
+    // InstancedMeshは1つにつき共通のスケールしか持てないため、レールと同様に向きごとに
+    // 別メッシュにする
+    const SENSOR_ALONG = 0.35; // SENSOR_CROSSは上でセンサー向きデバッグ光線と共有するため定義済み
+    ["vertical", "horizontal"].forEach(dir => {
+        const positions = sensorPositionsByDirection[dir];
+        if (positions.length === 0) return;
+        const dirIsVertical = dir === "vertical";
+        const mesh = buildAssemblyInstancedMesh(
+            positions, assemblyUnitBoxGeometry, assemblySensorMaterial,
+            dirIsVertical ? SENSOR_CROSS : SENSOR_ALONG, 0.25, dirIsVertical ? SENSOR_ALONG : SENSOR_CROSS, 0
+        );
+        assemblyScene.add(mesh);
+        assemblySensorMeshes.push(mesh);
+    });
+    if (showSensorDirection && sensorDirectionInstances.length > 0) {
+        assemblySensorDirectionMesh = buildAssemblyInstancedMeshCustom(sensorDirectionInstances, assemblyUnitBoxGeometry, assemblySensorDirectionMaterial);
+        assemblySensorDirectionMesh.castShadow = false;
+        assemblySensorDirectionMesh.receiveShadow = false;
+        assemblyScene.add(assemblySensorDirectionMesh);
+    }
     Object.entries(panelPositionsByPitch).forEach(([pitch, positions]) => {
         const mesh = buildAssemblyInstancedMesh(positions, assemblyUnitBoxGeometry, getAssemblyPanelMaterials(pitch), 0.95, 0.15, 0.95, rotY);
         assemblyPanelMeshes[pitch] = mesh;
@@ -3432,30 +6955,107 @@ function rebuildAssemblyMeshes() {
     const boundaryFracFor = (centerSum) => ((((centerSum % 2) + 2) % 2) === 0 ? 0.5 : 0);
     const offsetX = boundaryFracFor(extent.minX + extent.maxX) === nativeLineFrac ? 0 : ASSEMBLY_CELL_SIZE / 2;
     const offsetZ = boundaryFracFor(extent.minY + extent.maxY) === nativeLineFrac ? 0 : ASSEMBLY_CELL_SIZE / 2;
-    // グリッド線は中間層（レールが実在する層）だけに表示する（上位層・下位層には出さない）
-    [0].forEach(layer => {
-        // GridHelperは本来「中心を通る2本の線だけ濃い色にする」機能を持つが、これは
-        // gridSize（マス数）の偶奇でその中心線が実在するかどうかが決まる仕様のため、
-        // マス数が変わるだけで「濃い線が出たり消えたりする」意図しない見た目のブレになる。
-        // このプレビューに中心線を強調したい意図は無いため、2色を同じ色にして常に均一にする
-        const helper = new THREE.GridHelper(gridSize * ASSEMBLY_CELL_SIZE, gridSize, 0xd8d8d8, 0xd8d8d8);
-        helper.position.set(offsetX, layer * ASSEMBLY_LAYER_HEIGHT - 0.15, offsetZ);
-        helper.visible = assemblyGridVisible; // #assemblyGridToggleBtnでの設定を再構築後も保つ
-        assemblyScene.add(helper);
-        assemblyLayerGrids.push(helper);
+    // グリッド線は中間層（レールが実在する層）だけに表示する（上位層・下位層には出さない）。
+    //
+    // 【2026-09-17の経緯、長い試行錯誤】(1)当初はレールの高さに追従する1枚のTHREE.GridHelper
+    // だけだったが、「浮かす」モードではレールが地面から離れているため地面ブロック上に
+    // グリッドが乗らなかった。(2)地面ブロック専用の2枚目を重ねたところ、「浮かす」時に
+    // 2枚の高さが離れすぎて視差で線がズレ「二重に見える」不具合になった。ユーザーの
+    // 要望は「レールの高さは関係なく、緑・茶色どちらの地面にも同じグリッドが1枚乗ること」
+    // と判明したため、レール追従をやめ常に地面ブロックと同じ高さの1枚に統合した。
+    // (3)地面ブロックの高さちょうどに揃えたところ、地面ブロック側のマテリアルが本体の
+    // 地面とのz-fighting対策でpolygonOffset（factor/units: -4）によりカメラ側へ
+    // 引き寄せられているため、同じ高さのGridHelper（LINEプリミティブ）は押し負けて隠れて
+    // しまう。WebGLのpolygonOffsetは塗りつぶし（三角形）にしか効かない。(4)このためグリッド線を
+    // 焼き込んだキャンバステクスチャを貼った平面メッシュ（塗りつぶし＝三角形）に置き換え、
+    // polygonOffsetが使えるようにしたが、薄い線をテクスチャの透明度（alpha）で表現する
+    // 方式そのものが、mipmap（縮小版テクスチャの自動生成）絡みの問題を次々に引き起こした
+    // ——縮小時にalphaTestの閾値を割って完全消失（近くでしか見えない）、mipmap無効化の
+    // 副作用で大きい曲だと線が点々になる、テクスチャがNPOTサイズだとmipmap生成自体が
+    // 壊れて地面全体が灰色の靄になる、透明背景のRGBが線の色と混ざって縮小時に色がくすむ、
+    // その対策（背景RGBを線と揃える）も canvas の内部実装（alpha=0では透明合成時にRGB情報が
+    // 失われる）でそもそも効いていなかった、等。texture+alphaという表現方式自体が
+    // 何重にも脆いと判明したため、テクスチャを使わず、地面ブロック・池と同じ「実際の
+    // ジオメトリ（薄い板ポリゴン）を敷き並べる」方式に切り替えた。線の透明度に一切頼らない
+    // ため、mipmap・alphaTest関連の問題が構造的に起こり得ない
+    const gridWorldSize = gridSize * ASSEMBLY_CELL_SIZE;
+    const gridHalf = gridWorldSize / 2;
+    const gridLineWidth = Math.max(0.025, ASSEMBLY_CELL_SIZE * 0.03); // 線の太さ（ワールド単位）
+    const gridLineY = ASSEMBLY_GROUND_Y + 0.02; // 地面ブロックと完全に同じ高さ（浮いて見えない）
+    const gridPositions = [];
+    const addGridQuad = (x1, z1, x2, z2, x3, z3, x4, z4) => {
+        gridPositions.push(x1, gridLineY, z1, x2, gridLineY, z2, x3, gridLineY, z3);
+        gridPositions.push(x1, gridLineY, z1, x3, gridLineY, z3, x4, gridLineY, z4);
+    };
+    const half = gridLineWidth / 2;
+    for (let i = 0; i <= gridSize; i++) {
+        const xi = -gridHalf + i * ASSEMBLY_CELL_SIZE;
+        addGridQuad(xi - half, -gridHalf, xi + half, -gridHalf, xi + half, gridHalf, xi - half, gridHalf);
+        const zi = -gridHalf + i * ASSEMBLY_CELL_SIZE;
+        addGridQuad(-gridHalf, zi - half, gridHalf, zi - half, gridHalf, zi + half, -gridHalf, zi + half);
+    }
+    const helperGeometry = new THREE.BufferGeometry();
+    helperGeometry.setAttribute("position", new THREE.Float32BufferAttribute(gridPositions, 3));
+    // 三角形の頂点順（＝法線の向き）が下向きになっており、上から見下ろすカメラからは
+    // 背面カリングで見えなくなっていた（実測で判明）。side:DoubleSideで両面描画にして解消する
+    const helperMaterial = new THREE.MeshBasicMaterial({
+        color: 0xd8d8d8, side: THREE.DoubleSide,
+        polygonOffset: true, polygonOffsetFactor: -8, polygonOffsetUnits: -8,
     });
+    const helper = new THREE.Mesh(helperGeometry, helperMaterial);
+    // 頂点は既にXZ平面（ワールドのX/Z軸）で計算済みのため、回転は不要
+    helper.position.set(offsetX, 0, offsetZ);
+    helper.visible = assemblyGridVisible; // #assemblyGridToggleBtnでの設定を再構築後も保つ
+    assemblyScene.add(helper);
+    assemblyLayerGrids.push(helper);
+
+    // 池（大・中・小3個、トラック外側のランダムな位置に配置）。地面ブロックが池の上に
+    // 重ならないよう避けられるようにするため、地面ブロックより先に生成する
+    generateAssemblyPonds(extent, toWorld);
+    // 池を沈めた分、陸の板がその上を覆って隠してしまわないよう、池のマスだけ陸を透明にする
+    updateAssemblyGroundHoles(assemblyPondCellSet, toWorld);
+    // 地面ブロックの色分け（黄土色の群れをランダム配置。「グリッドエリアでも茶色が混ざって
+    // もいい」との指摘で、実際にレール・センサー・音符マットが無いマスであればグリッド
+    // エリアの内側にも生成できるようにした——gridを渡し、実際に使われているマスだけを
+    // 避ける）。「茶色ブロックには草ははやさないでください」との指摘対応で、木・草・花より
+    // 先に生成し、そのマス目集合(assemblyGroundBlockCellSet)を木・草・花側が避けられるようにする
+    generateAssemblyGroundBlocks(extent, toWorld, grid);
+    // 木・草・花（陸の装飾）。トラックの外周の空きマスに散りばめる
+    generateAssemblyDecorations(extent, toWorld);
 
     // 影用のshadow.camera（光源から見た正射影カメラ）の見える範囲を、内容の実際の広がりに
     // 合わせて毎回更新する。既定値（左右上下±5の狭い正方形）のままだと、原点付近から外れた
     // 音符マット/レールがその範囲外になり影が出なかったり、範囲の境界で不自然に切れたりする
     // （曲が長い/マス数が多いほど顕著）。中心はtoWorld()により常に原点なので、半径は
     // グリッドの対角ぶんの広さを取れば全体を確実に覆える
-    const shadowHalfExtent = Math.max(extent.maxX - extent.minX, extent.maxY - extent.minY) * ASSEMBLY_CELL_SIZE / 2 + 4;
+    // 「影が途中で切断されているように見える」との指摘のため、トラック自体の広さだけでなく
+    // 木・草・花の装飾が広がる範囲（ASSEMBLY_DECORATION_MARGIN）もshadow.cameraの可視範囲に
+    // 含める（トラックが小さいと装飾の影の方が範囲外になり、境界で不自然に切れて見えていた）。
+    // 以前はここに雲の表示範囲（assemblyCloudRange）も含めていたが、「雲をマップ全体に
+    // 表示」の対応でその範囲がASSEMBLY_GROUND_BLOCK_MARGIN=300ぶんまで大きく広がった結果、
+    // 同じ解像度のシャドウマップがより広い面積を覆うことになりテクセル密度が下がって
+    // しまい、「レール/トロッコ/キャラクター/音符マットの影が薄れた」との指摘につながった。
+    // 雲の影はASSEMBLY_CLOUD_LAYERで分離したassemblyCloudSun側が別途担当するため、ここでは
+    // 含めない（雲以外の内容だけを考えればよく、装飾（120マス）の方がずっと狭いので、
+    // このライトのテクセル密度をずっと高く保てる）
+    const shadowHalfExtent = Math.max(
+        extent.maxX - extent.minX, extent.maxY - extent.minY
+    ) * ASSEMBLY_CELL_SIZE / 2 + ASSEMBLY_DECORATION_MARGIN;
     assemblySun.shadow.camera.left = -shadowHalfExtent;
     assemblySun.shadow.camera.right = shadowHalfExtent;
     assemblySun.shadow.camera.top = shadowHalfExtent;
     assemblySun.shadow.camera.bottom = -shadowHalfExtent;
     assemblySun.shadow.camera.updateProjectionMatrix();
+
+    // 雲専用ライト（assemblyCloudSun）の影範囲は、雲の表示範囲（assemblyCloudRange、
+    // ASSEMBLY_GROUND_BLOCK_MARGINぶんまで広がりうる）に合わせて広く取る。雲の影は元々
+    // ぼんやりした大きなものなので、テクセル密度が粗くても見た目上は問題にならない
+    const cloudShadowHalfExtent = assemblyCloudRange + 30;
+    assemblyCloudSun.shadow.camera.left = -cloudShadowHalfExtent;
+    assemblyCloudSun.shadow.camera.right = cloudShadowHalfExtent;
+    assemblyCloudSun.shadow.camera.top = cloudShadowHalfExtent;
+    assemblyCloudSun.shadow.camera.bottom = -cloudShadowHalfExtent;
+    assemblyCloudSun.shadow.camera.updateProjectionMatrix();
 
     // 「一列の最大センサー数」やレール方向はマップ全体の縦横比を大きく変えるため、
     // 前回フレーミングした時から変わっていたら、通常は編集のたびに視点をリセットしない
@@ -3494,16 +7094,55 @@ function updateAssemblyPlayMarker(beatIndex, t) {
     }
 
     const posA = beatIndex == null ? null : assemblyBeatCenters[beatIndex];
-    if (!posA) {
+    const rawAnchor = beatIndex == null ? null : assemblyBeatCentersRaw[beatIndex];
+    if (!posA || !rawAnchor) {
         assemblyPlayMarker.visible = false;
+        resetTrolleyDisplayState();
         return;
     }
-    let posB = assemblyBeatCenters[beatIndex + 1] || posA;
-    if (posA.distanceTo(posB) > ASSEMBLY_CELL_SIZE * 1.5) posB = posA;
 
-    assemblyPlayMarker.position.lerpVectors(posA, posB, t);
-    assemblyPlayMarker.position.y += 0.4; // レール/センサーの高さより少し上に浮かせて見やすくする
+    // 返ってくるのはtoWorld変換前のグリッド論理座標なので、rawAnchor→posAの対応
+    // （平行移動+ASSEMBLY_CELL_SIZE倍）を使ってワールド座標に変換する
+    const resolvedRaw = resolveTrolleyDisplayPosition(assemblyBeatCentersRaw, beatIndex, t, ASSEMBLY_CELL_SIZE);
+    assemblyPlayMarker.position.set(
+        posA.x + (resolvedRaw.x - rawAnchor.x) * ASSEMBLY_CELL_SIZE,
+        posA.y,
+        posA.z + (resolvedRaw.y - rawAnchor.y) * ASSEMBLY_CELL_SIZE
+    );
+    assemblyPlayMarker.position.y += ASSEMBLY_TROLLEY_MARKER_Y_OFFSET;
     assemblyPlayMarker.visible = true;
+
+    // 進行方向へ向かせる。resolveTrolleyDisplayPosition側が、実際に移動した瞬間の向きを
+    // （動きが無い/ごく僅かな瞬間は直前の向きを保持したまま）返してくれるので、それをそのまま使う
+    // （停止直後や折り返しの瞬間に車体が不自然な向きに一瞬回転しないようにするため）
+    if (!assemblyMarkerLastForward) assemblyMarkerLastForward = new THREE.Vector3(0, 0, 1);
+    if (resolvedRaw.forward) {
+        assemblyMarkerLastForward.set(resolvedRaw.forward.x, 0, resolvedRaw.forward.y);
+    }
+    // 「同じアングルでしばらく経つと一瞬カクっとなる、おそらくどのアングルでも1回」との
+    // 報告の原因調査で判明: レール折り返し等で進行方向が急変する瞬間、この向き自体は
+    // （上のロジックにより）正しく求まるが、rotation.yへの反映がatan2の結果を毎フレーム
+    // 直接代入するだけ（角度の補間なし）だったため、車体の向きが1フレームで瞬時に
+    // 切り替わっていた。折り返しはトラック中に数える程度しか無いため「1回」という体感と
+    // 一致し、カメラのモードに関わらず車体そのものが瞬間回転するため「どのアングルでも」
+    // 見えていたと考えられる（トロッコ視点等の近接カメラは今回別途カメラ位置をトロッコの
+    // 移動ぶんだけ平行移動させる方式に変えたため、以前のように車体の回転につられて
+    // カメラごと動いていた時よりも、車体だけが瞬間回転する様子が目立ちやすくなった
+    // 可能性もある）。最大角速度を設け、目標の向きへ滑らかに回転させるよう修正した
+    // （最短経路で回るよう、角度差を-π〜πに正規化してから制限する）
+    const targetRotationY = Math.atan2(assemblyMarkerLastForward.x, assemblyMarkerLastForward.z);
+    const nowTime = performance.now();
+    const rotDt = assemblyMarkerLastRotationTime == null ? 0 : Math.min(0.1, (nowTime - assemblyMarkerLastRotationTime) / 1000);
+    assemblyMarkerLastRotationTime = nowTime;
+    const ASSEMBLY_MARKER_MAX_ROTATION_SPEED = Math.PI * 4; // ラジアン/秒（半回転を約0.125秒で追従できる速さ）
+    let rotDiff = targetRotationY - assemblyPlayMarker.rotation.y;
+    rotDiff = ((rotDiff + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
+    const maxStep = ASSEMBLY_MARKER_MAX_ROTATION_SPEED * rotDt;
+    if (rotDt === 0 || Math.abs(rotDiff) <= maxStep) {
+        assemblyPlayMarker.rotation.y = targetRotationY;
+    } else {
+        assemblyPlayMarker.rotation.y += Math.sign(rotDiff) * maxStep;
+    }
 }
 
 // beatIndexに鳴る音符マット（1つまたは和音で複数）を凹ませる/元に戻す。
@@ -3520,6 +7159,12 @@ function updateAssemblyPlayMarker(beatIndex, t) {
 // （initAssemblyScene()以外の）トップレベルのconstで生成してはいけない（ensureThreeLoaded
 // 参照）。ここは数値だけ持ち、実際のTHREEオブジェクトはapplyAssemblyPanelPressAmount()の中で作る
 const ASSEMBLY_PANEL_PRESS_DEPTH = 0.32;
+// 「レールを地面につけた場合、音符マットが踏まれたときに地面へ埋まってしまう」との
+// 指摘対応。「地面につける」時はマットの基準位置(basePos.y)自体が地面すれすれの高さに
+// なるため、通常の沈み込み量(0.32)をそのまま適用すると地面の下まで潜ってしまう。
+// マットの下端と地面の間にこのぶんだけ余白を残すようクランプする（「浮かす」時は
+// 基準位置が十分高いため、このクランプは実質発動しない）
+const ASSEMBLY_PANEL_PRESS_MIN_GROUND_CLEARANCE = 0.05;
 const ASSEMBLY_PANEL_PRESS_SCALE_Y = 0.22; // 縦方向のスケール（大きく押しつぶす）
 const ASSEMBLY_PANEL_PRESS_SCALE_XZ = 1.3; // 横方向のスケール（押しつぶされて広がる。真上から見てもfootprintの変化で分かる）
 const ASSEMBLY_PANEL_BASE_SCALE_XYZ = [0.95, 0.15, 0.95];
@@ -3544,8 +7189,15 @@ function applyAssemblyPanelPressAmount(pitch, index, amount) {
 
     const scaleY = baseSy - (baseSy - baseSy * ASSEMBLY_PANEL_PRESS_SCALE_Y) * eased;
     const scaleXZ = 1 + (ASSEMBLY_PANEL_PRESS_SCALE_XZ - 1) * eased;
+    // 「地面につける」設定時は、地面から沈み込める余地（clearance）を超えないよう
+    // 沈み込み量をクランプする（「浮かす」設定時はbasePos.yが十分高く、常に
+    // ASSEMBLY_PANEL_PRESS_DEPTHが上限のまま実質クランプされない）
+    const clearance = basePos.y - ASSEMBLY_GROUND_Y - ASSEMBLY_PANEL_PRESS_MIN_GROUND_CLEARANCE;
+    const pressDepth = mapSettings.railFloating
+        ? ASSEMBLY_PANEL_PRESS_DEPTH
+        : Math.max(0, Math.min(ASSEMBLY_PANEL_PRESS_DEPTH, clearance));
     const pos = basePos.clone();
-    pos.y += ((baseSy - scaleY) / 2 - ASSEMBLY_PANEL_PRESS_DEPTH) * eased;
+    pos.y += ((baseSy - scaleY) / 2 - pressDepth) * eased;
     const scale = new THREE.Vector3(baseSx * scaleXZ, scaleY, baseSz * scaleXZ);
     const quat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), assemblyPanelRotY);
     const color = new THREE.Color(
@@ -3588,11 +7240,126 @@ function setAssemblyPanelPressed(beatIndex, pressed) {
         if (pressed) {
             assemblyPanelPressAnimations.delete(key);
             applyAssemblyPanelPressAmount(pitch, index, 1);
+            // 「音符マットが踏まれたらきらきらエフェクトを出してほしい」との依頼で追加。
+            // 踏み込み（凹み）と同じタイミング＝毎回一瞬で起きる方でだけ発生させる
+            // （戻りアニメーション側では発生させない）
+            const basePos = assemblyPanelPositionsByPitch[pitch]?.[index];
+            if (basePos) spawnAssemblySparkleEffect(basePos);
             return;
         }
         // 押し込みは常に瞬時にamount=1へ飛ぶため、戻り始めのamountは常に1でよい
         assemblyPanelPressAnimations.set(key, { pitch, index, amount: 1, target: 0 });
     });
+}
+
+// 音符マットが踏まれた瞬間の「きらきらエフェクト」。マットの上面付近から加法合成の
+// 光の粒が数個弾け、上に舞いながらふわっと消える。1バーストにつき専用のTHREE.Points
+// （ジオメトリ・マテリアルとも専用インスタンス、テクスチャだけ共有）を作り、
+// tickAssemblySparkleEffects()が寿命に応じて位置・不透明度・サイズを更新し、
+// 寿命が尽きたら破棄する
+// 「もう少し派手でもいい」との指摘で、粒の数・サイズ・飛び散る速さ・寿命を強化し、
+// 単色（金）から数色（金/白/ピンク/水色）を混ぜた見た目に変更した
+const ASSEMBLY_SPARKLE_PARTICLE_COUNT = 22;
+const ASSEMBLY_SPARKLE_LIFETIME_S = 0.65;
+const ASSEMBLY_SPARKLE_BASE_SIZE = 0.26;
+const ASSEMBLY_SPARKLE_GRAVITY = 2.6;
+// 粒ごとの色のバリエーション（暖色の金・白を主体に、たまにピンク/水色を混ぜて華やかに）
+const ASSEMBLY_SPARKLE_COLORS = [
+    [1, 0.86, 0.42], [1, 0.86, 0.42], [1, 0.95, 0.75], [1, 1, 1],
+    [1, 0.6, 0.75], [0.65, 0.9, 1],
+];
+// 極端に音の詰まった曲・低フレームレート環境でも際限なく増え続けないようにする上限
+const ASSEMBLY_SPARKLE_MAX_ACTIVE = 60;
+let assemblySparkleEffects = []; // {points, geometry, material, velocities, age}
+
+// キラキラ用の光の粒テクスチャ（中心が明るく縁がなじむ放射状グラデーション）を
+// 遅延生成し使い回す。THREE.CanvasTextureはTHREEが読み込まれてから触る必要があるため、
+// 初回のspawnAssemblySparkleEffect呼び出し時（＝3Dシーンが既にある時）まで生成を遅らせる
+let assemblySparkleTexture = null;
+function getAssemblySparkleTexture() {
+    if (assemblySparkleTexture) return assemblySparkleTexture;
+    const size = 64;
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    const grad = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    grad.addColorStop(0, "rgba(255,255,255,1)");
+    grad.addColorStop(0.35, "rgba(255,240,190,0.9)");
+    grad.addColorStop(1, "rgba(255,240,190,0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, size, size);
+    assemblySparkleTexture = new THREE.CanvasTexture(canvas);
+    return assemblySparkleTexture;
+}
+
+function spawnAssemblySparkleEffect(basePos) {
+    if (!assemblyScene || assemblySparkleEffects.length >= ASSEMBLY_SPARKLE_MAX_ACTIVE) return;
+    const n = ASSEMBLY_SPARKLE_PARTICLE_COUNT;
+    const positions = new Float32Array(n * 3);
+    const colors = new Float32Array(n * 3);
+    const velocities = [];
+    for (let i = 0; i < n; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 0.9 + Math.random() * 1.6; // 「もう少し派手に」で飛び散る範囲を拡大
+        const px = basePos.x + (Math.random() - 0.5) * 0.3;
+        const py = basePos.y + 0.12 + Math.random() * 0.05; // マット上面付近から発生
+        const pz = basePos.z + (Math.random() - 0.5) * 0.3;
+        positions[i * 3] = px;
+        positions[i * 3 + 1] = py;
+        positions[i * 3 + 2] = pz;
+        velocities.push({ x: Math.cos(angle) * speed, y: 1.8 + Math.random() * 1.6, z: Math.sin(angle) * speed });
+
+        const c = ASSEMBLY_SPARKLE_COLORS[Math.floor(Math.random() * ASSEMBLY_SPARKLE_COLORS.length)];
+        colors[i * 3] = c[0];
+        colors[i * 3 + 1] = c[1];
+        colors[i * 3 + 2] = c[2];
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    const material = new THREE.PointsMaterial({
+        size: ASSEMBLY_SPARKLE_BASE_SIZE,
+        map: getAssemblySparkleTexture(),
+        vertexColors: true,
+        transparent: true,
+        opacity: 1,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false, // 加法合成の粒同士・既存ジオメトリとの深度書き込み競合でチラつかないように
+        sizeAttenuation: true,
+    });
+    const points = new THREE.Points(geometry, material);
+    assemblyScene.add(points);
+    assemblySparkleEffects.push({ points, geometry, material, velocities, age: 0 });
+}
+
+// 毎フレーム呼ぶ。各バーストの粒を放物運動（重力で上昇が減速し、やがて落下）させながら、
+// 経過時間に応じて不透明度・サイズを1→0へフェードさせる。寿命が尽きたバーストはシーンから
+// 取り除きジオメトリ/マテリアルを破棄する（GPUリソースのリークを防ぐ）
+function tickAssemblySparkleEffects(dt) {
+    if (assemblySparkleEffects.length === 0) return;
+    for (let i = assemblySparkleEffects.length - 1; i >= 0; i--) {
+        const fx = assemblySparkleEffects[i];
+        fx.age += dt;
+        const lifeRatio = fx.age / ASSEMBLY_SPARKLE_LIFETIME_S;
+        if (lifeRatio >= 1) {
+            assemblyScene.remove(fx.points);
+            fx.geometry.dispose();
+            fx.material.dispose();
+            assemblySparkleEffects.splice(i, 1);
+            continue;
+        }
+        const posAttr = fx.geometry.attributes.position;
+        for (let p = 0; p < fx.velocities.length; p++) {
+            const v = fx.velocities[p];
+            v.y -= ASSEMBLY_SPARKLE_GRAVITY * dt;
+            posAttr.array[p * 3] += v.x * dt;
+            posAttr.array[p * 3 + 1] += v.y * dt;
+            posAttr.array[p * 3 + 2] += v.z * dt;
+        }
+        posAttr.needsUpdate = true;
+        fx.material.opacity = 1 - lifeRatio;
+        fx.material.size = ASSEMBLY_SPARKLE_BASE_SIZE * (1 - lifeRatio * 0.6);
+    }
 }
 
 // 毎フレーム呼ぶ。amountをtargetへ少しずつ近づけ、その値で見た目を更新する
@@ -3610,6 +7377,10 @@ function tickAssemblyPanelPressAnimations(dt) {
 
 // 内容の大きさに合わせてカメラの初期位置・ズーム範囲を決める。初回ビルド時のみ呼ばれる
 // （毎回呼ぶと編集のたびにユーザーがせっかく回転させた視点がリセットされてしまうため）
+// トロッコ視点/前視点のチェイスカメラ用に一時的にminDistanceを下げた後、
+// 元（曲・マップ設定に応じた「シーン全体を見渡す」既定値）に戻すために保持しておく
+let assemblySceneMinDistance = 3;
+
 function frameAssemblyCamera(extent) {
     const gridW = (extent.maxX - extent.minX + 1) * ASSEMBLY_CELL_SIZE;
     const gridH = (extent.maxY - extent.minY + 1) * ASSEMBLY_CELL_SIZE;
@@ -3618,29 +7389,383 @@ function frameAssemblyCamera(extent) {
 
     assemblyCamera.position.set(dist * 0.7, dist * 0.6, dist * 0.7);
     assemblyControls.target.set(0, 0, 0);
-    assemblyControls.minDistance = Math.max(3, footprint * 0.15);
+    assemblySceneMinDistance = Math.max(3, footprint * 0.15);
+    assemblyControls.minDistance = assemblySceneMinDistance;
     assemblyControls.maxDistance = footprint * 4 + 40;
     assemblyControls.update();
 }
 
-// assemblyCameraPlaying×assemblyCameraAngleModeの現在の組み合わせをOrbitControlsに反映する。
-// 再生/一時停止ボタン・アングル選択ボタンのどちらのクリックからも呼ばれる
+// assemblyCycleAngleIndexがASSEMBLY_ANGLE_MODE_ORDER内の「選択済みモード」を指すよう、
+// 必要なら（トグルが外された等で選択済みでなくなっていたら）ASSEMBLY_ANGLE_MODE_ORDERの
+// 順で次の選択済みモードまで進める。1つも選択が無い場合はnullを返す
+function resolveAssemblyCycleIndexToSelected() {
+    const order = ASSEMBLY_ANGLE_MODE_ORDER;
+    for (let i = 0; i < order.length; i++) {
+        const idx = (assemblyCycleAngleIndex + i) % order.length;
+        if (assemblySelectedAngleModes.has(order[idx])) {
+            assemblyCycleAngleIndex = idx;
+            return order[idx];
+        }
+    }
+    return null;
+}
+
+// 現在実際に使うべきアングルモードを返す。ランダムモード中は、選択集合
+// （assemblySelectedAngleModes）自体には手を触れず「ランダムモードが今選んでいるもの」
+// （assemblyRandomCameraCurrentMode）をそのまま返す——これにより選択集合は常に
+// 「ランダムモードで使ってよい種類のトグル」という意味のまま保たれ、ランダムモード中でも
+// 手動トグルボタンで自由に切り替えられる。ランダムモードでない時は従来通り：
+// 0個選択＝null（カメラワーク一時停止と同一に扱う）、1個選択＝常にそれ、
+// 2個以上選択＝ASSEMBLY_ANGLE_MODE_ORDER順に3秒おきに巡回
+// （巡回自体はmanageAssemblyCycleTimer()のタイマーがassemblyCycleAngleIndexを進める）
+function getEffectiveAssemblyCameraAngleMode() {
+    if (assemblyRandomCameraMode) return assemblyRandomCameraCurrentMode;
+    if (assemblySelectedAngleModes.size === 0) return null;
+    if (assemblySelectedAngleModes.size === 1) return [...assemblySelectedAngleModes][0];
+    return resolveAssemblyCycleIndexToSelected();
+}
+
+// トロッコ視点/トロッコ前視点で使う進行方向ベクトルを計算し、assemblyTrolleyLastForwardを
+// 更新して返す（drawMapPlayLine/updateAssemblyPlayMarkerと同じ、beatIndexとbeatIndex+1の
+// レール中心座標から進行方向を求める）。段の折り返しをまたぐ大ジャンプ・次のビートが無い
+// （曲の終端）・移動が無い瞬間は、進行方向を再計算できないため、直前まで使っていた向きを
+// そのまま維持する。トロッコが無い/座標が取れない場合はnullを返す
+function computeAssemblyTrolleyForward() {
+    if (!assemblyPlayMarker || currentHighlightBeatIndex == null) return null;
+    const posA = assemblyBeatCenters[currentHighlightBeatIndex];
+    if (!posA) return null;
+    if (!assemblyTrolleyLastForward) assemblyTrolleyLastForward = new THREE.Vector3(0, 0, 1);
+    const posB = assemblyBeatCenters[currentHighlightBeatIndex + 1];
+    let forward = assemblyTrolleyLastForward;
+    if (posB && posA.distanceTo(posB) <= ASSEMBLY_CELL_SIZE * 1.5) {
+        const candidate = posB.clone().sub(posA);
+        candidate.y = 0;
+        if (candidate.lengthSq() > 1e-6) {
+            candidate.normalize();
+            assemblyTrolleyLastForward.copy(candidate);
+            forward = candidate;
+        }
+    }
+    return forward;
+}
+
+// トロッコ視点/前視点（近接グループ）で、毎フレームOrbitControlsのtargetをここへ追従させる
+// （左回り/右回りと同じ「targetだけ動かしてcontrols.update()に任せる」方式。これにより
+// カメラ自身の位置はOrbitControls＝マウスドラッグ操作の対象のまま維持され、
+// 「トロッコ視点中もマウスで視点を変えたい」に対応できる）
+function getAssemblyChaseCameraTarget(mode, forward) {
+    if (mode === "trolleyView") {
+        // 後方視点だけ、注視点をトロッコの少し先に置いて進行方向の先まで見通せるようにする。
+        // 前視点はトロッコ自身を見ればよい
+        return assemblyPlayMarker.position.clone().addScaledVector(forward, ASSEMBLY_TROLLEY_VIEW_LOOK_AHEAD);
+    }
+    return assemblyPlayMarker.position;
+}
+
+// 進行方向(forward、y=0に正規化済み)から見て右側の水平ベクトルを返す（左前/右前視点用）
+function getAssemblyTrolleyRightVector(forward) {
+    return new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
+}
+
+// トロッコ視点/前視点/左前視点/右前視点（近接グループ）に入った瞬間・トロッコが非表示→
+// 表示に切り替わった瞬間だけ、各モードの基準構図にカメラ位置を一度スナップさせる。以降は
+// tick()内でtargetだけ追従させ、カメラ位置自体はOrbitControls（＝ユーザーのドラッグ操作）に委ねる
+function snapAssemblyChaseCameraToTrolley(mode) {
+    if (!assemblyPlayMarker || !assemblyPlayMarker.visible) return;
+    const forward = computeAssemblyTrolleyForward();
+    if (!forward) return;
+    const eye = assemblyPlayMarker.position.clone();
+    if (mode === "trolleyFrontLeftView" || mode === "trolleyFrontRightView") {
+        const right = getAssemblyTrolleyRightVector(forward);
+        const sideSign = mode === "trolleyFrontRightView" ? 1 : -1;
+        eye.addScaledVector(forward, ASSEMBLY_TROLLEY_FRONT_DIAGONAL_FORWARD);
+        eye.addScaledVector(right, sideSign * ASSEMBLY_TROLLEY_FRONT_DIAGONAL_SIDE);
+    } else if (mode === "trolleyFrontView") {
+        eye.addScaledVector(forward, ASSEMBLY_TROLLEY_FRONT_VIEW_OFFSET);
+    } else {
+        eye.addScaledVector(forward, -ASSEMBLY_TROLLEY_VIEW_BACK_OFFSET);
+    }
+    eye.y += ASSEMBLY_TROLLEY_VIEW_HEIGHT;
+    const target = getAssemblyChaseCameraTarget(mode, forward);
+    // OrbitControls.minDistance（シーン全体を見渡すための「これ以上近寄れない」下限、
+    // frameAssemblyCamera参照）が、曲・マップ設定によってはチェイス構図の距離より
+    // 大きいことがあり、その場合update()が半径を強制的にminDistanceまで押し戻してしまい
+    // 「引きすぎ」になる不具合があった。チェイス構図に必要な距離を計算し、現在のminDistanceが
+    // それより大きければ一時的に緩める（少し余裕を持たせるため0.7倍）
+    const neededRadius = eye.distanceTo(target);
+    if (assemblyControls.minDistance > neededRadius * 0.7) {
+        assemblyControls.minDistance = neededRadius * 0.7;
+    }
+    assemblyCamera.position.copy(eye);
+    assemblyControls.target.copy(target);
+    // 「近接カメラに切り替わった直後、わずかにまだアングルが動いていて、それを修正する
+    // ために画角が変わりカクっとなる」との報告の原因: OrbitControlsはenableDamping+
+    // dampingFactor=0.08で滑らかな慣性を持たせている。直前まで遠隔グループでautoRotateが
+    // 回っていた場合、update()を呼ぶたびに「今回のautoRotate角度」の一部（8%）だけを
+    // 実際の回転へ適用し、残り（92%）を次フレームへ持ち越す仕組みのため、autoRotateを
+    // 継続的に回し続けた後は、内部に蓄積された回転量（定常状態で1フレームぶんの
+    // 約12.5倍）が残ったままになる。autoRotate=falseにしてもこの蓄積分は消えず、
+    // 8%ずつしか減衰しないため、完全に収まるまで約60フレーム（1秒近く）かけて
+    // 「わずかに回転し続ける→徐々に収まる」という動きが残ってしまっていた。
+    // 初版の修正ではupdate()をこの場で60回連続で呼んで一気に減衰させていた。その後、
+    // 「近接カメラに切り替わった時は必ず起きる」という別の報告があり、一時は「60回ループの
+    // 呼び出しコスト自体が新たなブロッキングを生んでいるのでは」と疑って本方式（damping無効化+
+    // update()1回）に置き換えたが、実際の真因はこの関数とは無関係な別バグ（複数の近接アングル
+    // 選択中に3秒おきの巡回タイマーがランダムモードと排他制御されておらず、無関係なタイミングで
+    // このsnapAssemblyChaseCameraToTrolley自体を余分に呼び出していたこと。manageAssemblyCycleTimer
+    // 参照）と判明している。とはいえ本方式（60回→1回）はdampingモーメンタムのフラッシュとしては
+    // 同等以上に正確（実測ドリフト量がさらに小さい）かつ軽量なので、そのまま採用を継続している。
+    // three.jsのOrbitControls内部実装では、enableDampingがfalseの間はupdate()が保留中の
+    // 回転差分を「減衰させながら一部だけ適用」するのではなく「全部を即座に適用してから
+    // ゼロクリア」する（非damping時の分岐）。この性質を利用し、dampingを一時的にfalseに
+    // した状態でupdate()を1回だけ呼ぶことで、59回ぶんの無駄なループを削り、
+    // 残存モーメンタムを1回の軽い呼び出しだけで完全に解消できる
+    const dampingWasEnabled = assemblyControls.enableDamping;
+    assemblyControls.enableDamping = false;
+    assemblyControls.update();
+    assemblyControls.enableDamping = dampingWasEnabled;
+    // 上のupdate()で、残存していた回転モーメンタムが一括で適用されてしまうため、
+    // カメラが厳密なeye/target（狙った基準構図）から少しズレた位置に収まってしまう
+    // （モーメンタム自体は消えても、それが一度は反映された先の角度に居着いてしまう）。
+    // モーメンタムを消し切った後で改めて厳密な位置へ合わせ直し、最後にもう1回
+    // update()を通す（この時点では残存量ゼロなので、この呼び出し自体は位置を
+    // 動かさない「無害な」確定処理になる）
+    assemblyCamera.position.copy(eye);
+    assemblyControls.target.copy(target);
+    assemblyControls.update();
+}
+
+// 選択中のアングルが2個以上の間だけ、3秒おきにassemblyCycleAngleIndexを次の選択済み
+// モードへ進めるタイマーを動かす（0〜1個の選択時は巡回不要なので止めたまま）。
+// 再生中かどうかに関わらず巡回自体は進める（一時停止中に選択を変えても表示が
+// 正しく更新されるように、他の状態変更と同じくapplyAssemblyCameraAngleAndPlayState()経由で反映する）。
+// 「近接を複数選択してランダム再生すると、必ず途中で1回カクっとなる」の原因: この巡回タイマーは
+// assemblyRandomCameraMode（ランダムモード）中かどうかを見ておらず、アングルが2個以上選択されて
+// さえいれば裏で3秒おきに走り続けていた。ランダムモード中はgetEffectiveAssemblyCameraAngleMode()が
+// assemblyRandomCameraCurrentModeを優先するため巡回インデックス自体は表示に影響しないが、
+// このタイマーが呼ぶapplyAssemblyCameraAngleAndPlayState()は、近接モード中なら（実際に
+// モードが変わっていなくても）snapAssemblyChaseCameraToTrolley()で無条件に基準構図へ
+// 再スナップしてしまう。ランダム側の切替間隔（2000〜4500ms）とこの3秒間隔が独立して走るため、
+// 「近接再生の途中で1回だけ」ちょうど基準構図へ引き戻されカクっと見えていた。
+// ランダムモード中はこの巡回タイマー自体を止めることで解消する
+function manageAssemblyCycleTimer() {
+    const shouldRun = !assemblyRandomCameraMode && assemblySelectedAngleModes.size >= 2;
+    if (shouldRun && assemblyCycleTimerId == null) {
+        assemblyCycleTimerId = setInterval(() => {
+            assemblyCycleAngleIndex = (assemblyCycleAngleIndex + 1) % ASSEMBLY_ANGLE_MODE_ORDER.length;
+            applyAssemblyCameraAngleAndPlayState();
+        }, ASSEMBLY_CYCLE_INTERVAL_MS);
+    } else if (!shouldRun && assemblyCycleTimerId != null) {
+        clearInterval(assemblyCycleTimerId);
+        assemblyCycleTimerId = null;
+    }
+}
+
+// グループ（"near"＝近接=ASSEMBLY_CHASE_MODES、"remote"＝遠隔=ASSEMBLY_REMOTE_CAMERA_MODES）
+// のうち、現在手動トグルでON（assemblySelectedAngleModesに入っている）になっている
+// ものだけを返す。「ランダム時に使う種類は、トグルで切りかえられるように戻す」との
+// 依頼により、ランダムモードは常にこの選択集合から候補を選ぶ（選択集合自体はランダム
+// モード中も一切書き換えない）
+function getAssemblyEligibleModesForGroup(group) {
+    const groupModes = group === "near" ? ASSEMBLY_CHASE_MODES : ASSEMBLY_REMOTE_CAMERA_MODES;
+    return groupModes.filter(m => assemblySelectedAngleModes.has(m));
+}
+
+function applyAssemblyRandomCameraButtonStyle() {
+    const btn = document.getElementById("assemblyRandomCameraBtn");
+    if (btn) btn.style.color = assemblyRandomCameraMode ? "#4a6cf7" : "#ccc";
+}
+
+// 4つのアングルトグルボタンの見た目（選択中＝青、それ以外＝グレー）を更新する。
+// ランダムモード中もこの選択集合自体は変えないため、ここは常に「ランダムで使ってよい
+// 種類」を表す通常の表示のままでよい
+function applyAssemblyAngleButtonStyles() {
+    document.querySelectorAll(".assembly-angle-btn").forEach(btn => {
+        const icon = btn.querySelector("i");
+        if (icon) icon.style.color = assemblySelectedAngleModes.has(btn.dataset.angleMode) ? "#4a6cf7" : "#ccc";
+    });
+}
+
+// グループごとの「シャッフルバッグ」。「同じグループの中で使われたものは後回しに
+// してほしい」との依頼に対応するため、単純な直前1つ除外の乱数ではなく、トランプの
+// シャッフルのように「そのグループの候補全員を1周使い切るまでは同じものを繰り返さない」
+// 方式にした。バッグが尽きたら、その時点でトグルON中の候補を改めてシャッフルして補充する
+const assemblyRandomGroupBag = { near: [], remote: [] };
+
+function shuffleArray(arr) {
+    const a = arr.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+}
+
+// 指定グループのバッグから1つ取り出す。バッグの中身が今のトグル選択と食い違う場合
+// （トグルON/OFFが変わった、等）は、現在のeligibleに含まれないものを除外した上で判定し、
+// 空になっていれば新しくシャッフルして補充する
+function pickFromAssemblyRandomGroupBag(group, eligible) {
+    let bag = assemblyRandomGroupBag[group].filter(m => eligible.includes(m));
+    if (bag.length === 0) {
+        bag = shuffleArray(eligible);
+    }
+    const picked = bag.shift();
+    assemblyRandomGroupBag[group] = bag;
+    return picked;
+}
+
+// 「必ず、近接→遠隔の順に切り替わるようにしてほしい」との依頼に対応。ランダムモード中は
+// 近接グループ・遠隔グループを厳密に交互に選び続ける（assemblyRandomCameraNextGroupが
+// 次に選ぶべきグループを保持し、実際に選ぶたびに反転させる）。選ぼうとしたグループに
+// トグルONの候補が1つも無い場合は、もう一方のグループから選ぶ（両方0個の場合のみ
+// 一時停止相当＝nullになる）。同じグループ内での実際の抽選は、上のシャッフルバッグ方式
+// （そのグループの候補を1周使い切るまで同じものを繰り返さない）に委ねる
+function pickNextAssemblyRandomCameraMode() {
+    const wantGroup = assemblyRandomCameraNextGroup;
+    let group = wantGroup;
+    let eligible = getAssemblyEligibleModesForGroup(group);
+    if (eligible.length === 0) {
+        group = wantGroup === "near" ? "remote" : "near";
+        eligible = getAssemblyEligibleModesForGroup(group);
+    }
+    assemblyRandomCameraNextGroup = group === "near" ? "remote" : "near";
+    if (eligible.length === 0) return null; // 近接・遠隔どちらもトグルOFF＝選べるものが無い
+    if (eligible.length === 1) return eligible[0]; // 候補が1つだけならバッグ管理は不要
+    return pickFromAssemblyRandomGroupBag(group, eligible);
+}
+
+// ランダムモードの本体。assemblyRandomCameraCurrentMode（getEffectiveAssemblyCameraAngleMode
+// が参照する、ランダムモード専用の「今表示しているモード」）だけを書き換え、
+// applyAssemblyCameraAngleAndPlayState()を呼ぶ（chase視点のスナップ・autoRotateの向き等、
+// アングルごとの実際の見た目の適用はそちら側の既存ロジックに完全に委ねている）。
+// 次の切り替えまでの間隔も毎回ランダムに引き直すことで、一定間隔の巡回モードとは
+// 違う「予測できない切り替わり」を表現する
+function scheduleNextAssemblyRandomCamera() {
+    if (!assemblyRandomCameraMode) return;
+    const interval = ASSEMBLY_RANDOM_CAMERA_MIN_INTERVAL_MS
+        + Math.random() * (ASSEMBLY_RANDOM_CAMERA_MAX_INTERVAL_MS - ASSEMBLY_RANDOM_CAMERA_MIN_INTERVAL_MS);
+    assemblyRandomCameraTimerId = setTimeout(() => {
+        assemblyRandomCameraCurrentMode = pickNextAssemblyRandomCameraMode();
+        applyAssemblyCameraAngleAndPlayState();
+        scheduleNextAssemblyRandomCamera(); // 次回もランダムな間隔で自分自身を予約し直す
+    }, interval);
+}
+
+function startAssemblyRandomCameraMode() {
+    if (assemblyRandomCameraMode) return;
+    assemblyRandomCameraMode = true;
+    assemblyRandomCameraNextGroup = "near"; // 「必ず近接→遠隔の順」なので必ず近接から開始する
+    assemblyRandomGroupBag.near = [];
+    assemblyRandomGroupBag.remote = []; // 前回ONにした時の残りを持ち越さず、毎回新しくシャッフルし直す
+    applyAssemblyRandomCameraButtonStyle();
+    // ONにした瞬間、次の切り替えを待たずにまず1回すぐ切り替える（「ランダムを選んだのに
+    // 最初の数秒何も起きない」体感の遅さを避けるため）
+    assemblyRandomCameraCurrentMode = pickNextAssemblyRandomCameraMode();
+    applyAssemblyCameraAngleAndPlayState();
+    scheduleNextAssemblyRandomCamera();
+}
+
+function stopAssemblyRandomCameraMode() {
+    if (!assemblyRandomCameraMode) return;
+    assemblyRandomCameraMode = false;
+    if (assemblyRandomCameraTimerId != null) {
+        clearTimeout(assemblyRandomCameraTimerId);
+        assemblyRandomCameraTimerId = null;
+    }
+    assemblyRandomCameraCurrentMode = null;
+    applyAssemblyRandomCameraButtonStyle();
+    // 選択集合(assemblySelectedAngleModes)はランダムモード中も一切書き換えていないため、
+    // ここで戻すだけで通常の（選択集合に基づく）挙動にそのまま復帰する
+    applyAssemblyCameraAngleAndPlayState();
+}
+
+// 近接グループ（チェイス視点等）から抜ける時、OrbitControls.minDistanceを
+// assemblySceneMinDistance（シーン全体を見渡すための下限）へ戻すためのヘルパー。
+// 「ランダムにしている時だけ、しばらく経つと一瞬カクっとなる」との指摘の原因調査で
+// 判明: 近接グループは自分のカメラ位置に応じてminDistanceを一時的に緩めている
+// （snapAssemblyChaseCameraToTrolley参照）。ここで無条件にassemblySceneMinDistance
+// （かなり大きい値）へ戻すと、カメラの実際の位置はまだ近接グループの近い距離のまま
+// なため、次のOrbitControls.update()でクランプが働き、カメラが強制的に大きく
+// 押し戻されて「カクっ」とスナップしてしまう。rotateLeft/rotateRight（追従サブモード）は
+// tick()側で明示的に位置ごと再スナップするため実害が無いが、rotateLeftFixed/
+// rotateRightFixed（「カメラ位置をほぼ動かさない」設計）はその再スナップを行わないため、
+// クランプによる意図しない移動がそのまま見えてしまっていた。
+// 「近接グループでもドラッグで位置を動かせるようにする」「ドラッグ後の位置を維持する」
+// という直近の改善により、近接グループ滞在中のカメラの実際の距離が固定の一値ではなく
+// 任意になったため、このクランプで生じる移動量も以前よりずっと大きくなり、目立つように
+// なったと考えられる（以前は常にsnapの式通りの決まった近い距離だったため、ジャンプ量も
+// 小さく・一定していた）。
+// 対策として、現在のカメラ⇄target距離を下回らない範囲でminDistanceを設定する
+// （＝カメラ位置は一切動かさずに下限だけを安全に戻す）
+function restoreAssemblyMinDistanceSafely() {
+    if (!assemblyControls || !assemblyCamera) return;
+    const currentDistance = assemblyCamera.position.distanceTo(assemblyControls.target);
+    assemblyControls.minDistance = Math.min(assemblySceneMinDistance, currentDistance * 0.99);
+}
+
+// assemblyCameraPlaying×選択中アングル集合の現在の組み合わせをOrbitControlsに反映する。
+// 再生/一時停止ボタン・アングルトグルボタンのクリック、巡回タイマーのいずれからも呼ばれる
 function applyAssemblyCameraAngleAndPlayState() {
     if (!assemblyControls) return;
-    if (assemblyCameraPlaying && assemblyCameraAngleMode === "trolleyView") {
-        // トロッコ視点はupdateAssemblyTrolleyViewCamera()がカメラを直接動かすため、
-        // OrbitControlsのドラッグ操作は無効化する（有効のままだとドラッグ入力が
-        // 内部に溜まり、トロッコ視点を抜けた瞬間にカメラが跳ねる原因になる）
+    const effectiveMode = getEffectiveAssemblyCameraAngleMode();
+    const isChaseMode = ASSEMBLY_CHASE_MODES.includes(effectiveMode);
+    // トロッコ視点/前視点中もマウスでの視点変更を許可するため、常にenabledのまま
+    // （以前は専用のカメラ直接制御のためにここをfalseにしていたが、「トロッコ視点時でも
+    // マウスによる視点変更は許容してほしい」との依頼で撤廃した）
+    assemblyControls.enabled = true;
+    // 「何も選ばれていない場合は、カメラワークを一時停止と同一」との指定通り、
+    // effectiveModeがnull（選択0個）の間はassemblyCameraPlayingの値に関わらず
+    // 一時停止扱い（autoRotate無し・チェイス追従無し）にする
+    if (effectiveMode != null && assemblyCameraPlaying && isChaseMode) {
         assemblyControls.autoRotate = false;
-        assemblyControls.enabled = false;
-    } else if (assemblyCameraPlaying) {
-        assemblyControls.enabled = true;
+        snapAssemblyChaseCameraToTrolley(effectiveMode);
+    } else if (effectiveMode != null && assemblyCameraPlaying) {
+        restoreAssemblyMinDistanceSafely(); // チェイス視点を抜けたので下限を戻す
         assemblyControls.autoRotate = true;
-        assemblyControls.autoRotateSpeed = assemblyCameraAngleMode === "rotateLeft" ? -ASSEMBLY_ROTATE_SPEED : ASSEMBLY_ROTATE_SPEED;
+        assemblyControls.autoRotateSpeed = (effectiveMode === "rotateLeft" || effectiveMode === "rotateLeftFixed") ? -ASSEMBLY_ROTATE_SPEED : ASSEMBLY_ROTATE_SPEED;
     } else {
+        restoreAssemblyMinDistanceSafely(); // チェイス視点を抜けたので下限を戻す
         assemblyControls.autoRotate = false;
-        assemblyControls.enabled = true;
     }
+    manageAssemblyCycleTimer();
+}
+
+// 遠隔グループ（左回り/右回り）に入った瞬間だけ呼ぶ。「開始位置はマップの中央を起点に、
+// トロッコに近づいた地点」との指定通り、水平方向はランダムな方位ではなく、マップの中央
+// （frameAssemblyCamera()が既定の見渡し視点でも狙う原点(0,0,0)）からトロッコへ向かう
+// 直線上——トロッコから見てマップ中央側へ、ある距離（近接グループの距離感を基準にした
+// 絶対距離、ASSEMBLY_ROTATE_START_DISTANCE_MIN/MAX参照。「これは今までの距離」との
+// 指定通り、直前に調整した範囲のまま）だけ戻った地点にカメラをスナップさせる。
+// 仰角は既定の俯瞰視点に揃え、距離だけをランダムにする（開始後はこの距離のまま
+// autoRotateで回り続ける——毎フレーム距離を詰めていく処理は「トロッコに接近する仕様は
+// 廃止」との依頼により削除済み）
+function snapAssemblyCameraToRandomRemoteStart() {
+    const target = assemblyControls.target;
+    // 実際にOrbitControlsで選べる範囲を超えないよう、安全のためminDistance/maxDistanceで
+    // クランプする（通常のトラックであれば絶対距離の範囲がそのまま採用され、極端に小さい
+    // トラックでだけ稀にクランプが効く）
+    const rawDistance = ASSEMBLY_ROTATE_START_DISTANCE_MIN
+        + Math.random() * (ASSEMBLY_ROTATE_START_DISTANCE_MAX - ASSEMBLY_ROTATE_START_DISTANCE_MIN);
+    const distance = Math.min(Math.max(rawDistance, assemblyControls.minDistance), assemblyControls.maxDistance);
+    // トロッコからマップ中央(原点)へ向かう水平方向の単位ベクトル。トロッコがちょうど
+    // 中央付近にありベクトルの長さがほぼ0の場合だけ、方位が定まらないためランダムに逃がす
+    let dirX = -target.x, dirZ = -target.z;
+    const dirLen = Math.hypot(dirX, dirZ);
+    if (dirLen < 1e-6) {
+        const fallbackAzimuth = Math.random() * Math.PI * 2;
+        dirX = Math.cos(fallbackAzimuth);
+        dirZ = Math.sin(fallbackAzimuth);
+    } else {
+        dirX /= dirLen;
+        dirZ /= dirLen;
+    }
+    const elevation = ASSEMBLY_ROTATE_START_ELEVATION_DEG * Math.PI / 180;
+    const horizontalRadius = Math.cos(elevation) * distance;
+    assemblyCamera.position.set(
+        target.x + dirX * horizontalRadius,
+        target.y + Math.sin(elevation) * distance,
+        target.z + dirZ * horizontalRadius
+    );
 }
 
 function startAssemblyRenderLoop() {
@@ -3654,18 +7779,124 @@ function startAssemblyRenderLoop() {
         const dt = Math.min(0.1, (now - lastTime) / 1000);
         lastTime = now;
         tickAssemblyPanelPressAnimations(dt);
-        if (assemblyCameraPlaying && assemblyCameraAngleMode === "trolleyView") {
-            // トロッコ視点はOrbitControlsを経由せずカメラを直接動かすため、
-            // controls.update()は呼ばない（呼ぶと内部のspherical状態に基づいて
-            // 位置が上書きされてしまう）
-            updateAssemblyTrolleyViewCamera();
+        tickAssemblySparkleEffects(dt);
+        tickAssemblyCharacterWobble(dt);
+        tickAssemblyClouds(dt);
+
+        const markerVisible = !!(assemblyPlayMarker && assemblyPlayMarker.visible);
+        const effectiveMode = getEffectiveAssemblyCameraAngleMode();
+        const isChaseMode = ASSEMBLY_CHASE_MODES.includes(effectiveMode);
+        // アングルが1つも選択されていない（effectiveMode===null）間は、
+        // assemblyCameraPlayingの値に関わらず一時停止と同一に扱う
+        const activelyAnimating = effectiveMode != null && assemblyCameraPlaying;
+        if (activelyAnimating && isChaseMode) {
+            // targetだけを動かしてcontrols.update()を呼んでも、OrbitControls内部では
+            // 毎回「現在のcamera.position - 現在のtarget」からoffsetを再計算して
+            // そのままtargetへ足し戻す（＝角度デルタが無ければ事実上の恒等変換）ため、
+            // それだけではカメラは一切追従しない（実測で判明、詳細は上のコメント参照）。
+            // 以前はドラッグ中（assemblyChaseUserInteracting）でない限り毎フレーム
+            // snapAssemblyChaseCameraToTrolley()でカメラ位置ごと再計算して追従させていたが、
+            // これだとユーザーがドラッグで視点を動かした直後、マウスを離した次のフレームで
+            // また「ドラッグ中でない」判定になり基準構図へ戻ってしまっていた（「近接アングルの
+            // 時も、視点を動かした後、戻すのではなく維持してほしい（遠隔と同じように）」との
+            // 指摘）。遠隔グループ（rotateLeft/rotateRight）と同じ方式に変更：このモードに
+            // 入った瞬間（モードが変わった時）だけ基準構図に一度スナップし、以降は同じモードが
+            // 続く限り、トロッコが前フレームからどれだけ動いたかをカメラにもそのまま平行移動
+            // として足し込むだけにする。ユーザーのドラッグによる相対オフセットはこの平行移動を
+            // 挟んでも保たれるため、ドラッグ中かどうかで分岐する必要が無くなった
+            // 「モードが変わったかどうか」の判定は、トロッコが見えているかどうか
+            // (markerVisible)とは完全に切り離す。以前はmarkerVisibleがfalseの間
+            // assemblyLastChaseCameraModeをnullに戻していたが、実際に計測したところ
+            // 速いテンポの曲ではノートの切れ目ごとにmarkerVisibleがtrue/falseを
+            // 頻繁に行き来しており（休符に限らず、ごく短い間隙でも起こりうる）、その
+            // たびに「モードが変わった」という誤判定が起きて、毎回forward依存の
+            // snapAssemblyChaseCameraToTrolley()（進行方向によって視点ごと再計算される）
+            // が再実行されてしまっていた。これがレール折り返しの瞬間に限らず曲中随所で
+            // 「カクっ」となるデグレの正体だった（実測: 60サンプル中55サンプルで
+            // 単純追従では説明できない大きな動きを検出）。
+            // 正しくは、「スナップが必要かどうか」はmarkerVisibleではなく
+            // assemblyChaseLastTrolleyPos/assemblyChaseTargetOffsetが未確定かどうかで
+            // 判定する——モードが変わった時だけこの2つをnullに戻し、トロッコの可視/不可視は
+            // 「今フレームで何もしない（動かさないだけ、モードの状態は保持する）」を
+            // 意味するだけにする
+            const chaseModeChanged = effectiveMode !== assemblyLastChaseCameraMode;
+            assemblyLastChaseCameraMode = effectiveMode;
+            if (chaseModeChanged) {
+                assemblyChaseLastTrolleyPos = null;
+                assemblyChaseTargetOffset = null;
+            }
+            if (markerVisible) {
+                if (!assemblyChaseLastTrolleyPos || !assemblyChaseTargetOffset) {
+                    // モードに入った直後、またはモードが変わらないままトロッコが非表示→
+                    // 表示に切り替わった最初のフレームだけ、基準構図へ一度スナップする
+                    snapAssemblyChaseCameraToTrolley(effectiveMode);
+                    assemblyChaseLastTrolleyPos = assemblyPlayMarker.position.clone();
+                    // スナップが確定させたtarget（トロッコ視点ならlook-ahead分ずれた注視点）と
+                    // トロッコ位置そのものとの差を、以降の追従で使う固定オフセットとして保存する
+                    assemblyChaseTargetOffset = assemblyControls.target.clone().sub(assemblyPlayMarker.position);
+                } else {
+                    // カメラ位置・注視点(target)のどちらも、トロッコの移動ぶんだけ平行移動させる
+                    // （進行方向=forwardを毎回引き直さない）。target側もforwardではなく
+                    // スナップ時に確定した固定オフセットをトロッコ位置へ足すだけにすることで、
+                    // カメラ⇄target間の距離が常に一定に保たれ、レール折り返しで進行方向が急反転
+                    // してもOrbitControlsのminDistance/maxDistanceクランプが働かない
+                    const delta = assemblyPlayMarker.position.clone().sub(assemblyChaseLastTrolleyPos);
+                    assemblyCamera.position.add(delta);
+                    assemblyControls.target.copy(assemblyPlayMarker.position).add(assemblyChaseTargetOffset);
+                    assemblyChaseLastTrolleyPos.copy(assemblyPlayMarker.position);
+                }
+            }
+            assemblyControls.update();
         } else {
+            assemblyLastChaseCameraMode = null;
+            assemblyChaseLastTrolleyPos = null;
+            assemblyChaseTargetOffset = null;
+            const isRemoteMode = ASSEMBLY_REMOTE_CAMERA_MODES.includes(effectiveMode);
+            const nowInRemoteGroup = activelyAnimating && isRemoteMode && markerVisible;
+            // 遠隔グループのうち「追従サブモード」（rotateLeft/rotateRight）だけが、
+            // ランダム開始位置へのスナップ・毎フレームの追従補正（ドリフト防止）の対象。
+            // rotateLeftFixed/rotateRightFixedは「昔の（カメラ位置がほぼ動かない）
+            // 左回り/右回り」を別アングルとして復活させたもので、targetがトロッコを
+            // 追う以外は一切位置操作をしない（下のtarget追従の1行だけが効く）
+            const isRemoteChaseSubmode = ASSEMBLY_REMOTE_CHASE_SUBMODES.includes(effectiveMode);
+            // 遠隔グループで既に回っている間（今まさに入った瞬間は除く）は、target（トロッコ）
+            // が前フレームからどれだけ動いたかをカメラの位置にもそのまま平行移動として
+            // 足し込む。OrbitControls.update()は毎回「現在のcamera.position - 現在のtarget」
+            // から素直に半径を再計算するため、target（＝トロッコ）だけを動かしてカメラ自身は
+            // 動かさずにいると、トロッコが進むにつれて見かけ上の半径がどんどん変わってしまう
+            // （実測: minDistanceでスナップした直後でも、1〜2フレームでもう20%以上ズレる程度に
+            // 顕著だった）。「可能な限り近くまで寄る」を実際に維持するには、この平行移動による
+            // 補正が必要——ユーザーのマウスによるズーム操作（OrbitControls自体のdolly）は
+            // この後のupdate()側で別途処理されるため、ここでの補正とは干渉しない
+            // 「左回り⇄右回りの切替でも、毎回この中央基準の近づいた地点へ再スナップして
+            // ほしい」との指定通り、判定は「遠隔グループに入っているかどうか」ではなく
+            // 「実際に効いているモード（rotateLeft/rotateRight/それ以外）そのものが
+            // 直前フレームと変わったかどうか」で行う——他モード/一時停止から遠隔グループに
+            // 入った時はもちろん、遠隔グループ内で左回り⇄右回りが切り替わった時も
+            // 変化ありと判定され、その都度再スナップする
+            const remoteModeChanged = nowInRemoteGroup && effectiveMode !== assemblyLastRemoteCameraMode;
+            if (nowInRemoteGroup && isRemoteChaseSubmode && !remoteModeChanged && assemblyRemoteCameraLastTargetPos) {
+                const delta = assemblyPlayMarker.position.clone().sub(assemblyRemoteCameraLastTargetPos);
+                assemblyCamera.position.add(delta);
+            }
             // 左回り/右回り再生中は、トロッコが見えている間だけ回転の中心を
             // トロッコの現在位置へ追従させる（再生していない/トロッコが無い時は
-            // 直前の中心のまま回り続ける）
-            if (assemblyCameraPlaying && assemblyPlayMarker && assemblyPlayMarker.visible) {
+            // 直前の中心のまま回り続ける）。Fixed版もこの追従自体は行う（「注視点だけ
+            // トロッコを追う」という復活の要望通り）
+            if (activelyAnimating && markerVisible) {
                 assemblyControls.target.copy(assemblyPlayMarker.position);
             }
+            // 「トロッコに接近する仕様は廃止」との依頼により、スナップ直後の毎フレームの
+            // 距離調整（接近イージング）は行わない——スナップした距離のままautoRotateで回り続ける。
+            // ランダム開始スナップ自体も追従サブモードだけで行う（Fixed版は「元々あった
+            // カメラの位置のまま」始まるのが復活させたい挙動そのものなので、スナップしない）
+            if (remoteModeChanged && isRemoteChaseSubmode) {
+                snapAssemblyCameraToRandomRemoteStart();
+            }
+            assemblyLastRemoteCameraMode = nowInRemoteGroup ? effectiveMode : null;
+            assemblyRemoteCameraLastTargetPos = (nowInRemoteGroup && isRemoteChaseSubmode && markerVisible)
+                ? assemblyPlayMarker.position.clone()
+                : null;
             assemblyControls.update();
         }
         // 空の球を常にカメラの位置へ追従させる（黒丸バグ対策、initAssemblyScene参照）
@@ -3683,35 +7914,6 @@ function startAssemblyRenderLoop() {
         assemblyRenderer.render(assemblyScene, assemblyCamera);
     };
     tick();
-}
-
-// トロッコ視点: トロッコよりやや後ろにカメラを置き、進行方向を向かせる
-// （drawMapPlayLine/updateAssemblyPlayMarkerと同じ、beatIndexとbeatIndex+1の
-// レール中心座標から進行方向を求める）
-function updateAssemblyTrolleyViewCamera() {
-    if (!assemblyPlayMarker || !assemblyPlayMarker.visible || currentHighlightBeatIndex == null) return;
-    const posA = assemblyBeatCenters[currentHighlightBeatIndex];
-    if (!posA) return;
-    let posB = assemblyBeatCenters[currentHighlightBeatIndex + 1] || posA;
-    // 段の折り返しをまたぐ大ジャンプは進行方向として不自然なので、直前の位置を保つ
-    if (posA.distanceTo(posB) > ASSEMBLY_CELL_SIZE * 1.5) posB = posA;
-    let forward = posB.clone().sub(posA);
-    if (forward.lengthSq() < 1e-6) forward.set(0, 0, 1); // 移動が無い瞬間のフォールバック
-    forward.y = 0;
-    forward.normalize();
-
-    // 「トロッコよりやや後ろ」との指定で、進行方向と逆向きに少し下げた位置にカメラを置く
-    const eye = assemblyPlayMarker.position.clone();
-    eye.addScaledVector(forward, -ASSEMBLY_TROLLEY_VIEW_BACK_OFFSET);
-    eye.y += ASSEMBLY_TROLLEY_VIEW_HEIGHT;
-    assemblyCamera.position.copy(eye);
-    // 注視点はeyeの高さ（=トロッコより高い位置）ではなく、トロッコ自身の高さのまま
-    // 少し先を見るようにする。真水平を向かせるとカメラがトロッコより高く・近いせいで
-    // トロッコが画面の下端からはみ出して見えなくなっていた（「トロッコの後ろが見える
-    // くらいでいい」との指摘はこれが原因）。トロッコの高さを見ることで自然に見下ろす
-    // 角度になり、後ろ姿が画面内に収まる
-    const lookTarget = assemblyPlayMarker.position.clone().addScaledVector(forward, ASSEMBLY_TROLLEY_VIEW_LOOK_AHEAD);
-    assemblyCamera.lookAt(lookTarget);
 }
 
 function stopAssemblyRenderLoop() {
@@ -4059,6 +8261,11 @@ function setupMapAreaDrag() {
         // ドロワー（調号・移調・マップ設定・音符グループ等）からドラッグを始めても、
         // 同様に小節選択を巻き込まないよう除外する
         if (e.target.closest("#drawer")) return;
+        // 画面上部のメニューバー（タブ・ファイル操作・ズーム・マップ/3D設定等のツールバー列）
+        // からドラッグを始めても、同様に小節選択を巻き込まないよう除外する。ボタン単体は
+        // e.target.closest("button")で既に除外されているが、ツールバー同士の余白や
+        // タブ行の背景などボタンではない部分を押しても選択が始まってしまう不具合があった
+        if (e.target.closest("#stickyHeader")) return;
         // 単発クリック（ドラッグに発展しなかった場合）用に、グリッド外・余白を除外する
         // 厳密な判定も別途取っておく。実際にドラッグに発展した場合は、開始点がグリッド外/
         // 余白上でも（＝マウスを下ろした瞬間はまだ厳密な判定で無効でも）、そこから実際に
@@ -4457,9 +8664,11 @@ function buildStaffNotes(measureIndex, preview, renderNoteData, origIndexMap, ho
             }
             if (note.__preview) {
                 restNote.setStyle({ fillStyle: previewColor, strokeStyle: previewColor });
-            } else if (isHovered) {
-                restNote.setStyle({ fillStyle: hoverColor, strokeStyle: hoverColor });
             }
+            // 休符は右クリックしても何も起きない（削除ハンドラのnote.rest分岐が「何もしない」）
+            // ため、赤い「削除できます」ホバー色は付けない。音符を削除すると同じ長さの休符に
+            // 置き換わる仕様上、これを付けたままだと「削除した音符の跡地に、まだ削除できるかの
+            // ような赤いホバーが残って見える」という指摘（「消えた後なので」）につながっていた
             notes.push(restNote);
             meta.push({ realNoteIndex, isRest: true, dataPitchIndices: [] });
             return;
@@ -5825,9 +10034,7 @@ function updateStatusBar() {
 
     const countEl = document.getElementById("statusMeasureCount");
     if (countEl && score) {
-        const bpm = parseInt(document.getElementById("bpmInput")?.value) || 120;
-        const beatsPerMeasure = getBeatsPerMeasure();
-        const totalSeconds = score.measures.length * beatsPerMeasure * (60 / bpm);
+        const totalSeconds = getFullSongDuration();
         const m = Math.floor(totalSeconds / 60);
         const s = Math.floor(totalSeconds % 60);
         countEl.textContent = `全${score.measures.length}小節 / 再生時間 ${m}:${String(s).padStart(2, "0")}`;
@@ -6202,6 +10409,11 @@ function setupGlobalEvents() {
         // ドロワー（調号・移調・マップ設定・音符グループ等）からドラッグを始めても、
         // 同様に小節選択を巻き込まないよう除外する
         if (e.target.closest("#drawer")) return;
+        // 画面上部のメニューバー（タブ・ファイル操作・ズーム・マップ/3D設定等のツールバー列）
+        // からドラッグを始めても、同様に小節選択を巻き込まないよう除外する。ボタン単体は
+        // e.target.closest("button")で既に除外されているが、ツールバー同士の余白や
+        // タブ行の背景などボタンではない部分を押しても選択が始まってしまう不具合があった
+        if (e.target.closest("#stickyHeader")) return;
 
         // 右クリック・Shift・Ctrl は音符モード時のみSVG上で音符編集
         if (e.button !== 0 || e.shiftKey || e.ctrlKey) {
@@ -6478,7 +10690,11 @@ function scoreToMusicXML(scoreData, { title, bpm, northDirection: nd, mapSetting
         const backupUnits = staffNotesUnits(measure.upperNotes);
 
         const attributesXml = i === 0 ? `<attributes><divisions>${MUSICXML_DIVISIONS}</divisions><key><fifths>${fifths}</fifths></key><time><beats>${beatsNum}</beats><beat-type>${beatsDen}</beat-type></time><staves>2</staves><clef number="1"><sign>G</sign><line>2</line></clef><clef number="2"><sign>G</sign><line>2</line></clef></attributes>` : "";
-        const directionXml = i === 0 ? `<direction placement="above"><direction-type><metronome><beat-unit>quarter</beat-unit><per-minute>${bpm}</per-minute></metronome></direction-type><sound tempo="${bpm}"/></direction>` : "";
+        // テンポマップ対応: 先頭小節は必ずテンポを書き出す（measure.tempoがあればそれ、
+        // 無ければ引数のbpm）。それ以外の小節は、measure.tempoが設定されている
+        // （＝直前の小節からテンポが変化する）場合だけ<sound tempo>を追加する
+        const measureTempo = i === 0 ? (measure.tempo != null ? measure.tempo : bpm) : measure.tempo;
+        const directionXml = measureTempo != null ? `<direction placement="above"><direction-type><metronome><beat-unit>quarter</beat-unit><per-minute>${measureTempo}</per-minute></metronome></direction-type><sound tempo="${measureTempo}"/></direction>` : "";
 
         return `<measure number="${i + 1}">${attributesXml}${directionXml}${upperXml}<backup><duration>${backupUnits}</duration></backup>${lowerXml}</measure>`;
     }).join("");
@@ -6538,15 +10754,27 @@ function extractMusicXMLFromMxl(arrayBuffer) {
 }
 
 // <pitch>要素→ピッチ文字列
-function readPitchFromXML(pitchEl) {
+// octaveShiftOctaves: <octave-shift>（8va/8vb等）による記譜上の見た目のオクターブと
+// 実際の鳴る音のオクターブのズレ（オクターブ単位、下方シフトなら負の値）。呼び出し側が
+// 現在有効なシフト量を渡す（デフォルト0=シフト無し）
+function readPitchFromXML(pitchEl, octaveShiftOctaves = 0) {
     const step = pitchEl.querySelector("step").textContent;
     const alterEl = pitchEl.querySelector("alter");
-    const alter = alterEl ? parseInt(alterEl.textContent, 10) : 0;
-    if (alter !== 0 && alter !== 1 && alter !== -1) {
-        throw new Error(`対応していない臨時記号です（alter=${alter}）`);
+    const alterRaw = alterEl ? parseFloat(alterEl.textContent) : 0;
+    const octave = parseInt(pitchEl.querySelector("octave").textContent, 10) + octaveShiftOctaves;
+    if (alterRaw === 0 || alterRaw === 1 || alterRaw === -1) {
+        return musicXMLToPitchString(step, alterRaw, octave);
     }
-    const octave = pitchEl.querySelector("octave").textContent;
-    return musicXMLToPitchString(step, alter, octave);
+    if (!Number.isInteger(alterRaw)) {
+        // 四分音等の非整数alterは、このアプリの半音単位のピッチ表現では表せない
+        throw new Error(`対応していない臨時記号です（alter=${alterRaw}）`);
+    }
+    // ダブルシャープ(alter=2)・ダブルフラット(alter=-2)等、このアプリのピッチ文字列表記
+    // （#かbを1つだけ持つ形式）では直接表現できない臨時記号は、実際に鳴る半音へいったん
+    // 変換してから単一のシャープ表記へ綴り直す（実機は音高＝半音だけが重要で、楽譜上の
+    // 「綴り」（G##とA、どちらの表記か）を区別して鳴らす仕組みは無いため実用上問題ない）
+    const semitone = octave * 12 + NATURAL_SEMITONE[step] + alterRaw;
+    return semitoneToPitch(semitone);
 }
 
 // MusicXML文字列→{score, title, bpm, northDirection, mapSettings}。
@@ -6575,6 +10803,8 @@ function musicXMLToScore(xmlString) {
     if (!firstAttributes) {
         throw new Error("拍子/調号の情報（attributes）が見つかりませんでした");
     }
+    const divisionsEl = firstAttributes.querySelector("divisions");
+    const divisions = divisionsEl ? parseInt(divisionsEl.textContent, 10) : 1;
     const fifthsEl = firstAttributes.querySelector("key > fifths");
     const fifths = fifthsEl ? parseInt(fifthsEl.textContent, 10) : 0;
     const keySignature = FIFTHS_TO_KEY_SIG[fifths];
@@ -6584,6 +10814,11 @@ function musicXMLToScore(xmlString) {
     const beatsEl = firstAttributes.querySelector("time > beats");
     const beatTypeEl = firstAttributes.querySelector("time > beat-type");
     const timeSignature = beatsEl && beatTypeEl ? `${beatsEl.textContent}/${beatTypeEl.textContent}` : "4/4";
+    // <rest measure="yes"/>（下記）を展開する際に使う、1小節ぶんの拍数（4分音符基準、
+    // getBeatsPerMeasure()と同じ計算式）。score.timeSignatureはまだ確定していない
+    // （このあと戻り値としてまとめて作る）ため、ここで同じ式をそのまま使う
+    const [tsNum, tsDen] = timeSignature.split("/").map(Number);
+    const measureBeats = tsNum * 4 / tsDen;
     const stavesEl = firstAttributes.querySelector("staves");
     const hasSecondStaff = stavesEl ? parseInt(stavesEl.textContent, 10) >= 2 : false;
 
@@ -6598,13 +10833,53 @@ function musicXMLToScore(xmlString) {
     const soundEl = part.querySelector("sound[tempo]");
     const bpm = soundEl ? Math.round(parseFloat(soundEl.getAttribute("tempo"))) : 120;
 
+    // <octave-shift>（8va/8vb等の記譜）による、段ごとの現在有効なオクターブシフト量
+    // （オクターブ単位）。start/stopが小節をまたぐことがあるため、measures.mapの外
+    // （曲全体を通した状態）として持つ
+    const activeOctaveShiftByStaff = { 1: 0, 2: 0 };
+    const OCTAVE_SHIFT_SIZE_TO_OCTAVES = { 8: 1, 15: 2, 22: 3 };
+    // テンポマップ: 曲全体を通して直前に見つかったテンポ（初期値は上で読んだ最初のsound[tempo]、
+    // 無ければ120）。小節ごとにこれと異なる<sound tempo>が見つかった時だけ、その小節に
+    // measures[i].tempoとして記録する（変化が無い限り記録しない＝省略可能フィールド）
+    let lastTempo = bpm;
+
     const measures = Array.from(measureEls).map((measureEl) => {
         const upperNotes = [];
         const lowerNotes = [];
         const currentSlotByStaff = { 1: null, 2: null };
         const seenVoiceByStaff = { 1: null, 2: null };
+        let tempoForThisMeasure = null;
 
-        measureEl.querySelectorAll(":scope > note").forEach((noteEl) => {
+        // <direction>（octave-shiftの開始/終了、テンポ変化）と<note>は小節内で出現順に
+        // 交互に現れ得るため、shift状態の更新と音符の読み取りは出現順（:scope > *を通しで
+        // 走査）で行う必要がある（先に全<direction>を処理してから<note>を処理すると、
+        // 小節途中でシフトが切り替わる場合に、切り替え前の音符にも新しいシフトが適用されてしまう）
+        Array.from(measureEl.children).forEach((el) => {
+            if (el.tagName === "direction") {
+                const soundTempoEl = el.querySelector("sound[tempo]");
+                if (soundTempoEl) {
+                    const newTempo = Math.round(parseFloat(soundTempoEl.getAttribute("tempo")));
+                    if (newTempo !== lastTempo) {
+                        tempoForThisMeasure = newTempo;
+                        lastTempo = newTempo;
+                    }
+                }
+                const shiftEl = el.querySelector("direction-type > octave-shift");
+                if (!shiftEl) return;
+                const staffEl = el.querySelector("staff");
+                const staffNum = staffEl ? parseInt(staffEl.textContent, 10) : 1;
+                const shiftType = shiftEl.getAttribute("type");
+                if (shiftType === "stop") {
+                    activeOctaveShiftByStaff[staffNum] = 0;
+                    return;
+                }
+                const size = parseInt(shiftEl.getAttribute("size"), 10) || 8;
+                const octaves = OCTAVE_SHIFT_SIZE_TO_OCTAVES[size] || 1;
+                activeOctaveShiftByStaff[staffNum] = shiftType === "down" ? -octaves : octaves;
+                return;
+            }
+            if (el.tagName !== "note") return;
+            const noteEl = el;
             const staffEl = noteEl.querySelector("staff");
             const staffNum = staffEl ? parseInt(staffEl.textContent, 10) : 1;
             if (staffNum !== 1 && staffNum !== 2) {
@@ -6629,9 +10904,35 @@ function musicXMLToScore(xmlString) {
                 }
                 const pitchEl = noteEl.querySelector("pitch");
                 if (!pitchEl) throw new Error("<chord/>要素に音高情報がありません");
-                target.pitches.push(readPitchFromXML(pitchEl));
+                target.pitches.push(readPitchFromXML(pitchEl, activeOctaveShiftByStaff[staffNum]));
                 target.pitches.sort((a, b) => pitchToSemitone(a) - pitchToSemitone(b));
                 return;
+            }
+
+            // <rest measure="yes"/>（MusicXML標準の「小節まるごと休符」表記）は、
+            // 小節の長さ自体が休符の音価を兼ねるため<type>を持たない（仕様上省略可能）。
+            // 現在の拍子（全小節共通、beatsToRestsと同じ単位＝4分音符基準）ぶんの休符に
+            // 展開して追加する。既存の「<type>が無ければエラー」という判定の対象外にする
+            const restEl = noteEl.querySelector(":scope > rest");
+            if (restEl && restEl.getAttribute("measure") === "yes") {
+                const targetArray = staffNum === 1 ? upperNotes : lowerNotes;
+                targetArray.push(...beatsToRests(measureBeats));
+                currentSlotByStaff[staffNum] = null;
+                return;
+            }
+            // <type>を持たない休符（<rest measure="yes"/>ではない、単に<duration>だけで
+            // 長さを示す休符表記）も同様に対応する。5拍・6拍等、単一の音符グリフでは
+            // 表せない長さの休符でこの表記が使われることがある（divisionsからの逆算で
+            // 4分音符基準の拍数に変換し、beatsToRestsで音価の組み合わせに分解する）
+            if (restEl && !restEl.getAttribute("measure")) {
+                const durationEl = noteEl.querySelector(":scope > duration");
+                if (durationEl && !noteEl.querySelector("type")) {
+                    const restBeats = parseInt(durationEl.textContent, 10) / divisions;
+                    const targetArray = staffNum === 1 ? upperNotes : lowerNotes;
+                    targetArray.push(...beatsToRests(restBeats));
+                    currentSlotByStaff[staffNum] = null;
+                    return;
+                }
             }
 
             const typeEl = noteEl.querySelector("type");
@@ -6652,7 +10953,7 @@ function musicXMLToScore(xmlString) {
             } else {
                 const pitchEl = noteEl.querySelector("pitch");
                 if (!pitchEl) throw new Error("音高情報が見つかりませんでした");
-                noteObj = { pitches: [readPitchFromXML(pitchEl)], duration: durationCode, ...(dotted ? { dotted: true } : {}) };
+                noteObj = { pitches: [readPitchFromXML(pitchEl, activeOctaveShiftByStaff[staffNum])], duration: durationCode, ...(dotted ? { dotted: true } : {}) };
             }
             targetArray.push(noteObj);
             currentSlotByStaff[staffNum] = noteObj;
@@ -6666,7 +10967,7 @@ function musicXMLToScore(xmlString) {
             if (upperBeats > 0) lowerNotes.push(...beatsToRests(upperBeats));
         }
 
-        return { upperNotes, lowerNotes };
+        return { upperNotes, lowerNotes, ...(tempoForThisMeasure != null ? { tempo: tempoForThisMeasure } : {}) };
     });
 
     return {
@@ -6727,6 +11028,11 @@ async function main() {
 
     loadSeBuffers();
     loadMapPanelImages();
+    loadAssemblyTrolleyIcon2D();
+    // 設定が既にONで保存されている場合、3Dタブを開くのを待たずにここでプリロードを
+    // 始めておく（57MBあるため、タブを開いてから・再生を押してからでは表示までの
+    // 遅延が目立つとの指摘への対策）
+    if (mapSettings.showCharacter) loadAssemblyCharacterModel();
 
     // タブUIの生成は取得したデータに依存しないため、fetch完了を待たず先に行う。
     // これをfetchの後に回すと、通信が終わるまでタブが1つも表示されない
@@ -6791,6 +11097,7 @@ async function main() {
     setupNoteToolbarDrag();
     setupMapAreaDrag();
     setupDrawer();
+    setupDebugPanel();
     setupHelpPopover();
     setupMapCornerOverlayScrollSync();
     setupAbLoopStrip();
@@ -6932,6 +11239,63 @@ async function main() {
         mapSettings.hideUnusedSensors = true;
         saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
     });
+    // buildMapGrid()がmapSettings.railWrapEnabledを見てbuildFixedRailTrack()（折り返しあり・
+    // 固定長レール）とレガシーな段組みロジック（折り返しなし）を切り替える。トグル自体は
+    // 単純な設定変更で、実際の配置ロジックの分岐先はbuildMapGrid側に実装済み
+    document.getElementById("mapRailWrapOn")?.addEventListener("click", () => {
+        mapSettings.railWrapEnabled = true;
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
+    });
+    document.getElementById("mapRailWrapOff")?.addEventListener("click", () => {
+        mapSettings.railWrapEnabled = false;
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
+    });
+    // 3Dプレビュー限定の見た目トグルなので、マップグリッドの再構築（refreshMapAndAssemblyIfVisible）は不要。
+    // キャラクターはassemblyPlayMarker配下に一度だけ読み込んで使い回すため、表示/非表示の切り替えは
+    // visibleの付け替えのみで行う（loadAssemblyCharacterModel/applyAssemblyCharacterVisibility参照）
+    document.getElementById("mapCharacterOn")?.addEventListener("click", () => {
+        mapSettings.showCharacter = true;
+        saveMapSettings(); updateMapToolbarUI();
+        loadAssemblyCharacterModel();
+        attachAssemblyCharacterIfReady();
+    });
+    document.getElementById("mapCharacterOff")?.addEventListener("click", () => {
+        mapSettings.showCharacter = false;
+        saveMapSettings(); updateMapToolbarUI();
+        applyAssemblyCharacterVisibility();
+    });
+    // 木・草・花の装飾（generateAssemblyDecorations）は再構築のたびに毎回生成し直す
+    // ものなので、キャラクターと違いvisibleの付け替えだけでは済まない。
+    // refreshMapAndAssemblyIfVisible()でrebuildAssemblyMeshes()から作り直させる
+    document.getElementById("mapDecorationsOn")?.addEventListener("click", () => {
+        mapSettings.showDecorations = true;
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
+    });
+    document.getElementById("mapDecorationsOff")?.addEventListener("click", () => {
+        mapSettings.showDecorations = false;
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
+    });
+    // 「レールを地面につけるか、浮かす（今の状態）かを決める」との依頼で追加。
+    // rebuildAssemblyMeshes()内のtoWorld()がこの値を見てレール層全体のYオフセットを
+    // 決めるため（詳細はそちら参照）、装飾と同じくグリッドの再構築が必要
+    document.getElementById("mapRailFloatingOn")?.addEventListener("click", () => {
+        mapSettings.railFloating = true;
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
+    });
+    document.getElementById("mapRailFloatingOff")?.addEventListener("click", () => {
+        mapSettings.railFloating = false;
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
+    });
+    // センサーの向き（forwardVec）をデバッグ可視化する薄い赤の光線。センサーと同じく
+    // rebuildAssemblyMeshes()内で毎回作り直すため、装飾・レール高さと同様グリッド再構築が必要
+    document.getElementById("mapSensorDirectionOn")?.addEventListener("click", () => {
+        mapSettings.showSensorDirection = true;
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
+    });
+    document.getElementById("mapSensorDirectionOff")?.addEventListener("click", () => {
+        mapSettings.showSensorDirection = false;
+        saveMapSettings(); updateMapToolbarUI(); refreshMapAndAssemblyIfVisible();
+    });
     updateMapToolbarUI();
 
     window.addEventListener("resize", () => {
@@ -6962,6 +11326,9 @@ async function main() {
     document.addEventListener("keydown", e => {
         if (e.key === "Shift" || e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "ArrowLeft" || e.key === "ArrowRight") {
             e.preventDefault();
+        } else if (e.ctrlKey && e.shiftKey && (e.key === "D" || e.key === "d")) {
+            e.preventDefault();
+            toggleDebugPanel();
         } else if (e.ctrlKey && e.shiftKey && e.key === "Z") {
             e.preventDefault();
             redo();
@@ -7054,6 +11421,51 @@ async function main() {
         });
     }
 
+    // 2Dマップを画像(PNG)として保存。#mapGridは表示中の一部だけでなくマップ全体の
+    // 論理サイズそのままのcanvas（スクロールはCSS側、canvas自体は全体を含む）なので、
+    // toDataURLするだけでスクロール外の部分も含めた全体図が得られる。保存の仕組み自体は
+    // saveBtn（MusicXML保存）と同じ、File System Access API対応ブラウザではダイアログ、
+    // 非対応ブラウザでは<a download>フォールバック
+    const mapSavePngBtn = document.getElementById("mapSavePngBtn");
+    if (mapSavePngBtn) {
+        mapSavePngBtn.addEventListener("click", async () => {
+            const canvas = document.getElementById("mapGrid");
+            if (!canvas || !mapRenderState) {
+                showToast("マップが空です", "fa-triangle-exclamation");
+                return;
+            }
+            const title = document.getElementById("scoreTitleInput").value || "NewScore";
+            const filename = `${title}-map.png`;
+
+            if (window.showSaveFilePicker) {
+                try {
+                    const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/png"));
+                    const handle = await window.showSaveFilePicker({
+                        suggestedName: filename,
+                        types: [{ description: "PNG画像", accept: { "image/png": [".png"] } }],
+                    });
+                    const writable = await handle.createWritable();
+                    await writable.write(blob);
+                    await writable.close();
+                    showToast(`「${filename}」を保存しました`, "fa-floppy-disk");
+                } catch (err) {
+                    if (err.name !== "AbortError") console.error(err);
+                }
+                return;
+            }
+
+            canvas.toBlob((blob) => {
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = filename;
+                a.click();
+                URL.revokeObjectURL(url);
+                showToast(`「${filename}」を保存しました`, "fa-floppy-disk");
+            }, "image/png");
+        });
+    }
+
     // 組み立てプレビューのグリッド線ON/OFF
     const assemblyGridToggleBtn = document.getElementById("assemblyGridToggleBtn");
     if (assemblyGridToggleBtn) {
@@ -7090,9 +11502,9 @@ async function main() {
         el.addEventListener("click", () => resetAssemblyColors());
     });
 
-    // 組み立てプレビューのカメラワーク（再生/一時停止 ＋ 左回り/右回り/トロッコ視点の
-    // アングル選択）。どちらのボタンを押した時も、現在の再生状態×アングルの組み合わせを
-    // applyAssemblyCameraAngleAndPlayState()にまとめて反映させる
+    // 組み立てプレビューのカメラワーク（再生/一時停止 ＋ 左回り/右回り/トロッコ視点/
+    // トロッコ前視点のアングルトグル）。どちらのボタンを押した時も、現在の再生状態×
+    // 選択中アングル集合の組み合わせをapplyAssemblyCameraAngleAndPlayState()にまとめて反映させる
     const assemblyCameraPlayBtn = document.getElementById("assemblyCameraPlayBtn");
     const applyAssemblyCameraPlayStyle = () => {
         if (!assemblyCameraPlayBtn) return;
@@ -7109,21 +11521,39 @@ async function main() {
         });
     }
 
+    // 「3秒おきに切り替える専用ボタン」は廃止し、代わりに4つのアングルボタン自体を
+    // トグル（複数選択可）にした。押すたびにassemblySelectedAngleModesへの追加/削除を
+    // 切り替える（排他選択ではない）
     const assemblyAngleBtns = document.querySelectorAll(".assembly-angle-btn");
-    const applyAssemblyAngleButtonStyles = () => {
-        assemblyAngleBtns.forEach(btn => {
-            const icon = btn.querySelector("i");
-            if (icon) icon.style.color = btn.dataset.angleMode === assemblyCameraAngleMode ? "#4a6cf7" : "#ccc";
-        });
-    };
     applyAssemblyAngleButtonStyles();
     assemblyAngleBtns.forEach(btn => {
         btn.addEventListener("click", () => {
-            assemblyCameraAngleMode = btn.dataset.angleMode;
+            // ランダムモード中でもこのトグル自体は普通に動く（「ランダム時に使う種類は、
+            // トグルで切りかえられるように戻す」との依頼）。ランダムモードは選択集合を
+            // 直接読むだけで自身では書き換えないため、ここで解除する必要はない
+            const mode = btn.dataset.angleMode;
+            if (assemblySelectedAngleModes.has(mode)) {
+                assemblySelectedAngleModes.delete(mode);
+            } else {
+                assemblySelectedAngleModes.add(mode);
+            }
             applyAssemblyAngleButtonStyles();
             applyAssemblyCameraAngleAndPlayState();
         });
     });
+
+    // 「レースゲームでよくある、数秒おきにランダムにカメラが切り替わるかっこいいモード」
+    const assemblyRandomCameraBtn = document.getElementById("assemblyRandomCameraBtn");
+    if (assemblyRandomCameraBtn) {
+        applyAssemblyRandomCameraButtonStyle();
+        assemblyRandomCameraBtn.addEventListener("click", () => {
+            if (assemblyRandomCameraMode) {
+                stopAssemblyRandomCameraMode();
+            } else {
+                startAssemblyRandomCameraMode();
+            }
+        });
+    }
 
     document.getElementById("newScoreBtn")
         .addEventListener("click", () => openNewScoreModal());
@@ -7230,6 +11660,15 @@ async function main() {
 
     document.getElementById("restartBtn")
         .addEventListener("click", () => restartScore());
+
+    // 「再生位置に自動で追従」トグル（ABの左）
+    applyAutoFollowToggleStyle();
+    document.getElementById("autoFollowToggleBtn")
+        .addEventListener("click", () => {
+            autoFollowPlayback = !autoFollowPlayback;
+            localStorage.setItem("autoFollowPlayback", autoFollowPlayback);
+            applyAutoFollowToggleStyle();
+        });
 
     // A-B区間ループの有効/無効トグル（区間自体はabLoopRangeに保持したまま、
     // 再生への反映だけをON/OFFする。#abLoopStripでの区間の描画・調整はそのまま）
